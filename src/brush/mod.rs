@@ -1,0 +1,185 @@
+use crate::film::Contact;
+use crate::tools::{push_tube, TubeVertex};
+use glam::DVec3;
+use rayon::prelude::*;
+
+pub struct Bristle {
+    pub pts: Vec<DVec3>,
+    pub prev: Vec<DVec3>,
+    pub root: DVec3,
+    pub rest: DVec3,
+    pub load: f64,
+    pub comp: [f32; 16],
+    pub touch: Vec<bool>,
+}
+
+pub struct Release {
+    pub p0: [f32; 2],
+    pub p1: [f32; 2],
+    pub r: f32,
+    pub vol: f64,
+    pub comp: [f32; 16],
+}
+
+pub struct Brush {
+    pub bristles: Vec<Bristle>,
+    pub len: f64,
+    pub segs: usize,
+    pub ferrule_r: f64,
+    pub radius: f64,
+    pub stiffness: f64,
+    pub friction: f64,
+    pub capacity: f64,
+    pub release: f64,
+    pub placed: bool,
+    pub handle: DVec3,
+    pub touching: usize,
+}
+
+impl Brush {
+    pub fn new(n: usize, len: f64, ferrule_r: f64, radius: f64) -> Self {
+        let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+        let segs = 8;
+        let mut bristles = Vec::with_capacity(n);
+        for k in 0..n {
+            let r = ferrule_r * ((k as f64 + 0.5) / n as f64).sqrt();
+            let a = k as f64 * golden;
+            let root = DVec3::new(r * a.cos(), r * a.sin(), 0.0);
+            let splay = 0.35 * r / ferrule_r;
+            let rest = DVec3::new(a.cos() * splay, a.sin() * splay, -1.0).normalize();
+            bristles.push(Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1] });
+        }
+        Self { bristles, len, segs, ferrule_r, radius, stiffness: 0.35, friction: 0.7, capacity: 6.0e-9, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+    }
+
+    pub fn total_load(&self) -> f64 {
+        self.bristles.iter().map(|b| b.load).sum()
+    }
+
+    pub fn total_capacity(&self) -> f64 {
+        self.capacity * self.bristles.len() as f64
+    }
+
+    pub fn dip(&mut self, frac: &[f32; 16]) {
+        for b in &mut self.bristles {
+            b.load = self.capacity;
+            b.comp = *frac;
+        }
+    }
+
+    pub fn clean(&mut self) {
+        for b in &mut self.bristles {
+            b.load = 0.0;
+            b.comp = [0.0; 16];
+        }
+    }
+
+    pub fn absorb(&mut self, res: &[[u32; 17]]) -> f64 {
+        let mut total = 0.0;
+        for (b, r) in self.bristles.iter_mut().zip(res) {
+            let vol = r[0] as f64 * 1e-15;
+            if vol <= 0.0 {
+                continue;
+            }
+            let newload = b.load + vol;
+            for i in 0..16 {
+                let sc = if i >= 13 { 100.0 } else { 1.0 };
+                let add = r[1 + i] as f64 * 1e-15 * sc;
+                b.comp[i] = ((b.comp[i] as f64 * b.load + add) / newload) as f32;
+            }
+            b.load = newload;
+            total += vol;
+        }
+        total
+    }
+
+    pub fn update(&mut self, handle: DVec3, dt: f64, floor: &(dyn Fn(f64, f64) -> f64 + Sync), dx: f64) -> (Vec<Contact>, Vec<Release>) {
+        let segs = self.segs;
+        let l = self.len / segs as f64;
+        let radius = self.radius;
+        let stiffness = self.stiffness;
+        let friction = self.friction;
+        let vel = if self.placed { (handle - self.handle) / dt.max(1e-6) } else { DVec3::ZERO };
+        if !self.placed || (handle - self.handle).length() > 0.1 {
+            for b in &mut self.bristles {
+                for i in 0..=segs {
+                    b.pts[i] = handle + b.root + b.rest * (l * i as f64);
+                    b.prev[i] = b.pts[i];
+                }
+            }
+            self.placed = true;
+        }
+        self.handle = handle;
+        self.bristles.par_iter_mut().for_each(|b| {
+            b.pts[0] = handle + b.root;
+            for _ in 0..8 {
+                for i in 1..=segs {
+                    let dir_prev = if i == 1 { b.rest } else { (b.pts[i - 1] - b.pts[i - 2]).normalize_or_zero() };
+                    let target = b.pts[i - 1] + dir_prev * l;
+                    let cur = b.pts[i];
+                    b.pts[i] = cur + (target - cur) * stiffness;
+                    let zs = floor(b.pts[i].x, b.pts[i].y) + radius;
+                    if b.pts[i].z < zs {
+                        b.pts[i].z = zs;
+                        let d = b.prev[i] - b.pts[i];
+                        let cur = b.pts[i];
+                        b.pts[i] = DVec3::new(cur.x + d.x * friction, cur.y + d.y * friction, cur.z);
+                    }
+                    let seg = b.pts[i] - b.pts[i - 1];
+                    let sl = seg.length();
+                    b.pts[i] = b.pts[i - 1] + if sl > 1e-9 { seg / sl * l } else { dir_prev * l };
+                }
+            }
+            for i in 0..=segs {
+                let zs = floor(b.pts[i].x, b.pts[i].y) + radius;
+                b.touch[i] = i > 0 && b.pts[i].z <= zs + 0.5 * radius;
+                b.prev[i] = b.pts[i];
+            }
+        });
+        let mut contacts = Vec::new();
+        let mut releases = Vec::new();
+        let rc = (radius * 2.0).max(0.6 * dx) as f32;
+        let vxy = DVec3::new(vel.x, vel.y, 0.0);
+        let sp = vxy.length();
+        let dir = if sp > 1e-6 { vxy / sp } else { DVec3::ZERO };
+        let shift = dir * (2.0 * rc as f64 + sp * dt);
+        let mut touching = 0;
+        for (bi, b) in self.bristles.iter_mut().enumerate() {
+            let segs_touching: Vec<usize> = (1..=segs).filter(|&i| b.touch[i]).collect();
+            if segs_touching.is_empty() {
+                continue;
+            }
+            touching += 1;
+            let nseg = segs_touching.len() as f64;
+            let over = (b.load - self.capacity).max(0.0) / nseg;
+            let rel = b.load.min(self.capacity) * (self.release * dt).min(1.0) / nseg;
+            for &i in &segs_touching {
+                let p0 = [b.pts[i - 1].x as f32, b.pts[i - 1].y as f32];
+                let p1 = [b.pts[i].x as f32, b.pts[i].y as f32];
+                let zb = (b.pts[i].z.min(b.pts[i - 1].z) - radius) as f32;
+                contacts.push(Contact { p0, p1, r: rc, zb, bristle: bi as u32, pad: 0 });
+                if rel > 1e-15 {
+                    releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp });
+                }
+                if over > 1e-15 {
+                    let q0 = [(b.pts[i - 1].x + shift.x) as f32, (b.pts[i - 1].y + shift.y) as f32];
+                    let q1 = [(b.pts[i].x + shift.x) as f32, (b.pts[i].y + shift.y) as f32];
+                    releases.push(Release { p0: q0, p1: q1, r: 1.5 * rc, vol: over, comp: b.comp });
+                }
+            }
+            b.load = (b.load - (rel + over) * nseg).max(0.0);
+        }
+        self.touching = touching;
+        (contacts, releases)
+    }
+
+    pub fn mesh(&self, verts: &mut Vec<TubeVertex>, idx: &mut Vec<u32>, paint_col: &dyn Fn(&[f32; 16]) -> [f32; 3], rmin: f64) {
+        for b in &self.bristles {
+            let f = (b.load / self.capacity).clamp(0.0, 1.0) as f32;
+            let pc = if f > 0.0 { paint_col(&b.comp) } else { [0.0; 3] };
+            let base = [0.42f32, 0.3, 0.17];
+            let col = [base[0] + (pc[0] - base[0]) * f, base[1] + (pc[1] - base[1]) * f, base[2] + (pc[2] - base[2]) * f];
+            push_tube(verts, idx, &b.pts, self.radius.max(rmin), col);
+        }
+    }
+}

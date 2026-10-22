@@ -283,7 +283,6 @@ pub struct Film {
     p_apply: wgpu::ComputePipeline,
     p_clear_acc: wgpu::ComputePipeline,
     p_split: wgpu::ComputePipeline,
-    p_sweep: wgpu::ComputePipeline,
     p_commit_tmp: wgpu::ComputePipeline,
     p_reduce: wgpu::ComputePipeline,
     p_pool: wgpu::ComputePipeline,
@@ -477,7 +476,6 @@ impl Film {
         let p_apply = compute_pipeline(d, "apply", &sm_film, "apply", &lf);
         let p_split = compute_pipeline(d, "strata_split", &sm_film, "strata_split", &lf);
         let p_clear_acc = compute_pipeline(d, "clear_acc", &sm_film, "clear_acc", &lf);
-        let p_sweep = compute_pipeline(d, "sweep_tiny", &sm_film, "sweep_tiny", &lf);
         let p_commit_tmp = compute_pipeline(d, "commit_tmp", &sm_film, "commit_tmp", &lf);
         let p_reduce = compute_pipeline(d, "reduce_tiles", &sm_film, "reduce_tiles", &lf);
         let p_pool = compute_pipeline(d, "pool8", &sm_film, "pool8", &lf);
@@ -514,7 +512,7 @@ impl Film {
             sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_start, ctile_count, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
-            p_lap, p_flux, p_limit, p_nose, p_slump, p_apply, p_split, p_clear_acc, p_sweep, p_commit_tmp, p_reduce, p_pool,
+            p_lap, p_flux, p_limit, p_nose, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
             p_strata_limit, p_strata_update, p_strata_fill, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,
         };
@@ -899,10 +897,6 @@ impl Film {
                 ind(&mut pass, &self.p_nose, &gf);
                 ind(&mut pass, &self.p_slump, &gf);
                 ind(&mut pass, &self.p_commit_tmp, &gf);
-                if self.settings.h_min > 0.0 {
-                    ind(&mut pass, &self.p_sweep, &gf);
-                    ind(&mut pass, &self.p_commit_tmp, &gf);
-                }
             }
             ind(&mut pass, &self.p_lap, &gf);
             ind(&mut pass, &self.p_split, &gf);

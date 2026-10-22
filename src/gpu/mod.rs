@@ -11,7 +11,7 @@ pub struct Gpu {
 impl Gpu {
     pub fn new(window: Arc<Window>) -> Self {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::DX12;
+        desc.backends = wgpu::Backends::PRIMARY;
         let instance = wgpu::Instance::new(desc);
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

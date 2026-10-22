@@ -84,6 +84,10 @@ fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, di
     let hb = h[cb];
     let hf = 0.5 * (ha + hb);
     if hf <= 0.0 { return out; }
+    if min(ha, hb) <= 0.0 {
+        let wet = select(cb, ca, ha > 0.0);
+        if h[wet] <= nose_cap(wet) { return out; }
+    }
     let ra = rheo[ca];
     let rb = rheo[cb];
     let wa = ha / (ha + hb);
@@ -355,6 +359,16 @@ fn okf(i: i32, j: i32) -> f32 {
     return 1.0;
 }
 
+fn outward(i: i32, j: i32) -> vec2<f32> {
+    var d = vec2<f32>(0.0);
+    for (var dj = -2; dj <= 2; dj++) {
+        for (var di = -2; di <= 2; di++) {
+            if di * di + dj * dj <= 5 && hat(i + di, j + dj) <= 0.0 { d += vec2<f32>(f32(di), f32(dj)); }
+        }
+    }
+    return d;
+}
+
 struct Shed {
     amount: f32,
     i0: i32,
@@ -374,11 +388,13 @@ fn shed_of(i: i32, j: i32) -> Shed {
     let e = shed(c);
     if e <= 0.0 { return o; }
     let hc = h[c];
-    let gx = 0.5 * (hat(i + 1, j) - hat(i - 1, j));
-    let gy = 0.5 * (hat(i, j + 1) - hat(i, j - 1));
-    let gm = length(vec2<f32>(gx, gy));
+    var dir = outward(i, j);
+    if length(dir) < 1e-6 {
+        dir = -vec2<f32>(0.5 * (hat(i + 1, j) - hat(i - 1, j)), 0.5 * (hat(i, j + 1) - hat(i, j - 1)));
+    }
+    let gm = length(dir);
     if gm < 1e-9 { return o; }
-    let dir = -vec2<f32>(gx, gy) / gm;
+    dir = dir / gm;
     let px = f32(i) + dir.x;
     let py = f32(j) + dir.y;
     let fx0 = floor(px);
@@ -550,40 +566,6 @@ fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
         strata_cure[c] = vec4<f32>(strata_cure[src][ks], 0.0, 0.0, 0.0);
     }
     acc[c] += accv * P.dt;
-}
-
-fn recipient(i: u32, j: u32) -> u32 {
-    let c = idx(i, j);
-    var best = c;
-    var bh = -1.0;
-    if i > 0u { let n = idx(i - 1u, j); if h[n] > bh { bh = h[n]; best = n; } }
-    if i + 1u < P.size.x { let n = idx(i + 1u, j); if h[n] > bh { bh = h[n]; best = n; } }
-    if j > 0u { let n = idx(i, j - 1u); if h[n] > bh { bh = h[n]; best = n; } }
-    if j + 1u < P.size.y { let n = idx(i, j + 1u); if h[n] > bh { bh = h[n]; best = n; } }
-    if bh < P.ein.w { return c; }
-    return best;
-}
-
-fn tiny(c: u32) -> bool {
-    let v = h[c];
-    return v > 0.0 && v < P.ein.w;
-}
-
-@compute @workgroup_size(16, 16)
-fn sweep_tiny(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let id = tile_cell(wid, lid);
-    if !in_grid(id) { return; }
-    let c = idx(id.x, id.y);
-    var v = h[c];
-    if tiny(c) {
-        if recipient(id.x, id.y) != c { v = 0.0; }
-    } else if v > 0.0 {
-        if id.x > 0u { let n = idx(id.x - 1u, id.y); if tiny(n) && recipient(id.x - 1u, id.y) == c { v += h[n]; } }
-        if id.x + 1u < P.size.x { let n = idx(id.x + 1u, id.y); if tiny(n) && recipient(id.x + 1u, id.y) == c { v += h[n]; } }
-        if id.y > 0u { let n = idx(id.x, id.y - 1u); if tiny(n) && recipient(id.x, id.y - 1u) == c { v += h[n]; } }
-        if id.y + 1u < P.size.y { let n = idx(id.x, id.y + 1u); if tiny(n) && recipient(id.x, id.y + 1u) == c { v += h[n]; } }
-    }
-    tmp[c] = v;
 }
 
 @compute @workgroup_size(16, 16)

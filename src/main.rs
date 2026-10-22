@@ -725,6 +725,14 @@ impl App {
     }
 
     fn frame(&mut self) {
+        let size = self.window.inner_size();
+        let surface_tex = match self.gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            _ => {
+                self.gpu.resize(size.width, size.height);
+                return;
+            }
+        };
         if self.auto.as_ref().map(|a| a.pace).unwrap_or(false) {
             let el = self.last.elapsed();
             if el < std::time::Duration::from_micros(16600) {
@@ -990,17 +998,9 @@ impl App {
         self.ui.state.handle_platform_output(&self.window, std::mem::take(&mut out.platform_output));
         let prims = self.ui.ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
 
-        let size = self.window.inner_size();
         self.cam.aspect = size.width as f32 / size.height.max(1) as f32;
         self.renderer.update(&self.gpu, &self.cam, &self.film);
 
-        let surface_tex = match self.gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => {
-                self.gpu.resize(size.width, size.height);
-                return;
-            }
-        };
         let view = surface_tex.texture.create_view(&Default::default());
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 

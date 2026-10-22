@@ -200,6 +200,8 @@ impl Default for FilmSettings {
     }
 }
 
+const FULL_SHADE_EVERY: u32 = 30;
+
 pub struct Film {
     pub w: u32,
     pub h: u32,
@@ -239,6 +241,8 @@ pub struct Film {
     p_copy_back: wgpu::ComputePipeline,
     p_shade_full: wgpu::ComputePipeline,
     pub needs_full_shade: bool,
+    pub active_tiles: u32,
+    frame: u32,
     pub white_refl: Vec<u32>,
     pub knife_buf: wgpu::Buffer,
     pub scraps: wgpu::Buffer,
@@ -279,6 +283,7 @@ pub struct Film {
     p_flux: wgpu::ComputePipeline,
     p_limit: wgpu::ComputePipeline,
     p_nose: wgpu::ComputePipeline,
+    p_shed: wgpu::ComputePipeline,
     p_slump: wgpu::ComputePipeline,
     p_apply: wgpu::ComputePipeline,
     p_clear_acc: wgpu::ComputePipeline,
@@ -350,6 +355,7 @@ impl Film {
         });
         gpu.queue.write_buffer(&tile_indirect, 0, bytemuck::cast_slice(&[0u32, 1, 1, 0]));
         let active_count = gpu.storage("active_count", 16);
+        let tile_moved = gpu.storage("tile_moved", nt16 * 4);
         let max_scraps = 1u64 << 16;
         let knife_buf = gpu.uniform("knife", std::mem::size_of::<KnifeParams>() as u64);
         let scraps = gpu.storage("scraps", max_scraps * 48);
@@ -367,7 +373,7 @@ impl Film {
         let reservoir = gpu.storage("reservoir", (MAX_BRISTLES * 17 * 4) as u64);
         let res_read = [gpu.readback("res_r0", (MAX_BRISTLES * 17 * 4) as u64), gpu.readback("res_r1", (MAX_BRISTLES * 17 * 4) as u64)];
         let res_pending = [std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))];
-        let stats_read = [gpu.readback("stats_r0", ntiles * 8), gpu.readback("stats_r1", ntiles * 8)];
+        let stats_read = [gpu.readback("stats_r0", ntiles * 8 + 16), gpu.readback("stats_r1", ntiles * 8 + 16)];
         let stats_pending = [std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))];
         let deposits = gpu.storage("deposits", (max_deposits * std::mem::size_of::<Deposit>()) as u64);
         let tile_start = gpu.storage("tile_start", ntiles * 4);
@@ -436,6 +442,7 @@ impl Film {
             .storage(&tile_flags, false)
             .storage(&tile_list, false)
             .storage(&active_count, false)
+            .storage(&tile_moved, false)
             .build(&gpu.device, "tiles");
         let (l_knife, bg_knife) = BindBuilder::new(stages)
             .uniform(&knife_buf)
@@ -472,6 +479,7 @@ impl Film {
         let p_flux = compute_pipeline(d, "fluxes", &sm_film, "fluxes", &lf);
         let p_limit = compute_pipeline(d, "limiter", &sm_film, "limiter", &lf);
         let p_nose = compute_pipeline(d, "nose", &sm_film, "nose", &lf);
+        let p_shed = compute_pipeline(d, "shed", &sm_film, "shed_pass", &lf);
         let p_slump = compute_pipeline(d, "slump", &sm_film, "slump", &lf);
         let p_apply = compute_pipeline(d, "apply", &sm_film, "apply", &lf);
         let p_split = compute_pipeline(d, "strata_split", &sm_film, "strata_split", &lf);
@@ -509,10 +517,10 @@ impl Film {
         let mut f = Self {
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
-            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_start, ctile_count, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
+            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_start, ctile_count, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
-            p_lap, p_flux, p_limit, p_nose, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
+            p_lap, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
             p_strata_limit, p_strata_update, p_strata_fill, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,
         };
@@ -583,6 +591,7 @@ impl Film {
                     }
                     self.h_max = hm;
                     self.mu_min = if mm > 1e8 { 1.0 } else { mm };
+                    self.active_tiles = *bytemuck::from_bytes(&view[nt * 8..nt * 8 + 4]);
                 }
                 {
                     let view = self.pool_read[k].slice(..).get_mapped_range().expect("map");
@@ -610,6 +619,7 @@ impl Film {
         }
         let nt = (self.tiles[0] * self.tiles[1]) as u64;
         enc.copy_buffer_to_buffer(&self.stats_buf, 0, &self.stats_read[k], 0, nt * 8);
+        enc.copy_buffer_to_buffer(&self.active_count, 0, &self.stats_read[k], nt * 8, 4);
         let np = (self.pool_dims[0] * self.pool_dims[1]) as u64;
         enc.copy_buffer_to_buffer(&self.pool_buf, 0, &self.pool_read[k], 0, np * 8);
         self.stats_pending[k].store(1, std::sync::atomic::Ordering::Release);
@@ -887,7 +897,7 @@ impl Film {
                 pass.dispatch_workgroups_indirect(&self.tile_indirect, 0);
             };
             let gf: [&wgpu::BindGroup; 4] = [&self.bg0, &self.bg1, &self.bg_fac, g];
-            ind(&mut pass, &self.p_cure, &gf);
+            dispatch(&mut pass, &self.p_cure, &gf, gx, gy, 1);
             ind(&mut pass, &self.p_clear_acc, &gf);
             for _ in 0..substeps {
                 ind(&mut pass, &self.p_lap, &gf);
@@ -895,6 +905,7 @@ impl Film {
                 ind(&mut pass, &self.p_limit, &gf);
                 ind(&mut pass, &self.p_apply, &gf);
                 ind(&mut pass, &self.p_nose, &gf);
+                ind(&mut pass, &self.p_shed, &gf);
                 ind(&mut pass, &self.p_slump, &gf);
                 ind(&mut pass, &self.p_commit_tmp, &gf);
             }
@@ -908,7 +919,7 @@ impl Film {
             for _ in 0..6 {
                 ind(&mut pass, &self.p_strata_fill, &gf);
             }
-            if self.needs_full_shade {
+            if self.needs_full_shade || self.frame % FULL_SHADE_EVERY == 0 {
                 dispatch(&mut pass, &self.p_shade_full, &[&self.bg0, &self.bg1, &self.bg_shade, g], gx, gy, 1);
                 self.needs_full_shade = false;
             } else {
@@ -916,5 +927,6 @@ impl Film {
             }
         }
         self.substeps_last = substeps;
+        self.frame += 1;
     }
 }

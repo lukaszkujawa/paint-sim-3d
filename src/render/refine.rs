@@ -81,6 +81,7 @@ impl Refine {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: h_fine.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: m_fine.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: film.tile_flags.as_entire_binding() },
             ],
         });
         Self { fw, fh, dx: film.dx * 0.5, h_fine, m_fine, scratch, weight, params, bg_h, bg_m, p_up, p_weight, p_ab, p_ba, bg_render, iterations: 24 }

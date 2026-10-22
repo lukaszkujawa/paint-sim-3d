@@ -16,6 +16,28 @@ struct Cam {
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<storage, read> hbuf: array<f32>;
 @group(0) @binding(4) var<storage, read> mbuf: array<f32>;
+@group(0) @binding(5) var<storage, read> tile_flags: array<u32>;
+
+fn near_paint(p: vec2<f32>) -> bool {
+    let tw = i32((cam.size.x + 15u) / 16u);
+    let th = i32((cam.size.y + 15u) / 16u);
+    let g = vec2<i32>(floor(p / (cam.canvas.z * 16.0)));
+    for (var dj = -2; dj <= 2; dj++) {
+        for (var di = -2; di <= 2; di++) {
+            let x = g.x + di;
+            let y = g.y + dj;
+            if x >= 0 && y >= 0 && x < tw && y < th && (tile_flags[x + y * tw] & 1u) != 0u { return true; }
+        }
+    }
+    return false;
+}
+
+fn normal_bilinear(p: vec2<f32>) -> vec3<f32> {
+    let e = 0.7 * cam.canvas.z;
+    let sx = surf_bilinear(p + vec2<f32>(e, 0.0)) - surf_bilinear(p - vec2<f32>(e, 0.0));
+    let sy = surf_bilinear(p + vec2<f32>(0.0, e)) - surf_bilinear(p - vec2<f32>(0.0, e));
+    return normalize(vec3<f32>(-sx / (2.0 * e), -sy / (2.0 * e), 1.0));
+}
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -287,6 +309,7 @@ fn shadow_at(p: vec2<f32>, z0: f32, l: vec3<f32>) -> f32 {
         let q = p + l.xy / l.z * d;
         let zs = surf_march(q);
         let zr = z0 + d;
+        if zr > cam.canvas.w { break; }
         let occ = (zs - zr) / step;
         sh = min(sh, 1.0 - clamp(occ * 2.0, 0.0, 1.0));
     }
@@ -371,6 +394,11 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         let fl = cam.ground.rgb * 0.6;
         return vec4<f32>(to_srgb(tonemap(fl)), 1.0);
     }
+    let v = -dir;
+    let l = normalize(cam.light.xyz);
+    if !near_paint(p) && cam.jitter.z <= 0.5 {
+        return vec4<f32>(to_srgb(tonemap(lit(normal_bilinear(p), v, l, 1.0, color_sharp(p)))), 1.0);
+    }
     let n = normal_at(p);
     let slope = length(n.xy) / max(n.z, 1e-3);
     var pc = p;
@@ -380,10 +408,14 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         pc = clamp(pc, vec2<f32>(0.0), vec2<f32>(W, H));
     }
     let col = color_sharp(pc);
-    let v = -dir;
-    let l = normalize(cam.light.xyz);
     let z0 = surf_hit(p);
     let sh = shadow_at(p, z0, l);
+    let c = lit(n, v, l, sh, col);
+    if cam.jitter.z > 0.5 { return vec4<f32>(c, 1.0); }
+    return vec4<f32>(to_srgb(tonemap(c)), 1.0);
+}
+
+fn lit(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, sh: f32, col: vec4<f32>) -> vec3<f32> {
     let ndl = max(dot(n, l), 0.0);
     let albedo = col.rgb;
     let rough = col.a;
@@ -395,7 +427,5 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let envc = mix(cam.ground.rgb, skyc, clamp(rv.z * 0.5 + 0.5, 0.0, 1.0));
     let fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(n, v), 0.0), 5.0);
     let env = envc * fres * (1.0 - rough * 0.7);
-    let c = diffuse + vec3<f32>(spec) + env;
-    if cam.jitter.z > 0.5 { return vec4<f32>(c, 1.0); }
-    return vec4<f32>(to_srgb(tonemap(c)), 1.0);
+    return diffuse + vec3<f32>(spec) + env;
 }

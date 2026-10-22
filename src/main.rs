@@ -704,10 +704,10 @@ impl App {
             log::warn!("wet {} low_ty {} no_strata {}", wetc, low_ty, no_strata);
         }
         self.stats = format!(
-            "wet {:.4} mL  cured {:.4} mL  deposited {:.4} mL  brush held {:.4} mL  err {:.2}%  hmax {:.3} mm  wet cells {}  nan {}",
+            "wet {:.4} mL  cured {:.4} mL  deposited {:.4} mL  brush held {:.4} mL  err {:.2}%  hmax {:.3} mm  wet cells {}  active tiles {}  nan {}  fps {:.0}  substeps {}",
             vol * 1e6, volm * 1e6, self.film.total_deposited * 1e6, self.brush.total_load() * 1e6,
             if self.film.total_deposited > 0.0 { (vol + volm + self.brush_scraped - self.brush_released - self.film.total_deposited) / self.film.total_deposited * 100.0 } else { 0.0 },
-            hmax * 1e3, wet, nan
+            hmax * 1e3, wet, self.film.active_tiles, nan, self.fps, self.film.substeps_last
         );
         log::warn!("{}", self.stats);
     }
@@ -749,7 +749,7 @@ impl App {
             let ms = (real_dt * 1e3 - self.last_cpu_ms).max(0.0);
             let s = &mut self.film.settings;
             if ms > self.frame_budget_ms * 1.15 {
-                s.max_substeps = (s.max_substeps as f32 * 0.85).floor().max(16.0) as u32;
+                s.max_substeps = (s.max_substeps as f32 * 0.85).floor().max(8.0) as u32;
             } else if ms < self.frame_budget_ms * 0.7 {
                 s.max_substeps = (s.max_substeps + 2).min(128);
             }

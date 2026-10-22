@@ -46,8 +46,7 @@ fn composition_rheo(s: Stack) -> vec2<f32> {
 }
 
 @compute @workgroup_size(16, 16)
-fn cure_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let id = tile_cell(wid, lid);
+fn cure_step(@builtin(global_invocation_id) id: vec3<u32>) {
     if !in_grid(id) { return; }
     let c = idx(id.x, id.y);
     if h[c] <= 0.0 {

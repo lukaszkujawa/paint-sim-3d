@@ -50,6 +50,7 @@ fn deposit(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if added > 0.0 {
         h[c] = h[c] + added;
+        mark_moved(id.x, id.y);
         stack_compact(&s);
         stack_store(c, s);
     }

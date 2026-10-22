@@ -93,6 +93,7 @@ impl Renderer {
             .sampler(&sampler, true)
             .storage(&film.h_buf, true)
             .storage(&film.m_buf, true)
+            .storage(&film.tile_flags, true)
             .build(&gpu.device, "render");
         let module = gpu.shader("render", include_str!("../../shaders/render.wgsl"));
         let pl = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

@@ -55,6 +55,31 @@ const TILE: u32 = 64u;
 @group(3) @binding(0) var<storage, read_write> tile_flags: array<u32>;
 @group(3) @binding(1) var<storage, read_write> tile_list: array<u32>;
 @group(3) @binding(2) var<storage, read_write> active_count: array<atomic<u32>>;
+@group(3) @binding(3) var<storage, read_write> tile_moved: array<u32>;
+
+const MOVED: u32 = 64u;
+const MOVE_EPS: f32 = 1e-7;
+
+fn tile16_of(i: u32, j: u32) -> u32 {
+    return (i / 16u) + (j / 16u) * tiles16().x;
+}
+
+fn mark_moved(i: u32, j: u32) {
+    tile_moved[tile16_of(i, j)] = 1u;
+}
+
+var<workgroup> wg_moved: atomic<u32>;
+
+fn begin_motion(li: u32) {
+    if li == 0u { atomicStore(&wg_moved, 0u); }
+    workgroupBarrier();
+}
+
+fn end_motion(moved: bool, wid: vec3<u32>, li: u32) {
+    if moved { atomicStore(&wg_moved, 1u); }
+    workgroupBarrier();
+    if li == 0u && atomicLoad(&wg_moved) != 0u { tile_moved[tile_list[wid.x]] = 1u; }
+}
 
 fn tiles16() -> vec2<u32> {
     return vec2<u32>((P.size.x + 15u) / 16u, (P.size.y + 15u) / 16u);

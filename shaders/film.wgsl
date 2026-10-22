@@ -461,6 +461,28 @@ fn nose(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     delta[c] = pack_off(best.x, best.y);
 }
 
+fn store_shed(c: u32, s: Shed) {
+    acc_s[4u * c] = vec4<f32>(s.amount, bitcast<f32>(s.i0), bitcast<f32>(s.j0), 0.0);
+    acc_s[4u * c + 1u] = s.w;
+}
+
+fn load_shed(c: u32) -> Shed {
+    let a = acc_s[4u * c];
+    var s: Shed;
+    s.amount = a.x;
+    s.i0 = bitcast<i32>(a.y);
+    s.j0 = bitcast<i32>(a.z);
+    s.w = acc_s[4u * c + 1u];
+    return s;
+}
+
+@compute @workgroup_size(16, 16)
+fn shed_pass(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    store_shed(idx(id.x, id.y), shed_of(i32(id.x), i32(id.y)));
+}
+
 @compute @workgroup_size(16, 16)
 fn slump(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let id = tile_cell(wid, lid);
@@ -469,7 +491,7 @@ fn slump(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
     let i = i32(id.x);
     let j = i32(id.y);
     let hc = h[c];
-    let mine = shed_of(i, j);
+    let mine = load_shed(c);
     let self_share = share_to(mine, i, j);
     var inn = 0.0;
     var best_in = 0.0;
@@ -485,7 +507,7 @@ fn slump(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
             let y = j + dj;
             if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
             if !cell_active(u32(x), u32(y)) { continue; }
-            let sn = shed_of(x, y);
+            let sn = load_shed(idx(u32(x), u32(y)));
             let give = share_to(sn, i, j);
             let take = share_to(mine, x, y);
             inn += give;
@@ -518,9 +540,15 @@ fn slump(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
 }
 
 @compute @workgroup_size(16, 16)
-fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    begin_motion(li);
     let id = tile_cell(wid, lid);
-    if !in_grid(id) { return; }
+    var moved = false;
+    if in_grid(id) { moved = apply_cell(id); }
+    end_motion(moved, wid, li);
+}
+
+fn apply_cell(id: vec3<u32>) -> bool {
     let c = idx(id.x, id.y);
     let i = i32(id.x);
     let j = i32(id.y);
@@ -551,6 +579,7 @@ fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
     let h0 = h[c];
     let hn = max(h0 - P.dt * st.div * P.inv_dx, 0.0);
     h[c] = hn;
+    let moved = abs(hn - h0) > MOVE_EPS;
     if h0 <= 0.0 && src != c {
         rheo[c] = rheo[src];
         let ts = strata_h[src];
@@ -566,14 +595,20 @@ fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
         strata_cure[c] = vec4<f32>(strata_cure[src][ks], 0.0, 0.0, 0.0);
     }
     acc[c] += accv * P.dt;
+    return moved;
 }
 
 @compute @workgroup_size(16, 16)
-fn commit_tmp(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn commit_tmp(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    begin_motion(li);
     let id = tile_cell(wid, lid);
-    if !in_grid(id) { return; }
-    let c = idx(id.x, id.y);
-    h[c] = tmp[c];
+    var moved = false;
+    if in_grid(id) {
+        let c = idx(id.x, id.y);
+        moved = abs(tmp[c] - h[c]) > MOVE_EPS;
+        h[c] = tmp[c];
+    }
+    end_motion(moved, wid, li);
 }
 
 @group(2) @binding(0) var<storage, read_write> stats_out: array<vec2<f32>>;
@@ -658,7 +693,11 @@ fn mark_tiles(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     }
     workgroupBarrier();
     if li == 0u {
-        tile_flags[wid.x + wid.y * tiles16().x] = atomicLoad(&wg_any);
+        let t = wid.x + wid.y * tiles16().x;
+        var flags = atomicLoad(&wg_any);
+        if tile_moved[t] != 0u { flags |= MOVED; }
+        tile_moved[t] = 0u;
+        tile_flags[t] = flags;
     }
 }
 
@@ -670,7 +709,7 @@ fn compact_tiles(@builtin(global_invocation_id) id: vec3<u32>) {
     if t >= nt { return; }
     let tx = i32(t % tw.x);
     let ty = i32(t / tw.x);
-    var any = tile_flags[t] & 1u;
+    var any = tile_flags[t] & MOVED;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dxi = -1; dxi <= 1; dxi++) {
             if dxi == 0 && dy == 0 { continue; }
@@ -683,7 +722,7 @@ fn compact_tiles(@builtin(global_invocation_id) id: vec3<u32>) {
                 if dxi == -1 && (fl & 4u) == 0u { need = false; }
                 if dy == 1 && (fl & 8u) == 0u { need = false; }
                 if dy == -1 && (fl & 16u) == 0u { need = false; }
-                if need { any |= fl & 1u; }
+                if need { any |= fl & MOVED; }
             }
         }
     }

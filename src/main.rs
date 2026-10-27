@@ -43,6 +43,8 @@ struct App {
     painter_speed: f32,
     sim_dt: f64,
     painter_cure_saved: Option<f32>,
+    painter_tilt_saved: Option<(f32, f32)>,
+    painter_last_pour: Option<[f32; 2]>,
     tool: Tool,
     air: Airborne,
     surface: CoarseSurface,
@@ -92,6 +94,7 @@ struct AutoScript {
     mu: f64,
     pig: i32,
     layer: String,
+    seed: u64,
     stop: u64,
 }
 
@@ -160,6 +163,8 @@ impl App {
             painter_speed: 2.0,
             sim_dt: 1.0 / 60.0,
             painter_cure_saved: None,
+            painter_tilt_saved: None,
+            painter_last_pour: None,
             prev_tool_pos: None,
             knife_dir: [1.0, 0.0],
             pending_deposits: Vec::new(),
@@ -240,7 +245,7 @@ impl App {
                 self.tool.pos = c.pos;
                 self.tool.vel = c.vel;
                 self.tool.flowing = c.flowing;
-                self.tool.height = c.height;
+                self.tool.height = if c.kind == ToolKind::Brush { self.brush.len * c.height } else { c.height };
                 self.tool.mu = c.mu;
                 self.tool.sigma = c.sigma;
                 self.tool.stick_diameter = c.stick_diameter;
@@ -248,12 +253,30 @@ impl App {
                 self.tool.bottle_radius = c.bottle_radius;
                 self.tool.bucket_flow = c.bucket_flow;
                 self.tool.bucket_radius = c.bucket_radius;
+                self.tool.knife_width = c.knife_width;
+                self.tool.knife_height = c.knife_height;
                 self.paint.frac = c.mix;
                 if c.reload {
-                    self.tool.reload();
+                    if c.kind == ToolKind::Brush {
+                        let mut f = c.mix;
+                        f[14] = (c.mu as f32).ln() + 10.0;
+                        self.brush.dip(&f);
+                    } else {
+                        self.tool.reload();
+                    }
                 }
                 if c.cut {
                     self.air.detach();
+                }
+                if c.kind == ToolKind::Pour && c.flowing {
+                    let p = [c.pos.x as f32, c.pos.y as f32];
+                    let p0 = self.painter_last_pour.unwrap_or(p);
+                    let vol = (c.pour_rate * self.sim_dt) as f32;
+                    let pig = self.paint.normalized().packed();
+                    self.pending_deposits.push(Deposit::stroke(p0, p, c.pour_radius as f32, vol, pig, self.film.dx).laid_by(Method::Pour));
+                    self.painter_last_pour = Some(p);
+                } else {
+                    self.painter_last_pour = None;
                 }
                 if c.cure_rate > 0.0 {
                     if self.painter_cure_saved.is_none() {
@@ -263,12 +286,32 @@ impl App {
                 } else if let Some(v) = self.painter_cure_saved.take() {
                     self.film.settings.cure_rate = v;
                 }
+                match c.tilt {
+                    Some((deg, dir)) => {
+                        if self.painter_tilt_saved.is_none() {
+                            self.painter_tilt_saved = Some((self.film.settings.tilt_deg, self.film.settings.tilt_dir_deg));
+                        }
+                        self.film.settings.tilt_deg = deg as f32;
+                        self.film.settings.tilt_dir_deg = dir as f32;
+                    }
+                    None => {
+                        if let Some((deg, dir)) = self.painter_tilt_saved.take() {
+                            self.film.settings.tilt_deg = deg;
+                            self.film.settings.tilt_dir_deg = dir;
+                        }
+                    }
+                }
                 true
             }
             None => {
                 self.tool.flowing = false;
+                self.painter_last_pour = None;
                 if let Some(v) = self.painter_cure_saved.take() {
                     self.film.settings.cure_rate = v;
+                }
+                if let Some((deg, dir)) = self.painter_tilt_saved.take() {
+                    self.film.settings.tilt_deg = deg;
+                    self.film.settings.tilt_dir_deg = dir;
                 }
                 true
             }
@@ -282,7 +325,7 @@ impl App {
         let Some(a) = &self.auto else { return false };
         if a.script == "pollock" {
             if self.painter.is_none() {
-                let mut p = pollock::Painter::new(7, self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+                let mut p = pollock::Painter::new(a.seed, self.film.settings.width_m as f64, self.film.settings.height_m as f64);
                 if !a.layer.is_empty() {
                     p.skip_to(&a.layer);
                 }
@@ -967,9 +1010,11 @@ impl App {
                 }
             }
             if total > 0.0 {
-                let span = (hi - lo).max(self.film.dx as f64);
-                let r = (2.0 * total / (std::f64::consts::PI * span)).sqrt().max(0.8 * self.film.dx as f64);
-                let ahead = 0.6 * r + 0.5 * self.film.dx as f64;
+                let dxm = self.film.dx as f64;
+                let span = (hi - lo).max(dxm);
+                let sweep = knife.as_ref().map(|k| k.sweep as f64).unwrap_or(0.0);
+                let r = (2.0 * total / (std::f64::consts::PI * span)).sqrt().max(0.5 * sweep + dxm).max(0.8 * dxm);
+                let ahead = r + 0.5 * dxm;
                 let a = center + blade * lo + d * ahead;
                 let b = center + blade * hi + d * ahead;
                 let pig = color::PaintMix { frac: mix }.normalized().packed();
@@ -1248,6 +1293,14 @@ impl App {
                 } else if ui.button("Pollock: stop").clicked() {
                     self.painter = None;
                     self.tool.flowing = false;
+                    self.painter_last_pour = None;
+                    if let Some(v) = self.painter_cure_saved.take() {
+                        self.film.settings.cure_rate = v;
+                    }
+                    if let Some((deg, dir)) = self.painter_tilt_saved.take() {
+                        self.film.settings.tilt_deg = deg;
+                        self.film.settings.tilt_dir_deg = dir;
+                    }
                 }
                 if let Some(p) = &self.painter {
                     ui.label(format!("seed {}  {}", p.seed, p.status()));
@@ -1504,6 +1557,7 @@ fn parse_auto() -> Option<AutoScript> {
     let mut yield_pa = -1.0f32;
     let mut pig = -1i32;
     let mut layer = String::new();
+    let mut seed: u64 = 7;
     let mut mu = -1.0f64;
     let mut angle = -1.0f32;
     let mut stop = 0u64;
@@ -1522,6 +1576,7 @@ fn parse_auto() -> Option<AutoScript> {
             "--sigma" => { sigma = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--pig" => { pig = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1); i += 1; }
             "--layer" => { layer = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
+            "--seed" => { seed = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(7); i += 1; }
             "--yield" => { yield_pa = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--mu" => { mu = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--angle" => { angle = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
@@ -1531,7 +1586,7 @@ fn parse_auto() -> Option<AutoScript> {
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, stop })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, stop })
 }
 
 fn main() {

@@ -57,6 +57,9 @@ impl Ribbon {
     }
 
     pub fn push(&mut self, p0: DVec2, p1: DVec2, vol: f64, speed: f64, spread: f64, r: f64) -> Option<Ribbon> {
+        if !(p0.is_finite() && p1.is_finite() && vol.is_finite() && speed.is_finite() && spread.is_finite() && r.is_finite()) {
+            return None;
+        }
         let mut finished = None;
         let continues = self.nodes.last().map(|n| n.p.distance(p0) <= JOIN_TOL).unwrap_or(false);
         if !continues {
@@ -126,13 +129,18 @@ impl Ribbon {
         }
         let s_end = self.nodes[n - 1].s;
         let s_avail = if flush { s_end } else { self.nodes[n - 2].s };
+        let mut guard = 0u32;
         loop {
             let s0 = self.cursor;
-            if s0 >= s_end - JOIN_TOL {
+            if !(s0 < s_end - JOIN_TOL) || guard > 100_000 {
                 break;
             }
-            let span = self.window(s0, step, s_avail);
+            guard += 1;
+            let span = self.window(s0, step, s_avail).max(JOIN_TOL);
             let s1 = if flush && s_end - s0 < 1.5 * span { s_end } else { (s0 + span).min(s_end) };
+            if !(s1 > s0) {
+                break;
+            }
             if !flush && s1 + self.window(s1, step, s_avail) > s_avail {
                 break;
             }

@@ -1,7 +1,9 @@
 pub mod banded;
+pub mod ribbon;
 
 use banded::Banded;
 use glam::{DMat3, DVec3};
+pub use ribbon::{Ribbon, Segment};
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
@@ -42,19 +44,14 @@ pub struct Rod {
     pub pig: [u32; 8],
     pub nozzle: Option<Nozzle>,
     pub feed_len: f64,
-    pub land_r: Option<f64>,
+    pub landed: Ribbon,
+    pub landed_done: Vec<Ribbon>,
     pub id: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct Landing {
-    pub p0: DVec3,
-    pub p1: DVec3,
-    pub r: f64,
-    pub r0: f64,
-    pub r1: f64,
-    pub vol: f64,
-    pub speed: f64,
+    pub seg: Segment,
     pub pig: [u32; 8],
     pub fluid: Fluid,
 }
@@ -141,7 +138,7 @@ impl Rod {
             tan.push(t);
             m1.push(any_perp(t));
         }
-        Self { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig, nozzle: Some(nozzle), feed_len: 0.0, land_r: None, id }
+        Self { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig, nozzle: Some(nozzle), feed_len: 0.0, landed: Ribbon::default(), landed_done: Vec::new(), id }
     }
 
     pub fn n(&self) -> usize {
@@ -427,7 +424,7 @@ impl Rod {
             self.feed_len += moved;
             self.vol[n - 2] += nz.flow * dt;
         }
-        self.contact(surface, out);
+        self.contact(surface);
         self.step_count += 1;
         if self.step_count % 3 == 0 || self.nozzle.is_some() && self.feed_len > 0.0 {
             self.remesh();
@@ -435,7 +432,7 @@ impl Rod {
         self.pinch(out);
     }
 
-    fn contact(&mut self, surface: &dyn Surface, out: &mut RodOut) {
+    fn contact(&mut self, surface: &dyn Surface) {
         let n = self.n();
         for i in 0..n {
             if self.frozen[i] {
@@ -467,19 +464,6 @@ impl Rod {
             }
         }
         let nn = self.n();
-        for i in 1..nn {
-            if self.frozen[i] || !self.frozen[i - 1] || (self.nozzle.is_some() && i == nn - 1) {
-                continue;
-            }
-            let reach = 1.2 * (self.vertex_radius(i) + self.vertex_radius(i - 1));
-            let d = self.x[i] - self.x[i - 1];
-            let zs = surface.height(self.x[i].x, self.x[i].y);
-            if d.length() <= reach && self.x[i].z <= zs + 3.0 * reach {
-                self.frozen[i] = true;
-                self.vimp[i] = self.v[i].length();
-                self.v[i] = DVec3::ZERO;
-            }
-        }
         let frozen_idx: Vec<usize> = (0..nn).filter(|k| self.frozen[*k]).collect();
         if !frozen_idx.is_empty() {
             for i in 0..nn {
@@ -548,30 +532,39 @@ impl Rod {
             self.stall = 0;
         }
         if self.stall > 150 && self.x.len() >= 3 {
-            self.emit_front(out);
+            self.emit_front();
             self.stall = 0;
         }
         let mut deposited = 0usize;
         while self.x.len() >= 3 && self.frozen[0] && self.frozen[1] && self.frozen[2] {
-            self.emit_front(out);
+            self.emit_front();
             deposited += 1;
         }
         let _ = deposited;
         if self.nozzle.is_none() {
             while self.x.len() >= 2 && self.frozen.iter().all(|f| *f) {
-                self.emit_front(out);
+                self.emit_front();
             }
         }
     }
 
-    fn emit_front(&mut self, out: &mut RodOut) {
+    fn emit_front(&mut self) {
         let r = self.edge_radius(0);
-        let r0 = self.land_r.unwrap_or(r);
-        let r1 = if self.x.len() >= 3 { self.vertex_radius(1) } else { r };
         let speed = self.vimp[0].max(self.vimp[1]);
-        out.landings.push(Landing { p0: self.x[0], p1: self.x[1], r, r0, r1, vol: self.vol[0], speed, pig: self.pig, fluid: self.fluid });
-        self.land_r = Some(r1);
+        let spread = impact_spread_factor(speed, 2.0 * r, &self.fluid);
+        if let Some(done) = self.landed.push(self.x[0].truncate(), self.x[1].truncate(), self.vol[0], speed, spread) {
+            self.landed_done.push(done);
+        }
         self.remove_vertex_front();
+    }
+
+    pub fn drain_landings(&mut self, step: f64, flush: bool, out: &mut Vec<Landing>) {
+        let mut segs = Vec::new();
+        for mut done in self.landed_done.drain(..) {
+            done.drain(step, true, &mut segs);
+        }
+        self.landed.drain(step, flush, &mut segs);
+        out.extend(segs.into_iter().map(|seg| Landing { seg, pig: self.pig, fluid: self.fluid }));
     }
 
     fn remove_vertex_front(&mut self) {
@@ -751,7 +744,8 @@ impl Rod {
             pig: self.pig,
             nozzle: None,
             feed_len: 0.0,
-            land_r: None,
+            landed: std::mem::take(&mut self.landed),
+            landed_done: std::mem::take(&mut self.landed_done),
             id: self.id + 1,
         };
         let last = lower.vol.len() - 1;
@@ -869,7 +863,7 @@ mod tests {
             tan.push(t);
             m1.push(any_perp(t));
         }
-        Rod { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig: [0; 8], nozzle: None, feed_len: 0.0, land_r: None, id: 0 }
+        Rod { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig: [0; 8], nozzle: None, feed_len: 0.0, landed: Ribbon::default(), landed_done: Vec::new(), id: 0 }
     }
 
     #[test]
@@ -927,11 +921,16 @@ mod tests {
                 panic!("non-finite at t={} step={} n={} spacing={} r={}", t, steps, rod.n(), rod.min_spacing(), r);
             }
         }
+        rod.drain_landings(4e-4, true, &mut out.landings);
+        for f in out.fragments.iter_mut() {
+            f.drain_landings(4e-4, true, &mut out.landings);
+        }
         for (k, l) in out.landings.iter().enumerate().skip(20).take(25) {
-            println!("landing {} p0 ({:.4},{:.4},{:.4}) p1 ({:.4},{:.4},{:.4}) len {:.2e} r {:.2e} vol {:.2e}", k, l.p0.x, l.p0.y, l.p0.z, l.p1.x, l.p1.y, l.p1.z, (l.p1 - l.p0).length(), l.r, l.vol);
+            let g = &l.seg;
+            println!("landing {} p0 ({:.4},{:.4}) p1 ({:.4},{:.4}) len {:.2e} r {:.2e} vol {:.2e}", k, g.p0.x, g.p0.y, g.p1.x, g.p1.y, g.p1.distance(g.p0), g.thread_r, g.vol);
         }
         let frag: f64 = out.fragments.iter().map(|r| r.total_volume()).sum::<f64>() + out.drops.iter().map(|d| d.vol).sum::<f64>();
-        let total = rod.total_volume() + out.landings.iter().map(|l| l.vol).sum::<f64>() + frag;
+        let total = rod.total_volume() + out.landings.iter().map(|l| l.seg.vol).sum::<f64>() + frag;
         println!("steps {} n {} landed {} airborne {} fragments {} total {}", steps, rod.n(), out.landings.len(), rod.total_volume(), frag, total);
         assert!(!out.landings.is_empty());
         let emitted = nz.flow * t + initial_volume;
@@ -963,7 +962,8 @@ mod tests {
                     let ls: Vec<f64> = (0..rod.n().saturating_sub(1)).map(|e| (rod.x[e + 1] - rod.x[e]).length()).collect();
                     panic!("non-finite rod {} nozzle {} at t={} n={} vol={:?} len={:?} frozen={:?} before={:?}", rod.id, rod.nozzle.is_some(), t, rod.n(), rod.vol, ls, rod.frozen, before);
                 }
-                landed += out.landings.iter().map(|l| l.vol).sum::<f64>();
+                rod.drain_landings(4e-4, rod.is_empty(), &mut out.landings);
+                landed += out.landings.iter().map(|l| l.seg.vol).sum::<f64>();
                 new_rods.extend(out.fragments);
                 landed += out.drops.iter().map(|d| d.vol).sum::<f64>();
             }
@@ -1001,7 +1001,8 @@ mod tests {
             for rod in rods.iter_mut() {
                 let mut out = RodOut { landings: vec![], drops: vec![], fragments: vec![] };
                 rod.step(dt, &Flat, &mut out, DVec3::new(0.0, 0.0, -G));
-                landed += out.landings.iter().map(|l| l.vol).sum::<f64>() + out.drops.iter().map(|d| d.vol).sum::<f64>();
+                rod.drain_landings(4e-4, rod.is_empty(), &mut out.landings);
+                landed += out.landings.iter().map(|l| l.seg.vol).sum::<f64>() + out.drops.iter().map(|d| d.vol).sum::<f64>();
                 new_rods.extend(out.fragments);
             }
             rods.retain(|r| !r.is_empty());
@@ -1037,7 +1038,7 @@ mod tests {
             tan.push(t);
             m1.push(any_perp(t));
         }
-        let mut rod = Rod { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig: [0; 8], nozzle: None, feed_len: 0.0, land_r: None, id: 0 };
+        let mut rod = Rod { x, v, vol, m1, tan, frozen: vec![false; n], vimp: vec![0.0; n], scratch: Vec::new(), step_count: 0, stall: 0, fluid, pig: [0; 8], nozzle: None, feed_len: 0.0, landed: Ribbon::default(), landed_done: Vec::new(), id: 0 };
         let mut out = RodOut { landings: vec![], drops: vec![], fragments: vec![] };
         let t0 = std::time::Instant::now();
         for _ in 0..20 {
@@ -1078,9 +1079,11 @@ mod tests {
         for _ in 0..200 {
             rod.step(2e-4, &Flat, &mut out, DVec3::new(0.0, 0.0, -G));
         }
-        let landed: f64 = out.landings.iter().map(|l| l.vol).sum();
+        rod.drain_landings(4e-4, true, &mut out.landings);
+        let landed: f64 = out.landings.iter().map(|l| l.seg.vol).sum();
         assert!(((rod.total_volume() + landed) - v0).abs() < 1e-12 * v0.max(1e-12) + 1e-15);
         let vz = rod.v.iter().map(|v| v.z).fold(0.0f64, |a, b| a.min(b));
         assert!(vz < -0.3, "vz {}", vz);
     }
 }
+

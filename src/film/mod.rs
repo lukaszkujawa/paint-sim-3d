@@ -24,41 +24,134 @@ pub struct Params {
 pub struct Deposit {
     pub p0: [f32; 2],
     pub p1: [f32; 2],
-    pub r: f32,
+    pub n0: [f32; 2],
+    pub n1: [f32; 2],
+    pub r0: f32,
+    pub r1: f32,
     pub h0: f32,
+    pub vol: f32,
     pub kind: u32,
-    pub pad: u32,
+    pub pad: [u32; 3],
     pub pig: [u32; 8],
 }
 
-impl Deposit {
-    pub fn capsule(p0: [f32; 2], p1: [f32; 2], r: f32, volume: f32, pig: [u32; 8], min_r: f32) -> Self {
-        let rr = r.max(min_r);
-        let l = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
-        let area_int = 4.0 * rr * l / 3.0 + std::f32::consts::PI * rr * rr / 2.0;
-        Self { p0, p1, r: rr, h0: volume / area_int, kind: 0, pad: 0, pig }
-    }
+pub const DEPOSIT_RECYCLED: u32 = 1;
+pub const DEPOSIT_CAP_START: u32 = 2;
+pub const DEPOSIT_CAP_END: u32 = 4;
+const DEPOSIT_METHOD_SHIFT: u32 = 8;
 
-    pub fn band(p0: [f32; 2], p1: [f32; 2], r0: f32, r1: f32, volume: f32, pig: [u32; 8], min_r: f32) -> Self {
+#[derive(Clone, Copy)]
+pub enum Method {
+    Thread = 1,
+    Drop = 2,
+    Pour = 3,
+    Brush = 4,
+    Knife = 5,
+}
+
+fn segment_dir(p0: [f32; 2], p1: [f32; 2]) -> ([f32; 2], f32) {
+    let d = [p1[0] - p0[0], p1[1] - p0[1]];
+    let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+    if l > 0.0 { ([d[0] / l, d[1] / l], l) } else { ([1.0, 0.0], 0.0) }
+}
+
+impl Deposit {
+    pub fn ribbon(p0: [f32; 2], p1: [f32; 2], n0: [f32; 2], n1: [f32; 2], r0: f32, r1: f32, caps: u32, volume: f32, pig: [u32; 8], dx: f32) -> Self {
+        let min_r = 0.8 * dx;
         let a = r0.max(min_r);
         let b = r1.max(min_r);
-        let l = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
-        if l < 0.5 * (a + b) {
-            return Self::capsule(p0, p1, 0.5 * (a + b), volume, pig, min_r);
+        let mut d = Self { p0, p1, n0, n1, r0: a, r1: b, h0: a, vol: volume, kind: caps, pad: [0; 3], pig };
+        let lattice = 0.25 * dx;
+        let sampled = d.sampled_volume(lattice);
+        let rm = a.max(b);
+        let disc = std::f32::consts::PI * rm * rm * rm / 2.0;
+        if sampled < 0.25 * disc {
+            let mid = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
+            d = Self { p0: mid, p1: mid, n0, n1, r0: rm, r1: rm, h0: rm, vol: volume, kind: caps, pad: [0; 3], pig };
+            d.h0 = volume / d.sampled_volume(lattice) * rm;
+            return d;
         }
-        let area_k = 4.0 / 9.0 * l * (a * a + a * b + b * b);
-        let k = volume / area_k;
-        Self { p0, p1, r: a, h0: k * a, kind: 2, pad: b.to_bits(), pig }
+        d.h0 = volume / sampled * a;
+        d
     }
 
-    pub fn stroke(p0: [f32; 2], p1: [f32; 2], r: f32, volume: f32, pig: [u32; 8], min_r: f32) -> Self {
-        let rr = r.max(min_r);
-        let l = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
-        if l < rr {
-            return Self::capsule(p0, p1, r, volume, pig, min_r);
+    pub fn capsule(p0: [f32; 2], p1: [f32; 2], r: f32, volume: f32, pig: [u32; 8], dx: f32) -> Self {
+        let (d, _) = segment_dir(p0, p1);
+        Self::ribbon(p0, p1, d, d, r, r, DEPOSIT_CAP_START | DEPOSIT_CAP_END, volume, pig, dx)
+    }
+
+    pub fn stroke(p0: [f32; 2], p1: [f32; 2], r: f32, volume: f32, pig: [u32; 8], dx: f32) -> Self {
+        let (d, l) = segment_dir(p0, p1);
+        if l < r.max(0.8 * dx) {
+            return Self::capsule(p0, p1, r, volume, pig, dx);
         }
-        let area_int = 4.0 * rr * l / 3.0;
-        Self { p0, p1, r: rr, h0: volume / area_int, kind: 2, pad: 0, pig }
+        Self::ribbon(p0, p1, d, d, r, r, 0, volume, pig, dx)
+    }
+
+    pub fn laid_by(mut self, method: Method) -> Self {
+        self.kind |= (method as u32) << DEPOSIT_METHOD_SHIFT;
+        self
+    }
+
+    pub fn recycled(mut self) -> Self {
+        self.kind |= DEPOSIT_RECYCLED;
+        self
+    }
+
+    pub fn max_radius(&self) -> f32 {
+        self.r0.max(self.r1)
+    }
+
+    pub fn max_height(&self) -> f32 {
+        self.h0 * self.max_radius() / self.r0
+    }
+
+    fn sampled_volume(&self, lattice: f32) -> f32 {
+        let rm = self.max_radius() + lattice;
+        let x0 = ((self.p0[0].min(self.p1[0]) - rm) / lattice).floor() as i32;
+        let x1 = ((self.p0[0].max(self.p1[0]) + rm) / lattice).ceil() as i32;
+        let y0 = ((self.p0[1].min(self.p1[1]) - rm) / lattice).floor() as i32;
+        let y1 = ((self.p0[1].max(self.p1[1]) + rm) / lattice).ceil() as i32;
+        let mut sum = 0.0;
+        for i in x0..x1 {
+            for j in y0..y1 {
+                sum += self.height_at([(i as f32 + 0.5) * lattice, (j as f32 + 0.5) * lattice]);
+            }
+        }
+        sum * lattice * lattice
+    }
+
+    pub fn height_at(&self, p: [f32; 2]) -> f32 {
+        let (dir, l) = segment_dir(self.p0, self.p1);
+        let q0 = [p[0] - self.p0[0], p[1] - self.p0[1]];
+        let q1 = [p[0] - self.p1[0], p[1] - self.p1[1]];
+        let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
+        if l <= 0.0 {
+            let x = len(q0) / self.r0;
+            return if x < 1.0 { self.h0 * (1.0 - x * x) } else { 0.0 };
+        }
+        let cap_start = self.kind & DEPOSIT_CAP_START != 0;
+        let cap_end = self.kind & DEPOSIT_CAP_END != 0;
+        if !cap_start && q0[0] * self.n0[0] + q0[1] * self.n0[1] < 0.0 {
+            return 0.0;
+        }
+        if !cap_end && q1[0] * self.n1[0] + q1[1] * self.n1[1] >= 0.0 {
+            return 0.0;
+        }
+        let u = q0[0] * dir[0] + q0[1] * dir[1];
+        if u < -self.r0 || u > l + self.r1 {
+            return 0.0;
+        }
+        let mut dist = (q0[0] * dir[1] - q0[1] * dir[0]).abs();
+        if cap_start && u < 0.0 {
+            dist = len(q0);
+        }
+        if cap_end && u > l {
+            dist = len(q1);
+        }
+        let rt = self.r0 + (self.r1 - self.r0) * (u / l).clamp(0.0, 1.0);
+        let x = dist / rt;
+        if x < 1.0 { self.h0 * (rt / self.r0) * (1.0 - x * x) } else { 0.0 }
     }
 }
 
@@ -251,8 +344,7 @@ pub struct Film {
     pub scrap_pending: [std::sync::Arc<std::sync::atomic::AtomicU8>; 2],
     pub knife_active: bool,
     pub contacts: wgpu::Buffer,
-    pub ctile_start: wgpu::Buffer,
-    pub ctile_count: wgpu::Buffer,
+    pub ctile_range: wgpu::Buffer,
     pub ctile_items: wgpu::Buffer,
     pub reservoir: wgpu::Buffer,
     pub res_read: [wgpu::Buffer; 2],
@@ -270,6 +362,8 @@ pub struct Film {
     pub tile_items: wgpu::Buffer,
     pub color_tex: wgpu::Texture,
     pub color_view: wgpu::TextureView,
+    pub detail_view: wgpu::TextureView,
+    lay: wgpu::Buffer,
     bg0: wgpu::BindGroup,
     bg1: wgpu::BindGroup,
     bg_fac: wgpu::BindGroup,
@@ -367,8 +461,7 @@ impl Film {
         let pool_buf = gpu.storage("pool", npool * 8);
         let pool_read = [gpu.readback("pool_r0", npool * 8), gpu.readback("pool_r1", npool * 8)];
         let contacts = gpu.storage("contacts", (MAX_CONTACTS * std::mem::size_of::<Contact>()) as u64);
-        let ctile_start = gpu.storage("ctile_start", ntiles * 4);
-        let ctile_count = gpu.storage("ctile_count", ntiles * 4);
+        let ctile_range = gpu.storage("ctile_range", ntiles * 8);
         let ctile_items = gpu.storage("ctile_items", (MAX_CONTACTS * 16 * 4) as u64);
         let reservoir = gpu.storage("reservoir", (MAX_BRISTLES * 17 * 4) as u64);
         let res_read = [gpu.readback("res_r0", (MAX_BRISTLES * 17 * 4) as u64), gpu.readback("res_r1", (MAX_BRISTLES * 17 * 4) as u64)];
@@ -390,6 +483,18 @@ impl Film {
             view_formats: &[],
         });
         let color_view = color_tex.create_view(&Default::default());
+        let detail_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("detail"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let detail_view = detail_tex.create_view(&Default::default());
+        let lay = gpu.storage("lay", n * 4);
 
         let white = substrate_refl(n as usize, settings.raw_canvas);
         gpu.queue.write_buffer(&sub_refl, 0, bytemuck::cast_slice(&white));
@@ -437,12 +542,14 @@ impl Film {
             .build(&gpu.device, "dep");
         let (l_shade, bg_shade) = BindBuilder::new(stages)
             .storage_texture(&color_view, wgpu::TextureFormat::Rgba16Float, wgpu::StorageTextureAccess::WriteOnly)
+            .storage_texture(&detail_view, wgpu::TextureFormat::Rgba16Float, wgpu::StorageTextureAccess::WriteOnly)
             .build(&gpu.device, "shade");
         let (l_tiles, bg_tiles) = BindBuilder::new(stages)
             .storage(&tile_flags, false)
             .storage(&tile_list, false)
             .storage(&active_count, false)
             .storage(&tile_moved, false)
+            .storage(&lay, false)
             .build(&gpu.device, "tiles");
         let (l_knife, bg_knife) = BindBuilder::new(stages)
             .uniform(&knife_buf)
@@ -451,8 +558,7 @@ impl Film {
             .build(&gpu.device, "knife");
         let (l_brush, bg_brush) = BindBuilder::new(stages)
             .storage(&contacts, true)
-            .storage(&ctile_start, true)
-            .storage(&ctile_count, true)
+            .storage(&ctile_range, true)
             .storage(&ctile_items, true)
             .storage(&reservoir, false)
             .build(&gpu.device, "brush");
@@ -517,9 +623,9 @@ impl Film {
         let mut f = Self {
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
-            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_start, ctile_count, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
+            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
-            color_tex, color_view, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
+            color_tex, color_view, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
             p_strata_limit, p_strata_update, p_strata_fill, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,
@@ -646,7 +752,7 @@ impl Film {
 
     pub fn clear(&mut self, gpu: &Gpu) {
         let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("clear") });
-        for b in [&self.h_buf, &self.m_buf, &self.lap, &self.flux, &self.flux_s, &self.alpha, &self.delta, &self.tmp, &self.acc_s, &self.strata_h, &self.strata_pig, &self.strata_cure, &self.strata_h2, &self.strata_pig2, &self.alpha_s, &self.tile_flags] {
+        for b in [&self.h_buf, &self.m_buf, &self.lap, &self.flux, &self.flux_s, &self.alpha, &self.delta, &self.tmp, &self.acc_s, &self.strata_h, &self.strata_pig, &self.strata_cure, &self.strata_h2, &self.strata_pig2, &self.alpha_s, &self.tile_flags, &self.lay] {
             enc.clear_buffer(b, 0, None);
         }
         gpu.queue.submit(std::iter::once(enc.finish()));
@@ -698,18 +804,15 @@ impl Film {
                 }
             }
         }
-        let mut start = vec![0u32; nt];
-        let mut cnt = vec![0u32; nt];
+        let mut range = vec![[0u32; 2]; nt];
         let mut items: Vec<u32> = Vec::new();
         for t in 0..nt {
-            start[t] = items.len() as u32;
-            cnt[t] = lists[t].len() as u32;
+            range[t] = [items.len() as u32, lists[t].len() as u32];
             items.extend_from_slice(&lists[t]);
         }
         items.truncate(MAX_CONTACTS * 16);
         gpu.queue.write_buffer(&self.contacts, 0, bytemuck::cast_slice(&cs[..count]));
-        gpu.queue.write_buffer(&self.ctile_start, 0, bytemuck::cast_slice(&start));
-        gpu.queue.write_buffer(&self.ctile_count, 0, bytemuck::cast_slice(&cnt));
+        gpu.queue.write_buffer(&self.ctile_range, 0, bytemuck::cast_slice(&range));
         if !items.is_empty() {
             gpu.queue.write_buffer(&self.ctile_items, 0, bytemuck::cast_slice(&items));
         }
@@ -809,21 +912,12 @@ impl Film {
         let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nt];
         let tile_m = 64.0 * self.dx;
         for (di, d) in deps.iter().enumerate().take(count) {
-            self.h_max_pending = self.h_max_pending.max(d.h0 + self.h_max);
-            let rb = if d.pad != 0 { d.r.max(f32::from_bits(d.pad)) } else { d.r };
+            self.h_max_pending = self.h_max_pending.max(d.max_height() + self.h_max);
+            let rb = d.max_radius();
             let inside = d.p0[0].max(d.p1[0]) + rb > 0.0 && d.p0[1].max(d.p1[1]) + rb > 0.0 && d.p0[0].min(d.p1[0]) - rb < self.settings.width_m && d.p0[1].min(d.p1[1]) - rb < self.settings.height_m;
             if !inside { continue; }
-            if d.kind & 1 == 0 {
-                let l = (((d.p1[0] - d.p0[0]).powi(2) + (d.p1[1] - d.p0[1]).powi(2)) as f64).sqrt();
-                if d.pad != 0 {
-                    let r0 = d.r as f64;
-                    let r1 = f32::from_bits(d.pad) as f64;
-                    let k = d.h0 as f64 / r0;
-                    self.total_deposited += k * 4.0 / 9.0 * l * (r0 * r0 + r0 * r1 + r1 * r1);
-                } else {
-                    let cap = if d.kind == 2 { 0.0 } else { 0.5 };
-                    self.total_deposited += (d.h0 as f64) * (4.0 * d.r as f64 * l / 3.0 + std::f64::consts::PI * (d.r as f64).powi(2) * cap);
-                }
+            if d.kind & DEPOSIT_RECYCLED == 0 {
+                self.total_deposited += d.vol as f64;
             }
             let minx = d.p0[0].min(d.p1[0]) - rb;
             let maxx = d.p0[0].max(d.p1[0]) + rb;
@@ -930,3 +1024,46 @@ impl Film {
         self.frame += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sampled_volume(d: &Deposit) -> f32 {
+        let r = d.max_radius();
+        let step = r / 40.0;
+        let lo = [d.p0[0].min(d.p1[0]) - 2.0 * r, d.p0[1].min(d.p1[1]) - 2.0 * r];
+        let hi = [d.p0[0].max(d.p1[0]) + 2.0 * r, d.p0[1].max(d.p1[1]) + 2.0 * r];
+        let mut sum = 0.0;
+        let mut x = lo[0];
+        while x < hi[0] {
+            let mut y = lo[1];
+            while y < hi[1] {
+                sum += d.height_at([x, y]);
+                y += step;
+            }
+            x += step;
+        }
+        sum * step * step
+    }
+
+    #[test]
+    fn ribbon_segments_hold_their_volume() {
+        let pig = [0u32; 8];
+        let c = 0.3f32.cos();
+        let s = 0.3f32.sin();
+        let cases = [
+            Deposit::ribbon([0.0, 0.0], [1e-3, 0.0], [1.0, 0.0], [1.0, 0.0], 4e-4, 6e-4, 0, 1e-9, pig, 3.9e-4),
+            Deposit::ribbon([0.0, 0.0], [1e-3, 0.0], [c, -s], [c, s], 4e-4, 6e-4, 0, 1e-9, pig, 3.9e-4),
+            Deposit::ribbon([0.0, 0.0], [3e-4, 0.0], [c, s], [c, -s], 8e-4, 8e-4, 0, 1e-9, pig, 3.9e-4),
+            Deposit::capsule([0.0, 0.0], [2e-3, 1e-3], 5e-4, 1e-9, pig, 3.9e-4),
+            Deposit::capsule([0.0, 0.0], [0.0, 0.0], 5e-4, 1e-9, pig, 3.9e-4),
+            Deposit::stroke([0.0, 0.0], [4e-3, 0.0], 5e-4, 1e-9, pig, 3.9e-4),
+        ];
+        for (i, d) in cases.iter().enumerate() {
+            let v = sampled_volume(d);
+            assert!((v - d.vol).abs() < 0.03 * d.vol, "case {} sampled {} stored {}", i, v, d.vol);
+        }
+    }
+}
+

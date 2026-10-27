@@ -16,13 +16,28 @@ struct Params {
 struct Deposit {
     p0: vec2<f32>,
     p1: vec2<f32>,
-    r: f32,
+    n0: vec2<f32>,
+    n1: vec2<f32>,
+    r0: f32,
+    r1: f32,
     h0: f32,
+    vol: f32,
     kind: u32,
-    pad: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
     pig0: vec4<u32>,
     pig1: vec4<u32>,
 }
+
+const DEPOSIT_CAP_START: u32 = 2u;
+const DEPOSIT_CAP_END: u32 = 4u;
+const DEPOSIT_METHOD_SHIFT: u32 = 8u;
+const METHOD_THREAD: u32 = 1u;
+const METHOD_DROP: u32 = 2u;
+const METHOD_POUR: u32 = 3u;
+const METHOD_BRUSH: u32 = 4u;
+const METHOD_KNIFE: u32 = 5u;
 
 const STRATA: u32 = 4u;
 const NPIG: u32 = 12u;
@@ -56,6 +71,21 @@ const TILE: u32 = 64u;
 @group(3) @binding(1) var<storage, read_write> tile_list: array<u32>;
 @group(3) @binding(2) var<storage, read_write> active_count: array<atomic<u32>>;
 @group(3) @binding(3) var<storage, read_write> tile_moved: array<u32>;
+@group(3) @binding(4) var<storage, read_write> lay: array<u32>;
+
+fn lay_pack(method: u32, dir: vec2<f32>) -> u32 {
+    let turn = atan2(dir.y, dir.x) / 6.2831853 + 0.5;
+    return (method & 0xffu) | (u32(clamp(turn, 0.0, 1.0) * 65535.0) << 8u);
+}
+
+fn lay_method(v: u32) -> u32 {
+    return v & 0xffu;
+}
+
+fn lay_dir(v: u32) -> vec2<f32> {
+    let ang = (f32((v >> 8u) & 0xffffu) / 65535.0 - 0.5) * 6.2831853;
+    return vec2<f32>(cos(ang), sin(ang));
+}
 
 const MOVED: u32 = 64u;
 const MOVE_EPS: f32 = 1e-7;

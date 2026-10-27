@@ -60,6 +60,7 @@ fn knife(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if removed <= 0.0 { return; }
     h[c] = hv - removed;
+    lay[c] = lay_pack(METHOD_KNIFE, K.dir);
     mark_moved(id.x, id.y);
     stack_compact(&s);
     stack_store(c, s);

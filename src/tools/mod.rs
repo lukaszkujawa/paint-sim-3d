@@ -1,5 +1,5 @@
 use crate::color::PaintMix;
-use crate::film::Deposit;
+use crate::film::{Deposit, Method, DEPOSIT_CAP_END, DEPOSIT_CAP_START};
 use crate::rod::{drop_step, impact_spread_factor, splash_count, Drop, Fluid, Nozzle, Rod, RodOut, Surface};
 use rand::Rng;
 use glam::DVec3;
@@ -334,6 +334,7 @@ impl Airborne {
                     if rod.is_empty() {
                         break;
                     }
+                    rod.drain_landings(dx as f64, false, &mut out.landings);
                     let nonfinite = rod.x.iter().any(|x| !x.is_finite()) || rod.v.iter().any(|v| !v.is_finite());
                     let outside = rod.x.iter().any(|x| x.x < -0.5 || x.y < -0.5 || x.x > bounds[0] + 0.5 || x.y > bounds[1] + 0.5 || x.z > 3.0);
                     if outside && !nonfinite {
@@ -362,6 +363,9 @@ impl Airborne {
                         break;
                     }
                 }
+                if rod.is_empty() {
+                    rod.drain_landings(dx as f64, true, &mut out.landings);
+                }
                 out
             })
             .collect();
@@ -371,26 +375,27 @@ impl Airborne {
         let mut splashes: Vec<Drop> = Vec::new();
         for out in outs {
             for l in out.landings {
-                let mut vol = l.vol;
-                let n = splash_count(l.speed, 2.0 * l.r, &l.fluid);
+                let g = l.seg;
+                let mut vol = g.vol;
+                let n = splash_count(g.speed, 2.0 * g.thread_r, &l.fluid);
                 if n > 0 {
                     let share = (0.3 * vol).min(vol);
                     let each = share / n as f64;
-                    let mid = 0.5 * (l.p0 + l.p1);
+                    let mid = 0.5 * (g.p0 + g.p1);
                     for _ in 0..n {
                         let az: f64 = rng.random::<f64>() * std::f64::consts::TAU;
                         let el: f64 = (30.0 + 30.0 * rng.random::<f64>()).to_radians();
-                        let sp = l.speed * (0.1 + 0.2 * rng.random::<f64>());
+                        let sp = g.speed * (0.1 + 0.2 * rng.random::<f64>());
                         let v = DVec3::new(sp * el.cos() * az.cos(), sp * el.cos() * az.sin(), sp * el.sin());
                         let frac = 0.5 + rng.random::<f64>();
-                        splashes.push(Drop { x: mid + DVec3::new(0.0, 0.0, 2.0 * l.r), v, vol: each * frac, pig: l.pig, fluid: l.fluid });
+                        splashes.push(Drop { x: DVec3::new(mid.x, mid.y, 2.0 * g.thread_r), v, vol: each * frac, pig: l.pig, fluid: l.fluid });
                     }
                     let spent: f64 = splashes.iter().rev().take(n).map(|d| d.vol).sum();
                     vol = (vol - spent).max(0.0);
                 }
-                let f = impact_spread_factor(l.speed, 2.0 * l.r, &l.fluid);
-                let d = Deposit::band([l.p0.x as f32, l.p0.y as f32], [l.p1.x as f32, l.p1.y as f32], (l.r0 * f) as f32, (l.r1 * f) as f32, vol as f32, l.pig, 0.8 * dx);
-                surface.add_recent(d.p0, d.p1, d.r, d.h0);
+                let caps = if g.cap_start { DEPOSIT_CAP_START } else { 0 } | if g.cap_end { DEPOSIT_CAP_END } else { 0 };
+                let d = Deposit::ribbon(g.p0.as_vec2().to_array(), g.p1.as_vec2().to_array(), g.n0.as_vec2().to_array(), g.n1.as_vec2().to_array(), g.r0 as f32, g.r1 as f32, caps, vol as f32, l.pig, dx).laid_by(Method::Thread);
+                surface.add_recent(d.p0, d.p1, d.max_radius(), d.max_height());
                 self.landed_volume += vol;
                 deposits.push(d);
             }
@@ -437,8 +442,8 @@ impl Airborne {
                         }
                         vol = vol.max(0.0);
                     }
-                    let dep = Deposit::capsule([d.x.x as f32, d.x.y as f32], [d.x.x as f32, d.x.y as f32], rd, vol as f32, d.pig, 0.8 * dx);
-                    surface.add_recent(dep.p0, dep.p1, dep.r, dep.h0);
+                    let dep = Deposit::capsule([d.x.x as f32, d.x.y as f32], [d.x.x as f32, d.x.y as f32], rd, vol as f32, d.pig, dx).laid_by(Method::Drop);
+                    surface.add_recent(dep.p0, dep.p1, dep.max_radius(), dep.max_height());
                     self.landed_volume += vol;
                     deposits.push(dep);
                     landed = true;

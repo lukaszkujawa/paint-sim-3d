@@ -8,10 +8,9 @@ struct Contact {
 }
 
 @group(2) @binding(0) var<storage, read> contacts: array<Contact>;
-@group(2) @binding(1) var<storage, read> ctile_start: array<u32>;
-@group(2) @binding(2) var<storage, read> ctile_count: array<u32>;
-@group(2) @binding(3) var<storage, read> ctile_items: array<u32>;
-@group(2) @binding(4) var<storage, read_write> reservoir: array<atomic<u32>>;
+@group(2) @binding(1) var<storage, read> ctile_range: array<vec2<u32>>;
+@group(2) @binding(2) var<storage, read> ctile_items: array<u32>;
+@group(2) @binding(3) var<storage, read_write> reservoir: array<atomic<u32>>;
 
 const RES_UNIT: f32 = 1e15;
 const LEAVE_FILM: f32 = 8e-5;
@@ -30,15 +29,17 @@ fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
     if !in_grid(id) { return; }
     let tile = (id.x / TILE) + (id.y / TILE) * P.tiles.x;
-    let n = ctile_count[tile];
+    let range = ctile_range[tile];
+    let n = range.y;
     if n == 0u { return; }
     let c = idx(id.x, id.y);
     let hv = h[c];
     if hv <= LEAVE_FILM { return; }
-    let start = ctile_start[tile];
+    let start = range.x;
     let p = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * P.dx;
     var cap = 1e9;
     var who = 0xffffffffu;
+    var stroke = vec2<f32>(1.0, 0.0);
     for (var q = 0u; q < n; q++) {
         let k = contacts[ctile_items[start + q]];
         if seg_dist(p, k.p0, k.p1) < k.r {
@@ -46,10 +47,13 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
             if cc < cap {
                 cap = cc;
                 who = k.bristle;
+                stroke = k.p1 - k.p0;
             }
         }
     }
-    if who == 0xffffffffu || hv <= cap { return; }
+    if who == 0xffffffffu { return; }
+    lay[c] = lay_pack(METHOD_BRUSH, normalize(stroke + vec2<f32>(1e-9, 0.0)));
+    if hv <= cap { return; }
     var s = stack_load(c);
     var excess = hv - cap;
     var removed = 0.0;

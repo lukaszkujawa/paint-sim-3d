@@ -63,6 +63,10 @@ impl Camera {
     }
 }
 
+fn pixel_footprint(cam: &Camera, viewport_height: u32) -> f32 {
+    cam.dist * 2.0 * (0.5 * cam.fov).tan() / viewport_height.max(1) as f32
+}
+
 pub struct Renderer {
     pub cam_buf: wgpu::Buffer,
     pub bg: wgpu::BindGroup,
@@ -94,6 +98,7 @@ impl Renderer {
             .storage(&film.h_buf, true)
             .storage(&film.m_buf, true)
             .storage(&film.tile_flags, true)
+            .texture(&film.detail_view, wgpu::TextureSampleType::Float { filterable: true })
             .build(&gpu.device, "render");
         let module = gpu.shader("render", include_str!("../../shaders/render.wgsl"));
         let pl = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -147,7 +152,8 @@ impl Renderer {
     }
 
     pub fn update(&self, gpu: &Gpu, cam: &Camera, film: &Film) {
-        let u = self.uniform(cam, film);
+        let mut u = self.uniform(cam, film);
+        u.jitter[3] = pixel_footprint(cam, gpu.config.height);
         gpu.queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&u));
     }
 
@@ -383,10 +389,11 @@ impl Beauty {
             let sx = ((i % grid) as f32 + 0.5) / grid as f32 - 0.5;
             let sy = ((i / grid) as f32 + 0.5) / grid as f32 - 0.5;
             let phi = (i as f32 * 2.399963) % (2.0 * std::f32::consts::PI);
-            let rr = 0.10 * (((i as f32 + 0.5) / spp as f32).sqrt());
+            let rr = 0.12 * (((i as f32 + 0.5) / spp as f32).sqrt());
             let lj = (l + u1 * (rr * phi.cos()) + u2 * (rr * phi.sin())).normalize();
             let mut u = base;
-            u.jitter = [sx * 2.0 / width as f32, sy * 2.0 / height as f32, 1.0, 0.0];
+            let footprint = if ortho { film.settings.width_m / width as f32 } else { pixel_footprint(&view_cam, height) };
+            u.jitter = [sx * 2.0 / width as f32, sy * 2.0 / height as f32, 1.0, footprint];
             u.ortho = [if ortho { 1.0 } else { 0.0 }, base.ortho[1], base.ortho[2], 0.0];
             u.light = [lj.x, lj.y, lj.z, renderer.light_intensity];
             gpu.queue.write_buffer(&renderer.cam_buf, 0, bytemuck::bytes_of(&u));

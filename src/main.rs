@@ -7,7 +7,7 @@ mod render;
 mod rod;
 mod tools;
 
-use film::{Deposit, Film, FilmSettings, KnifeParams, Scrap};
+use film::{Deposit, Film, FilmSettings, KnifeParams, Method, Scrap};
 use glam::Vec3;
 use render::{Beauty, Camera, Refine, Renderer, TubeRenderer};
 use tools::{Airborne, CoarseSurface, Tool, ToolKind};
@@ -79,6 +79,7 @@ struct AutoScript {
     frames: u64,
     shot: String,
     beauty: String,
+    view: String,
     tilt: f32,
     cam: String,
     script: String,
@@ -129,6 +130,7 @@ impl App {
                 "close" => { cam.pitch = 1.2; cam.dist = 0.3; cam.yaw = -1.5708; }
                 "blob" => { cam.pitch = 1.0; cam.dist = 0.12; cam.yaw = -1.0; }
                 "side" => { cam.pitch = 0.35; cam.dist = 0.6; cam.yaw = -0.9; }
+                "macro" => { cam.pitch = 0.9; cam.dist = 0.07; cam.yaw = -1.2; }
                 _ => {}
             }
         }
@@ -199,26 +201,26 @@ impl App {
             let mut paint = color::PaintMix::pure(1);
             paint.frac[12] = 0.3;
             paint.frac[13] = 0.0;
-            deposits.push(Deposit::capsule(curve(t0), curve(t1), 0.0012, 1.5e-7 * dt, paint.normalized().packed(), 0.75 * self.film.dx));
+            deposits.push(Deposit::capsule(curve(t0), curve(t1), 0.0012, 1.5e-7 * dt, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
         }
         if (40..100).contains(&f) {
             let t0 = (f - 40) as f32 / 60.0;
             let t1 = (f - 39) as f32 / 60.0;
             let line = |t: f32| [w * (0.2 + 0.6 * t), hgt * (0.7 - 0.3 * t)];
             let paint = color::PaintMix::pure(3);
-            deposits.push(Deposit::capsule(line(t0), line(t1), 0.0025, 1.2e-6 * dt, paint.normalized().packed(), 0.75 * self.film.dx));
+            deposits.push(Deposit::capsule(line(t0), line(t1), 0.0025, 1.2e-6 * dt, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
         }
         if (60..75).contains(&f) {
             let mut paint = color::PaintMix::pure(2);
             paint.frac[0] = 0.3;
             paint.frac[12] = 0.3;
             paint.frac[13] = 0.0;
-            deposits.push(Deposit::capsule([w * 0.5, hgt * 0.5], [w * 0.5, hgt * 0.5], 0.02, 6.0e-6 * dt * 4.0, paint.normalized().packed(), 0.75 * self.film.dx));
+            deposits.push(Deposit::capsule([w * 0.5, hgt * 0.5], [w * 0.5, hgt * 0.5], 0.02, 6.0e-6 * dt * 4.0, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
         }
         if (150..170).contains(&f) {
             let mut paint = color::PaintMix::pure(5);
             paint.frac[12] = 0.1;
-            deposits.push(Deposit::capsule([w * 0.5, hgt * 0.5], [w * 0.52, hgt * 0.51], 0.008, 4.0e-6 * dt, paint.normalized().packed(), 0.75 * self.film.dx));
+            deposits.push(Deposit::capsule([w * 0.5, hgt * 0.5], [w * 0.52, hgt * 0.51], 0.008, 4.0e-6 * dt, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
         }
     }
 
@@ -378,7 +380,7 @@ impl App {
                 paint.frac[13] = 40.0;
                 paint.frac[14] = lnmu;
                 let y0 = (hgt * 0.5 - 0.05 + f as f64 * 0.0015) as f32;
-                let d = Deposit::stroke([(w * 0.5 - 0.05) as f32, y0], [(w * 0.5 + 0.05) as f32, y0], 0.006, 2.4e-7, paint.normalized().packed(), 0.75 * self.film.dx);
+                let d = Deposit::stroke([(w * 0.5 - 0.05) as f32, y0], [(w * 0.5 + 0.05) as f32, y0], 0.006, 2.4e-7, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour);
                 self.pending_deposits.push(d);
                 self.tool.flowing = false;
                 self.tool.pos = DVec3::new(w * 0.5, hgt * 0.5 - 0.1, 0.021);
@@ -417,7 +419,7 @@ impl App {
                 let line = |t: f64| [(w * 0.5 - 0.06 + 0.12 * t) as f32, (hgt * 0.5 - 0.03 + 0.06 * t) as f32];
                 let mut paint = color::PaintMix::pure(5);
                 paint.frac[12] = 0.2;
-                let d = Deposit::stroke(line(t0), line(t1), 0.003, (1.5e-6 * dt) as f32, paint.normalized().packed(), 0.8 * self.film.dx);
+                let d = Deposit::stroke(line(t0), line(t1), 0.003, (1.5e-6 * dt) as f32, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour);
                 self.pending_deposits.push(d);
             }
             return true;
@@ -541,7 +543,7 @@ impl App {
 
     fn knife_test_deposit(&mut self, t0: f64, w: f64, hgt: f64, dt: f64, paint: color::PaintMix) {
         let c = [w * 0.5 + 0.02 * (t0 * 12.0).sin(), hgt * 0.5 + 0.02 * (t0 * 12.0).cos()];
-        let d = Deposit::capsule([c[0] as f32, c[1] as f32], [c[0] as f32, c[1] as f32], 0.012, (8.0e-6 * dt) as f32, paint.normalized().packed(), 0.8 * self.film.dx);
+        let d = Deposit::capsule([c[0] as f32, c[1] as f32], [c[0] as f32, c[1] as f32], 0.012, (8.0e-6 * dt) as f32, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour);
         self.pending_deposits.push(d);
     }
 
@@ -768,7 +770,7 @@ impl App {
                     let p0 = self.last_pour.unwrap_or(p);
                     let vol = self.pour_rate * frame_dt;
                     let pig = self.paint.normalized().packed();
-                    deposits.push(Deposit::stroke([p0.x, p0.y], [p.x, p.y], self.pour_radius, vol, pig, 0.75 * self.film.dx));
+                    deposits.push(Deposit::stroke([p0.x, p0.y], [p.x, p.y], self.pour_radius, vol, pig, self.film.dx).laid_by(Method::Pour));
                     self.last_pour = Some(p);
                 }
             } else {
@@ -914,9 +916,7 @@ impl App {
             let ahead = self.film.dx as f64 * 1.2;
             let q = center + blade * along + d * ahead;
             let p0 = [q.x as f32, q.y as f32];
-            let mut d = Deposit::capsule(p0, p0, 0.8 * self.film.dx, s.vol, s.pig, 0.8 * self.film.dx);
-            d.kind = 1;
-            deposits.push(d);
+            deposits.push(Deposit::capsule(p0, p0, 0.8 * self.film.dx, s.vol, s.pig, self.film.dx).laid_by(Method::Knife).recycled());
         }
         let mut contacts = Vec::new();
         if self.tool.kind == ToolKind::Brush {
@@ -937,10 +937,8 @@ impl App {
                 contacts = c;
                 for r in rel {
                     let pig = color::PaintMix { frac: r.comp }.normalized().packed();
-                    let mut d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, 0.8 * self.film.dx);
-                    d.kind |= 1;
+                    deposits.push(Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, self.film.dx).laid_by(Method::Brush).recycled());
                     self.brush_released += r.vol;
-                    deposits.push(d);
                 }
             }
         }
@@ -1101,6 +1099,13 @@ impl App {
                     let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, true, self.film.w * 2, self.film.h * 2, 36, Some(&self.refine));
                     let _ = img.save(&bp);
                     log::warn!("saved beauty {}", bp);
+                }
+                if !auto.view.is_empty() {
+                    let vp = auto.view.clone();
+                    self.refine.run(&self.gpu, &self.film);
+                    let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, false, 3072, 2048, 36, Some(&self.refine));
+                    let _ = img.save(&vp);
+                    log::warn!("saved view {}", vp);
                 }
                 exit = true;
             }
@@ -1425,6 +1430,7 @@ fn parse_auto() -> Option<AutoScript> {
     let mut frames = None;
     let mut shot = "auto.png".to_string();
     let mut beauty = String::new();
+    let mut view = String::new();
     let mut tilt = 0.0f32;
     let mut cam = String::new();
     let mut script = String::new();
@@ -1443,6 +1449,7 @@ fn parse_auto() -> Option<AutoScript> {
             "--auto" => { frames = Some(args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(200)); i += 1; }
             "--shot" => { shot = args.get(i + 1).cloned().unwrap_or(shot); i += 1; }
             "--beauty" => { beauty = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
+            "--view" => { view = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--tilt" => { tilt = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0); i += 1; }
             "--cam" => { cam = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--script" => { script = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
@@ -1459,7 +1466,7 @@ fn parse_auto() -> Option<AutoScript> {
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer })
 }
 
 fn main() {

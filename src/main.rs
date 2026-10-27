@@ -92,6 +92,7 @@ struct AutoScript {
     mu: f64,
     pig: i32,
     layer: String,
+    stop: u64,
 }
 
 struct Pending {
@@ -604,6 +605,21 @@ impl App {
         let mv: Vec<f32> = bytemuck::cast_slice(&bufm.slice(..).get_mapped_range().expect("map")).to_vec();
         buf.unmap();
         bufm.unmap();
+        if let Ok(prefix) = std::env::var("PAINT_DUMP") {
+            let dims = [self.film.w, self.film.h];
+            let _ = std::fs::write(format!("{}_dims.bin", prefix), bytemuck::cast_slice::<u32, u8>(&dims));
+            let _ = std::fs::write(format!("{}_h.bin", prefix), bytemuck::cast_slice::<f32, u8>(&hv));
+            let _ = std::fs::write(format!("{}_m.bin", prefix), bytemuck::cast_slice::<f32, u8>(&mv));
+            let bd = self.gpu.readback("delta_r", n * 4);
+            let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dump") });
+            enc.copy_buffer_to_buffer(&self.film.delta, 0, &bd, 0, n * 4);
+            self.gpu.queue.submit(std::iter::once(enc.finish()));
+            bd.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let dv: Vec<u32> = bytemuck::cast_slice(&bd.slice(..).get_mapped_range().expect("map")).to_vec();
+            bd.unmap();
+            let _ = std::fs::write(format!("{}_d.bin", prefix), bytemuck::cast_slice::<u32, u8>(&dv));
+        }
         let dx = self.film.dx as f64;
         let mut sum = 0.0f64;
         let mut summ = 0.0f64;
@@ -705,6 +721,8 @@ impl App {
             }
             log::warn!("wet {} low_ty {} no_strata {}", wetc, low_ty, no_strata);
         }
+        let cr = self.film.cg_report;
+        log::warn!("implicit: {} steps, residual {:.2e}, drift {:.2e} of {:.3e}", self.film.implicit_steps, if cr[0] > 0.0 { (cr[3] / cr[0]).sqrt() } else { 0.0 }, cr[1], cr[2]);
         self.stats = format!(
             "wet {:.4} mL  cured {:.4} mL  deposited {:.4} mL  brush held {:.4} mL  err {:.2}%  hmax {:.3} mm  wet cells {}  active tiles {}  nan {}  fps {:.0}  substeps {}",
             vol * 1e6, volm * 1e6, self.film.total_deposited * 1e6, self.brush.total_load() * 1e6,
@@ -792,10 +810,23 @@ impl App {
                 self.tool.mu = 8.0;
                 self.tool.sigma = 0.0585;
                 self.paint.frac[12] = 0.3;
-                self.paint.frac[13] = 35.0;
+                self.paint.frac[13] = 0.0;
                 if a.yield_pa >= 0.0 { self.paint.frac[13] = a.yield_pa; self.paint.frac[12] = 0.0; }
                 if a.pig >= 0 { let y = self.paint.frac[13]; let th = self.paint.frac[12]; self.paint = color::PaintMix::pure(a.pig as usize); self.paint.frac[13] = y; self.paint.frac[12] = th; }
                 if a.mu > 0.0 { self.tool.mu = a.mu; }
+            }
+            if a.script == "pour" {
+                let size = self.window.inner_size();
+                let f = self.frame_index;
+                let t = f as f32 / 60.0;
+                let x = if f < 130 { 0.5 } else if f < 400 { 0.5 + 0.05 * (t - 130.0 / 60.0) } else { 0.5 + 0.05 * 4.5 + 0.3 * (t - 400.0 / 60.0) };
+                let y = if f < 400 { 0.5 } else { 0.5 + 0.06 * ((t - 400.0 / 60.0) * 3.0).sin() };
+                self.cursor = [size.width as f32 * x.min(0.95), size.height as f32 * y];
+                self.mouse_down[0] = f > 10 && f < 560;
+                self.tool.kind = ToolKind::Pour;
+                self.tool.mu = if a.mu > 0.0 { a.mu } else { 4.0 };
+                self.paint.frac[12] = 0.3;
+                self.paint.frac[13] = if a.yield_pa >= 0.0 { a.yield_pa } else { 0.0 };
             }
             if a.script == "settle" {
                 let size = self.window.inner_size();
@@ -807,7 +838,7 @@ impl App {
                 self.tool.mu = 8.0;
                 self.tool.sigma = 0.0585;
                 self.paint.frac[12] = 0.3;
-                self.paint.frac[13] = 35.0;
+                self.paint.frac[13] = 0.0;
                 if a.yield_pa >= 0.0 { self.paint.frac[13] = a.yield_pa; self.paint.frac[12] = 0.0; }
                 if a.mu > 0.0 { self.tool.mu = a.mu; }
             }
@@ -852,6 +883,13 @@ impl App {
             }
         }
         let scripted = self.scripted_tool();
+        if let Some(a) = &self.auto {
+            if a.stop > 0 && self.frame_index >= a.stop {
+                let was = self.tool.flowing;
+                self.tool.flowing = false;
+                if was { self.air.detach(); }
+            }
+        }
         deposits.append(&mut self.pending_deposits);
         if !scripted {
             let pick_z = if self.tool.kind == ToolKind::Brush { 0.0 } else { self.tool.height as f32 };
@@ -905,18 +943,38 @@ impl App {
             }
         }
         self.scrap_total += scraps.iter().map(|s| s.vol as f64).sum::<f64>();
-        for s in &scraps {
-            let i = (s.cell % self.film.w) as f64 + 0.5;
-            let j = (s.cell / self.film.w) as f64 + 0.5;
-            let cell = DVec3::new(i * self.film.dx as f64, j * self.film.dx as f64, 0.0);
+        if !scraps.is_empty() {
             let d = DVec3::new(self.knife_dir[0], self.knife_dir[1], 0.0);
             let blade = DVec3::new(-d.y, d.x, 0.0);
             let center = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
-            let along = (cell - center).dot(blade);
-            let ahead = self.film.dx as f64 * 1.2;
-            let q = center + blade * along + d * ahead;
-            let p0 = [q.x as f32, q.y as f32];
-            deposits.push(Deposit::capsule(p0, p0, 0.8 * self.film.dx, s.vol, s.pig, self.film.dx).laid_by(Method::Knife).recycled());
+            let mut total = 0.0f64;
+            let mut mix = [0.0f32; 16];
+            let mut lo = f64::MAX;
+            let mut hi = f64::MIN;
+            for s in &scraps {
+                let i = (s.cell % self.film.w) as f64 + 0.5;
+                let j = (s.cell / self.film.w) as f64 + 0.5;
+                let cell = DVec3::new(i * self.film.dx as f64, j * self.film.dx as f64, 0.0);
+                let along = (cell - center).dot(blade);
+                lo = lo.min(along);
+                hi = hi.max(along);
+                total += s.vol as f64;
+                for k in 0..8 {
+                    let a = half::f16::from_bits((s.pig[k] & 0xffff) as u16).to_f32();
+                    let b = half::f16::from_bits((s.pig[k] >> 16) as u16).to_f32();
+                    mix[2 * k] += a * s.vol;
+                    mix[2 * k + 1] += b * s.vol;
+                }
+            }
+            if total > 0.0 {
+                let span = (hi - lo).max(self.film.dx as f64);
+                let r = (2.0 * total / (std::f64::consts::PI * span)).sqrt().max(0.8 * self.film.dx as f64);
+                let ahead = 0.6 * r + 0.5 * self.film.dx as f64;
+                let a = center + blade * lo + d * ahead;
+                let b = center + blade * hi + d * ahead;
+                let pig = color::PaintMix { frac: mix }.normalized().packed();
+                deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, total as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+            }
         }
         let mut contacts = Vec::new();
         if self.tool.kind == ToolKind::Brush {
@@ -953,6 +1011,7 @@ impl App {
             self.air.update(&mut self.tool, frame_dt as f64, &mut self.surface, gravity, self.film.dx, &mut deposits, bounds);
         }
         let ms_air = t_air.elapsed().as_secs_f32() * 1e3;
+        let air_detail = format!("(rods {:.1} land {:.1} drops {:.1} caps {} steps {})", self.air.prof[0], self.air.prof[1], self.air.prof[2], self.surface.caps.len(), self.air.rod_steps);
         let t_mesh = Instant::now();
         let colors: Vec<[f32; 3]> = (0..color::NPIG).map(|i| color::masstone_rgb(&self.film.pigments, &self.film.cmf_table, i)).collect();
         let color_of = |pig: &[u32; 8]| -> [f32; 3] {
@@ -1021,9 +1080,9 @@ impl App {
             self.sim_time += frame_dt;
         }
         let ms_enc = t_enc.elapsed().as_secs_f32() * 1e3;
-        self.prof = format!("air {:.1} ms  mesh {:.1} ms  encode {:.1} ms  frame {:.1} ms  rod verts {}  deposits {}", ms_air, ms_mesh, ms_enc, real_dt * 1e3, nverts, deposits.len());
+        self.prof = format!("air {:.1} ms {}  mesh {:.1} ms  encode {:.1} ms  frame {:.1} ms  rod verts {}  deposits {}", ms_air, air_detail, ms_mesh, ms_enc, real_dt * 1e3, nverts, deposits.len());
         self.last_cpu_ms = ms_air + ms_mesh + ms_enc;
-        if self.auto.as_ref().map(|a| a.script.starts_with("stress")).unwrap_or(false) && (self.frame_index % 60 == 0 || real_dt > 0.05) {
+        if self.auto.as_ref().map(|a| a.script.starts_with("stress") || a.script == "pollock").unwrap_or(false) && (self.frame_index % 300 == 0 || (real_dt > 0.05 && self.frame_index % 20 == 0)) {
             let vmax = self.air.rods.iter().flat_map(|r| r.v.iter()).map(|v| v.length()).fold(0.0f64, f64::max);
             log::warn!("vmax {:.2} m/s", vmax);
             log::warn!("f{} {:.0} fps sub {} rods {} drops {} {}", self.frame_index, self.fps, self.film.substeps_last, self.air.rods.len(), self.air.drops.len(), self.prof);
@@ -1132,6 +1191,8 @@ impl App {
         let resp = egui::Window::new("Paint").default_width(300.0).show(&ctx, |ui| {
             ui.label(format!("{:.0} fps   substeps {}   t={:.1}s   hmax {:.2} mm   mu_min {:.2}", self.fps, self.film.substeps_last, self.sim_time, self.film.h_max * 1e3, self.film.mu_min));
             ui.label(format!("deposited {:.3} mL", self.film.total_deposited * 1e6));
+            let cr = self.film.cg_report;
+            ui.label(format!("implicit: {} steps, residual {:.2e}, drift {:.2e} of {:.3e}", self.film.implicit_steps, if cr[0] > 0.0 { (cr[3] / cr[0]).sqrt() } else { 0.0 }, cr[1], cr[2]));
             if !self.stats.is_empty() { ui.label(&self.stats); }
             if !self.last_beauty.is_empty() { ui.label(format!("beauty: {}", self.last_beauty)); }
             ui.label(&self.prof);
@@ -1293,6 +1354,7 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.paint.frac[12], 0.0..=0.9).text("thinner"));
                 ui.add(egui::Slider::new(&mut self.paint.frac[13], 0.0..=600.0).text("yield stress Pa (impasto body)"));
                 ui.add(egui::Slider::new(&mut self.film.settings.contact_angle_deg, 0.0..=90.0).text("wetting angle deg"));
+                ui.add(egui::Slider::new(&mut self.film.settings.hysteresis_deg, 0.0..=45.0).text("contact angle hysteresis deg"));
                 ui.add(egui::Slider::new(&mut self.pour_rate, 1e-7..=5e-5).logarithmic(true).text("pour rate m3/s"));
                 ui.add(egui::Slider::new(&mut self.pour_radius, 0.0005..=0.03).logarithmic(true).text("pour radius m"));
             });
@@ -1305,6 +1367,7 @@ impl App {
             });
             egui::CollapsingHeader::new("Physics / quality").show(ui, |ui| {
                 let s = &mut self.film.settings;
+                ui.checkbox(&mut s.capillary, "explicit capillary levelling (experimental)");
                 ui.add(egui::Slider::new(&mut s.m_cap, 1e-11..=1e-7).logarithmic(true).text("capillary mobility cap"));
                 ui.add(egui::Slider::new(&mut s.m_cap_hydro, 1e-10..=1e-6).logarithmic(true).text("hydrostatic mobility cap"));
                 ui.add(egui::Slider::new(&mut s.h_min, 0.0..=5e-5).text("min film m"));
@@ -1443,6 +1506,7 @@ fn parse_auto() -> Option<AutoScript> {
     let mut layer = String::new();
     let mut mu = -1.0f64;
     let mut angle = -1.0f32;
+    let mut stop = 0u64;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1462,11 +1526,12 @@ fn parse_auto() -> Option<AutoScript> {
             "--mu" => { mu = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--angle" => { angle = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--cure" => { cure = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0); i += 1; }
+            "--stop" => { stop = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
             _ => {}
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, stop })
 }
 
 fn main() {

@@ -10,6 +10,7 @@ struct Node {
     q: DVec2,
     speed: f64,
     spread: f64,
+    r: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,13 @@ pub struct Ribbon {
 }
 
 const JOIN_TOL: f64 = 1e-6;
+const PILE_DENSITY: f64 = 3.0;
+
+fn pile_segment(p: DVec2, vol: f64, rt: f64, spread: f64, speed: f64) -> Segment {
+    let rt = rt.max(1e-5);
+    let r = (1.5 * spread.max(1.0) * rt).max((2.0 * vol / PI).cbrt());
+    Segment { p0: p, p1: p, n0: DVec2::X, n1: DVec2::X, r0: r, r1: r, thread_r: rt, vol, speed, cap_start: true, cap_end: true }
+}
 
 impl Ribbon {
     #[cfg(test)]
@@ -48,14 +56,14 @@ impl Ribbon {
         self.nodes.last().map(|n| n.v).unwrap_or(0.0)
     }
 
-    pub fn push(&mut self, p0: DVec2, p1: DVec2, vol: f64, speed: f64, spread: f64) -> Option<Ribbon> {
+    pub fn push(&mut self, p0: DVec2, p1: DVec2, vol: f64, speed: f64, spread: f64, r: f64) -> Option<Ribbon> {
         let mut finished = None;
         let continues = self.nodes.last().map(|n| n.p.distance(p0) <= JOIN_TOL).unwrap_or(false);
         if !continues {
             if !self.nodes.is_empty() {
                 finished = Some(std::mem::take(self));
             }
-            self.nodes.push(Node { p: p0, s: 0.0, v: 0.0, w: 0.0, q: DVec2::ZERO, speed, spread });
+            self.nodes.push(Node { p: p0, s: 0.0, v: 0.0, w: 0.0, q: DVec2::ZERO, speed, spread, r });
         }
         let last = *self.nodes.last().unwrap();
         let l = last.p.distance(p1);
@@ -64,11 +72,33 @@ impl Ribbon {
             n.v += vol;
             n.speed = n.speed.max(speed);
             n.spread = n.spread.max(spread);
+            n.r = n.r.max(r);
         } else {
             let v = last.v + vol;
-            self.nodes.push(Node { p: p1, s: last.s + l, v, w: last.w + 0.5 * (last.v + v) * l, q: last.q + 0.5 * (last.p + p1) * l, speed, spread });
+            self.nodes.push(Node { p: p1, s: last.s + l, v, w: last.w + 0.5 * (last.v + v) * l, q: last.q + 0.5 * (last.p + p1) * l, speed, spread, r });
         }
         finished
+    }
+
+    fn pile(&mut self, step: f64, out: &mut Vec<Segment>) -> bool {
+        let last = *self.nodes.last().unwrap();
+        let pending = last.v - self.emitted;
+        let rt = last.r.max(1e-5);
+        if pending <= 4.0 * PI * rt * rt * rt {
+            return false;
+        }
+        let len = last.s - self.cursor;
+        if pending / len.max(step) < PILE_DENSITY * PI * rt * rt {
+            return false;
+        }
+        let p = if len > step && self.nodes.len() > 1 { (self.position_integral(last.s) - self.position_integral(self.cursor)) / len } else { last.p };
+        out.push(pile_segment(p, pending, rt, last.spread, last.speed));
+        self.nodes.clear();
+        self.nodes.push(Node { p: last.p, s: 0.0, v: 0.0, w: 0.0, q: DVec2::ZERO, speed: last.speed, spread: last.spread, r: last.r });
+        self.cursor = 0.0;
+        self.emitted = 0.0;
+        self.started = false;
+        true
     }
 
     pub fn drain(&mut self, step: f64, flush: bool, out: &mut Vec<Segment>) {
@@ -76,12 +106,15 @@ impl Ribbon {
         if n == 0 {
             return;
         }
+        if !flush && self.pile(step, out) {
+            return;
+        }
         if n == 1 {
             if flush {
                 let nd = self.nodes[0];
-                if nd.v > 0.0 {
-                    let r = nd.spread * (nd.v / (PI * step)).sqrt().max(step);
-                    out.push(Segment { p0: nd.p, p1: nd.p, n0: DVec2::X, n1: DVec2::X, r0: r, r1: r, thread_r: (nd.v / (PI * step)).sqrt(), vol: nd.v, speed: nd.speed, cap_start: true, cap_end: true });
+                let pending = nd.v - self.emitted;
+                if pending > 0.0 {
+                    out.push(pile_segment(nd.p, pending, nd.r, nd.spread, nd.speed));
                 }
                 *self = Ribbon::default();
             }
@@ -243,7 +276,7 @@ mod tests {
         for e in 0..points.len() - 1 {
             let a = DVec2::new(points[e].0, points[e].1);
             let b = DVec2::new(points[e + 1].0, points[e + 1].1);
-            assert!(r.push(a, b, vols[e], 0.5, 1.5).is_none());
+            assert!(r.push(a, b, vols[e], 0.5, 1.5, 3e-4).is_none());
         }
         r
     }
@@ -258,7 +291,7 @@ mod tests {
             let vol = if e % 3 == 0 { 0.072e-9 } else { 0.009e-9 };
             let a = DVec2::new(0.1 + 0.3e-3 * e as f64, 0.2 + 0.1e-3 * (e as f64 * 0.7).sin());
             let b = DVec2::new(0.1 + 0.3e-3 * (e + 1) as f64, 0.2 + 0.1e-3 * ((e + 1) as f64 * 0.7).sin());
-            r.push(a, b, vol, 0.5, 1.5);
+            r.push(a, b, vol, 0.5, 1.5, 3e-4);
             total += vol;
             r.drain(step, false, &mut out);
         }
@@ -300,8 +333,8 @@ mod tests {
     #[test]
     fn jump_starts_a_new_ribbon() {
         let mut r = Ribbon::default();
-        assert!(r.push(DVec2::new(0.0, 0.0), DVec2::new(1e-3, 0.0), 1e-10, 0.5, 1.0).is_none());
-        let done = r.push(DVec2::new(5e-3, 0.0), DVec2::new(6e-3, 0.0), 1e-10, 0.5, 1.0);
+        assert!(r.push(DVec2::new(0.0, 0.0), DVec2::new(1e-3, 0.0), 1e-10, 0.5, 1.0, 2e-4).is_none());
+        let done = r.push(DVec2::new(5e-3, 0.0), DVec2::new(6e-3, 0.0), 1e-10, 0.5, 1.0, 2e-4);
         assert!(done.is_some());
         assert!((done.unwrap().total_volume() - 1e-10).abs() < 1e-20);
         assert!((r.total_volume() - 1e-10).abs() < 1e-20);

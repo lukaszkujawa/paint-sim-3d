@@ -11,6 +11,9 @@ struct Params {
     cure: vec4<f32>,
     misc: vec4<f32>,
     flags: vec4<u32>,
+    front: vec4<f32>,
+    front2: vec4<f32>,
+    front3: vec4<f32>,
 }
 
 struct Deposit {
@@ -88,7 +91,11 @@ fn lay_dir(v: u32) -> vec2<f32> {
 }
 
 const MOVED: u32 = 64u;
-const MOVE_EPS: f32 = 1e-7;
+const W_AXIS: f32 = 0.6666667;
+const W_DIAG_FLUX: f32 = 0.23570226;
+const W_DIAG_LAP: f32 = 0.16666667;
+const MOVE_EPS: f32 = 1e-6;
+const FRAME_EPS: f32 = 2e-6;
 
 fn tile16_of(i: u32, j: u32) -> u32 {
     return (i / 16u) + (j / 16u) * tiles16().x;

@@ -201,7 +201,7 @@ impl PaintMix {
     pub fn pure(i: usize) -> Self {
         let mut frac = [0.0; 16];
         frac[i] = 1.0;
-        frac[13] = 60.0;
+        frac[13] = 0.0;
         Self { frac }
     }
 

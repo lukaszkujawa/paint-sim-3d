@@ -18,8 +18,23 @@ fn laplacian(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
     let c = idx(id.x, id.y);
     let hv = h[c];
     let s0 = hv + m[c];
-    let l = (surf(i - 1, j) + surf(i + 1, j) + surf(i, j - 1) + surf(i, j + 1) - 4.0 * s0) * P.inv_dx * P.inv_dx;
-    pres[c] = vec2<f32>(-P.phys.y * l + disjoining(hv), P.phys.x * P.g.z * s0);
+    var hold = 0.0;
+    var pl = 0.0;
+    if hv > 0.0 { hold = hold_level(nose_dist(c)); }
+    let u0 = s0 - hold;
+    let ax = usurf(i - 1, j) + usurf(i + 1, j) + usurf(i, j - 1) + usurf(i, j + 1);
+    let dg = usurf(i - 1, j - 1) + usurf(i + 1, j - 1) + usurf(i - 1, j + 1) + usurf(i + 1, j + 1);
+    let l = (W_AXIS * ax + W_DIAG_LAP * dg - (4.0 * W_AXIS + 4.0 * W_DIAG_LAP) * u0) * P.inv_dx * P.inv_dx;
+    if hv > 0.0 {
+        let d = nose_dist(c);
+        if d <= 3.0 {
+            let n = fnorm[c];
+            if dot(n, n) > 0.5 {
+                pl = line_pressure(c) * exp(-(d - 1.0) * 0.7);
+            }
+        }
+    }
+    pres[c] = vec2<f32>(-P.phys.y * l + disjoining(hv), P.phys.x * P.g.z * (s0 - hold) + pl);
 }
 
 fn hb_flux(gmag: f32, hf: f32, mu: f32, ty: f32) -> vec3<f32> {
@@ -75,7 +90,156 @@ fn feeders(c: u32) -> u32 {
     return n;
 }
 
-fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, diag: bool) -> FaceFlux {
+fn usurf(i: i32, j: i32) -> f32 {
+    let c = idx(refl_i(i), refl_j(j));
+    var hold = 0.0;
+    if h[c] > 0.0 { hold = hold_level(nose_dist(c)); }
+    return h[c] + m[c] - hold;
+}
+
+fn hold_level(d: f32) -> f32 {
+    return P.front.x * (1.0 - exp(-(max(d, 1.0) - 0.5) * P.front.y));
+}
+
+const COX_LOG: f32 = 132.0;
+
+fn front_normal(c: u32) -> vec2<f32> {
+    let i = i32(c % P.size.x);
+    let j = i32(c / P.size.x);
+    var d = vec2<f32>(0.0);
+    for (var dj = -2; dj <= 2; dj++) {
+        for (var di = -2; di <= 2; di++) {
+            if di == 0 && dj == 0 { continue; }
+            let x = i + di;
+            let y = j + dj;
+            if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
+            if di * di + dj * dj > 5 { continue; }
+            if h[idx(u32(x), u32(y))] <= P.ein.w {
+                let o = vec2<f32>(f32(di), f32(dj));
+                d += o / dot(o, o);
+            }
+        }
+    }
+    let l = length(d);
+    if l < 1e-6 { return vec2<f32>(0.0); }
+    return d / l;
+}
+
+fn wet_gain(n: vec2<f32>) -> f32 {
+    let s2 = 0.70710678;
+    var w = W_AXIS * (max(n.x, 0.0) + max(-n.x, 0.0) + max(n.y, 0.0) + max(-n.y, 0.0));
+    w += W_DIAG_FLUX * (max(s2 * (n.x + n.y), 0.0) + max(-s2 * (n.x + n.y), 0.0) + max(s2 * (n.x - n.y), 0.0) + max(-s2 * (n.x - n.y), 0.0));
+    let m = max(max(abs(n.x), abs(n.y)), 1e-3);
+    return 1.0 / (m * max(w, 1e-3));
+}
+
+fn line_pressure(c: u32) -> f32 {
+    let i = i32(c % P.size.x);
+    let j = i32(c / P.size.x);
+    if i < 1 || j < 1 || i + 1 >= i32(P.size.x) || j + 1 >= i32(P.size.y) { return 0.0; }
+    let nl = fnorm[idx(u32(i - 1), u32(j))];
+    let nr = fnorm[idx(u32(i + 1), u32(j))];
+    let nd = fnorm[idx(u32(i), u32(j - 1))];
+    let nu = fnorm[idx(u32(i), u32(j + 1))];
+    if dot(nl, nl) < 0.5 || dot(nr, nr) < 0.5 || dot(nd, nd) < 0.5 || dot(nu, nu) < 0.5 { return 0.0; }
+    let curv = (nr.x - nl.x + nu.y - nd.y) * 0.5 * P.inv_dx;
+    return P.phys.y * curv * P.front2.z;
+}
+
+fn front_shape(c: u32, n: vec2<f32>) -> f32 {
+    let i = i32(c % P.size.x);
+    let j = i32(c / P.size.x);
+    var w = 0.0;
+    var w0 = 0.0;
+    for (var dj = -3; dj <= 3; dj++) {
+        for (var di = -3; di <= 3; di++) {
+            if di == 0 && dj == 0 { continue; }
+            if di * di + dj * dj > 9 { continue; }
+            let o = vec2<f32>(f32(di), f32(dj));
+            if dot(o, n) < -0.5 { w0 += 1.0; }
+            let x = i + di;
+            let y = j + dj;
+            if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
+            if h[idx(u32(x), u32(y))] > P.ein.w { w += 1.0; }
+        }
+    }
+    if w0 < 1.0 || (u32(P.front2.w) & 2u) != 0u { return 1.0; }
+    return pow(clamp(w / w0, 0.0, 2.5), P.front2.y);
+}
+
+fn wet_threshold(c: u32) -> f32 {
+    let ty = rheo[c].y;
+    let ycap = ty / (P.phys.x * P.g.z * max(h[c], 1e-4)) * P.dx;
+    return max(hold_level(1.0), ycap);
+}
+
+fn front_dist(c: u32) -> f32 {
+    if h[c] <= 0.0 { return 0.0; }
+    return nose_dist(c);
+}
+
+fn cox_speed(excess: f32, mu: f32) -> f32 {
+    if excess <= 0.0 { return 0.0; }
+    let theta = atan(P.ein.x);
+    let span = max(P.front.x - hold_level(1.0), 1e-6);
+    let th = theta + (3.14159265 - theta) * clamp(excess / span, 0.0, 1.0);
+    let adv = min(theta + P.front2.x, 3.1);
+    if th <= adv { return 0.0; }
+    return P.phys.y * (th * th * th - adv * adv * adv) / (COX_LOG * max(mu, 1e-4));
+}
+
+fn cell_excess(c: u32) -> f32 {
+    var e = h[c] - hold_level(front_dist(c));
+    let o = unpack_off(delta[c]);
+    let ol = length(vec2<f32>(f32(o.x), f32(o.y)));
+    if ol > 0.5 && ol < 60.0 {
+        let dir = vec2<f32>(f32(o.x), f32(o.y)) * (-1.0 / ol);
+        let bias = vec2<f32>(0.5 * sign(f32(-o.x)), 0.5 * sign(f32(-o.y)));
+        for (var k = 0u; k < 3u; k++) {
+            let reach = f32(4u << k);
+            let step = vec2<i32>(dir * reach + bias);
+            let ri = i32(c % P.size.x) + step.x;
+            let rj = i32(c / P.size.x) + step.y;
+            if ri < 0 || rj < 0 || ri >= i32(P.size.x) || rj >= i32(P.size.y) { break; }
+            let cr = idx(u32(ri), u32(rj));
+            if h[cr] <= 0.0 { break; }
+            e = max(e, h[cr] - hold_level(front_dist(cr)));
+        }
+    }
+    return e;
+}
+
+fn rim_translation(ca: u32, cb: u32, hf: f32, face_dir: vec2<f32>) -> vec2<f32> {
+    if (u32(P.front2.w) & 1u) != 0u { return vec2<f32>(0.0); }
+    let da = front_dist(ca);
+    let db = front_dist(cb);
+    if max(da, db) > 3.0 / P.front.y { return vec2<f32>(0.0); }
+    var n = vec2<f32>(0.0);
+    if da > db && h[ca] > 0.0 { n = fnorm[ca]; }
+    else if db > da && h[cb] > 0.0 { n = fnorm[cb]; }
+    else {
+        if h[ca] > 0.0 { n += fnorm[ca]; }
+        if h[cb] > 0.0 { n += fnorm[cb]; }
+    }
+    let nl = length(n);
+    if nl < 1e-6 { return vec2<f32>(0.0); }
+    n = n / nl;
+    let s = dot(n, face_dir);
+    if abs(s) < 1e-4 { return vec2<f32>(0.0); }
+    var src = ca;
+    var dst = cb;
+    if s < 0.0 { src = cb; dst = ca; }
+    if h[src] <= 0.0 { return vec2<f32>(0.0); }
+    let e = cell_excess(src);
+    if e <= 0.0 { return vec2<f32>(0.0); }
+    var e_out = -hold_level(1.0);
+    if h[dst] > 0.0 { e_out = cell_excess(dst); }
+    let room = clamp(1.0 - max(e_out, 0.0) / e, 0.0, 1.0);
+    let u = cox_speed(e, rheo[src].x);
+    return vec2<f32>(u * hf * room * mix(1.0, abs(s), P.front2.x), sign(s));
+}
+
+fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, diag: bool, face_dir: vec2<f32>) -> FaceFlux {
     var out: FaceFlux;
     out.q = 0.0;
     out.y = 0.0;
@@ -84,9 +248,21 @@ fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, di
     let hb = h[cb];
     let hf = 0.5 * (ha + hb);
     if hf <= 0.0 { return out; }
+    var shape = 1.0;
+    var wetting = false;
+    var proj = 1.0;
     if min(ha, hb) <= 0.0 {
         let wet = select(cb, ca, ha > 0.0);
-        if h[wet] <= nose_cap(wet) { return out; }
+        let dry = select(ca, cb, ha > 0.0);
+        if h[wet] <= wet_threshold(wet) { return out; }
+        wetting = true;
+        var n = fnorm[wet];
+        if dot(n, n) < 0.5 { n = front_normal(wet); }
+        let toward = select(-1.0, 1.0, ha > 0.0);
+        proj = max(dot(n, face_dir * toward), 0.0);
+        if proj <= 0.0 { return out; }
+        shape = front_shape(dry, n) * wet_gain(n);
+        if shape <= 0.0 { return out; }
     }
     let ra = rheo[ca];
     let rb = rheo[cb];
@@ -101,20 +277,33 @@ fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, di
     let qy = hb_flux(gmag, hf, mu, ty);
     if qy.x <= 0.0 { return out; }
     let meff = qy.x / gmag;
-    let qvec = meff * gtilt + min(meff, P.misc.w) * ghyd + min(meff, P.phys.w) * (gcap * fcap);
+    let fcap2 = pow(thin, P.front3.w);
+    let qvec = meff * gtilt + min(meff, P.misc.w) * ghyd + min(meff, P.phys.w) * (gcap * fcap2);
     var qn = qvec.x;
-    let vcap = 2.0;
-    if abs(qn) > vcap * hf { qn = sign(qn) * vcap * hf; }
-    let lo = min(ha, hb);
-    let hi = max(ha, hb);
-    if lo < 0.5 * hi {
-        if diag {
-            qn = 0.0;
-        } else {
-            var tgt = cb;
-            if hb > ha { tgt = ca; }
-            let n = feeders(tgt);
-            qn = qn / pow(f32(max(n, 1u)), 0.7);
+    let tr = rim_translation(ca, cb, hf, face_dir);
+    if wetting {
+        let wet = select(cb, ca, ha > 0.0);
+        let want = tr.x * 2.0 * h[wet] / max(hf, 1e-9);
+        qn = tr.y * max(qn * tr.y * proj, want) * shape;
+        let vcap = 2.0;
+        if abs(qn) > vcap * hf { qn = sign(qn) * vcap * hf; }
+    } else {
+        if tr.x > 0.0 {
+            qn = tr.y * max(qn * tr.y, tr.x);
+        }
+        let vcap = 2.0;
+        if abs(qn) > vcap * hf { qn = sign(qn) * vcap * hf; }
+        let lo = min(ha, hb);
+        let hi = max(ha, hb);
+        if lo < 0.5 * hi {
+            if diag {
+                qn = 0.0;
+            } else {
+                var tgt = cb;
+                if hb > ha { tgt = ca; }
+                let n = feeders(tgt);
+                qn = qn / pow(f32(max(n, 1u)), 0.7);
+            }
         }
     }
     out.q = qn;
@@ -123,7 +312,6 @@ fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, di
     return out;
 }
 
-const FRONT_DIAG: f32 = 0.5;
 
 fn face_pair(id: vec3<u32>) -> array<FaceFlux, 4> {
     let i = i32(id.x);
@@ -140,27 +328,27 @@ fn face_pair(id: vec3<u32>) -> array<FaceFlux, 4> {
     let p00 = pressure_at(i, j);
     let gxy = P.phys.x * P.g.xy;
     let s2 = 0.70710678;
-    let wa = 2.0 / 3.0;
-    let wd = s2 / 3.0;
-    if id.x + 1u < P.size.x {
+    let wa = W_AXIS;
+    let wd = W_DIAG_FLUX;
+    if id.x + 1u < P.size.x && cell_active(id.x + 1u, id.y) {
         let cb = idx(id.x + 1u, id.y);
         let p10 = pressure_at(i + 1, j);
         let gm = -(p10 - p00) * P.inv_dx;
         let pt = pressure_wet(i, j + 1, p00) + pressure_wet(i + 1, j + 1, p10) - pressure_wet(i, j - 1, p00) - pressure_wet(i + 1, j - 1, p10);
         let gt = -pt * 0.25 * P.inv_dx;
-        fx = face(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy, false);
+        fx = face(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy, false, vec2<f32>(1.0, 0.0));
         fx.q *= wa;
     }
-    if id.y + 1u < P.size.y {
+    if id.y + 1u < P.size.y && cell_active(id.x, id.y + 1u) {
         let cb = idx(id.x, id.y + 1u);
         let p01 = pressure_at(i, j + 1);
         let gm = -(p01 - p00) * P.inv_dx;
         let pt = pressure_wet(i + 1, j, p00) + pressure_wet(i + 1, j + 1, p01) - pressure_wet(i - 1, j, p00) - pressure_wet(i - 1, j + 1, p01);
         let gt = -pt * 0.25 * P.inv_dx;
-        fy = face(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy.yx, false);
+        fy = face(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy.yx, false, vec2<f32>(0.0, 1.0));
         fy.q *= wa;
     }
-    if id.x + 1u < P.size.x && id.y + 1u < P.size.y {
+    if id.x + 1u < P.size.x && id.y + 1u < P.size.y && cell_active(id.x + 1u, id.y + 1u) {
         let cb = idx(id.x + 1u, id.y + 1u);
         let p11 = pressure_at(i + 1, j + 1);
         let ga = -(p11 - p00) * P.inv_dx * s2;
@@ -171,11 +359,11 @@ fn face_pair(id: vec3<u32>) -> array<FaceFlux, 4> {
         let hs = P.ein.w;
         let open = min(h[c], h[cb]) > 0.0 || h[idx(id.x + 1u, id.y)] > hs || h[idx(id.x, id.y + 1u)] > hs;
         if open {
-            fd = face(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true);
+            fd = face(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true, vec2<f32>(s2, s2));
             fd.q *= wd;
         }
     }
-    if id.x + 1u < P.size.x && id.y > 0u {
+    if id.x + 1u < P.size.x && id.y > 0u && cell_active(id.x + 1u, id.y - 1u) {
         let cb = idx(id.x + 1u, id.y - 1u);
         let p1m = pressure_at(i + 1, j - 1);
         let ga = -(p1m - p00) * P.inv_dx * s2;
@@ -186,7 +374,7 @@ fn face_pair(id: vec3<u32>) -> array<FaceFlux, 4> {
         let hs = P.ein.w;
         let open = min(h[c], h[cb]) > 0.0 || h[idx(id.x + 1u, id.y)] > hs || h[idx(id.x, id.y - 1u)] > hs;
         if open {
-            fe = face(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true);
+            fe = face(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true, vec2<f32>(s2, -s2));
             fe.q *= wd;
         }
     }
@@ -436,6 +624,7 @@ fn nose(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let c = idx(id.x, id.y);
     if h[c] <= 0.0 {
         delta[c] = bitcast<f32>(0u);
+        fnorm[c] = vec2<f32>(0.0);
         return;
     }
     let i = i32(id.x);
@@ -444,21 +633,33 @@ fn nose(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     var bd = 1e9;
     for (var dj = -1; dj <= 1; dj++) {
         for (var di = -1; di <= 1; di++) {
-            if di == 0 && dj == 0 { continue; }
             let x = i + di;
             let y = j + dj;
             if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
             let n = idx(u32(x), u32(y));
             var cand = vec2<i32>(di, dj);
             if h[n] > 0.0 {
+                if (bitcast<u32>(delta[n]) & 0x10000u) == 0u { continue; }
                 let o = unpack_off(delta[n]);
                 cand = vec2<i32>(o.x + di, o.y + dj);
+                let tx = i + cand.x;
+                let ty = j + cand.y;
+                if tx < 0 || ty < 0 || tx >= i32(P.size.x) || ty >= i32(P.size.y) { continue; }
+                if h[idx(u32(tx), u32(ty))] > 0.0 { continue; }
+            } else if di == 0 && dj == 0 {
+                continue;
             }
             let d = length(vec2<f32>(f32(cand.x), f32(cand.y)));
             if d < bd { bd = d; best = cand; }
         }
     }
+    if bd > 1e8 {
+        delta[c] = bitcast<f32>(0u);
+        fnorm[c] = vec2<f32>(0.0);
+        return;
+    }
     delta[c] = pack_off(best.x, best.y);
+    if bd <= 3.0 { fnorm[c] = front_normal(c); } else { fnorm[c] = vec2<f32>(0.0); }
 }
 
 fn store_shed(c: u32, s: Shed) {
@@ -614,6 +815,429 @@ fn commit_tmp(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
 @group(2) @binding(0) var<storage, read_write> stats_out: array<vec2<f32>>;
 @group(2) @binding(1) var<storage, read_write> pool_out: array<f32>;
 
+@group(2) @binding(2) var<storage, read_write> cg_m: array<vec4<f32>>;
+@group(2) @binding(3) var<storage, read_write> cg_d: array<f32>;
+@group(2) @binding(4) var<storage, read_write> cg_x: array<f32>;
+@group(2) @binding(5) var<storage, read_write> cg_r: array<f32>;
+@group(2) @binding(6) var<storage, read_write> cg_p: array<f32>;
+@group(2) @binding(7) var<storage, read_write> cg_q: array<f32>;
+@group(2) @binding(8) var<storage, read_write> cg_part: array<f32>;
+@group(2) @binding(9) var<storage, read_write> cg_s: array<vec4<f32>>;
+@group(2) @binding(10) var<storage, read_write> cg_part2: array<f32>;
+@group(2) @binding(11) var<storage, read_write> h_frame: array<f32>;
+@group(2) @binding(12) var<storage, read_write> fnorm: array<vec2<f32>>;
+@group(2) @binding(13) var<storage, read_write> cg_t: array<f32>;
+@group(2) @binding(14) var<storage, read_write> cg_t2: array<f32>;
+
+fn face_mob(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, diag: bool) -> f32 {
+    let ha = h[ca];
+    let hb = h[cb];
+    if min(ha, hb) <= 0.0 { return 0.0; }
+    let hf = 0.5 * (ha + hb);
+    let ra = rheo[ca];
+    let rb = rheo[cb];
+    let wa = ha / (ha + hb);
+    let wb = 1.0 - wa;
+    let mu = exp(wa * log(max(ra.x, 1e-4)) + wb * log(max(rb.x, 1e-4)));
+    let ty = wa * ra.y + wb * rb.y;
+    let thin = min(ha, hb) / hf;
+    let fcap = thin * thin * thin;
+    let g = gcap * fcap + ghyd + gtilt;
+    let gmag = length(g);
+    let qy = hb_flux(gmag, hf, mu, ty);
+    if qy.x <= 0.0 { return 0.0; }
+    var mob = min(max(qy.x / gmag - P.misc.w, 0.0), P.front.z);
+    if min(ha, hb) < 0.5 * max(ha, hb) {
+        if diag { return 0.0; }
+        var tgt = cb;
+        if hb > ha { tgt = ca; }
+        mob = mob / pow(f32(max(feeders(tgt), 1u)), 0.7);
+    }
+    return mob;
+}
+
+fn kappa() -> f32 {
+    return P.front.w * P.phys.x * P.g.z * P.inv_dx * P.inv_dx;
+}
+
+fn hold_u(c: u32) -> f32 {
+    var hold = 0.0;
+    if h[c] > 0.0 { hold = hold_level(nose_dist(c)); }
+    return m[c] - hold;
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_setup(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let i = i32(id.x);
+    let j = i32(id.y);
+    let c = idx(id.x, id.y);
+    var mob = vec4<f32>(0.0);
+    let p00 = pressure_at(i, j);
+    let gxy = P.phys.x * P.g.xy;
+    let s2 = 0.70710678;
+    if id.x + 1u < P.size.x && cell_active(id.x + 1u, id.y) {
+        let cb = idx(id.x + 1u, id.y);
+        let p10 = pressure_at(i + 1, j);
+        let gm = -(p10 - p00) * P.inv_dx;
+        let pt = pressure_wet(i, j + 1, p00) + pressure_wet(i + 1, j + 1, p10) - pressure_wet(i, j - 1, p00) - pressure_wet(i + 1, j - 1, p10);
+        let gt = -pt * 0.25 * P.inv_dx;
+        mob.x = face_mob(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy, false);
+    }
+    if id.y + 1u < P.size.y && cell_active(id.x, id.y + 1u) {
+        let cb = idx(id.x, id.y + 1u);
+        let p01 = pressure_at(i, j + 1);
+        let gm = -(p01 - p00) * P.inv_dx;
+        let pt = pressure_wet(i + 1, j, p00) + pressure_wet(i + 1, j + 1, p01) - pressure_wet(i - 1, j, p00) - pressure_wet(i - 1, j + 1, p01);
+        let gt = -pt * 0.25 * P.inv_dx;
+        mob.y = face_mob(c, cb, vec2<f32>(gm.x, gt.x), vec2<f32>(gm.y, gt.y), gxy.yx, false);
+    }
+    if id.x + 1u < P.size.x && id.y + 1u < P.size.y && cell_active(id.x + 1u, id.y + 1u) {
+        let cb = idx(id.x + 1u, id.y + 1u);
+        let p11 = pressure_at(i + 1, j + 1);
+        let ga = -(p11 - p00) * P.inv_dx * s2;
+        let pa = pressure_wet(i + 1, j, p00);
+        let pb = pressure_wet(i, j + 1, p11);
+        let gp = -(pa - pb) * P.inv_dx * s2;
+        let gt = vec2<f32>(gxy.x + gxy.y, gxy.x - gxy.y) * s2;
+        mob.z = face_mob(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true);
+    }
+    if id.x + 1u < P.size.x && id.y > 0u && cell_active(id.x + 1u, id.y - 1u) {
+        let cb = idx(id.x + 1u, id.y - 1u);
+        let p1m = pressure_at(i + 1, j - 1);
+        let ga = -(p1m - p00) * P.inv_dx * s2;
+        let pa = pressure_wet(i + 1, j, p00);
+        let pb = pressure_wet(i, j - 1, p1m);
+        let gp = -(pa - pb) * P.inv_dx * s2;
+        let gt = vec2<f32>(gxy.x - gxy.y, gxy.x + gxy.y) * s2;
+        mob.w = face_mob(c, cb, vec2<f32>(ga.x, gp.x), vec2<f32>(ga.y, gp.y), gt, true);
+    }
+    cg_m[c] = mob;
+}
+
+struct Nb {
+    c: u32,
+    m: f32,
+}
+
+fn cg_nb(k: u32, i: u32, j: u32) -> Nb {
+    var o: Nb;
+    o.c = 0u;
+    o.m = 0.0;
+    let c = idx(i, j);
+    switch k {
+        case 0u: { if i + 1u < P.size.x { o.c = idx(i + 1u, j); o.m = W_AXIS * cg_m[c].x; } }
+        case 1u: { if j + 1u < P.size.y { o.c = idx(i, j + 1u); o.m = W_AXIS * cg_m[c].y; } }
+        case 2u: { if i + 1u < P.size.x && j + 1u < P.size.y { o.c = idx(i + 1u, j + 1u); o.m = W_DIAG_LAP * cg_m[c].z; } }
+        case 3u: { if i + 1u < P.size.x && j > 0u { o.c = idx(i + 1u, j - 1u); o.m = W_DIAG_LAP * cg_m[c].w; } }
+        case 4u: { if i > 0u { o.c = idx(i - 1u, j); o.m = W_AXIS * cg_m[o.c].x; } }
+        case 5u: { if j > 0u { o.c = idx(i, j - 1u); o.m = W_AXIS * cg_m[o.c].y; } }
+        case 6u: { if i > 0u && j > 0u { o.c = idx(i - 1u, j - 1u); o.m = W_DIAG_LAP * cg_m[o.c].z; } }
+        default: { if i > 0u && j + 1u < P.size.y { o.c = idx(i - 1u, j + 1u); o.m = W_DIAG_LAP * cg_m[o.c].w; } }
+    }
+    return o;
+}
+
+fn lap_src(c: u32, which: u32) -> f32 {
+    switch which {
+        case 0u: { return cg_p[c]; }
+        case 1u: { return h[c]; }
+        case 2u: { return cg_t2[c]; }
+        case 3u: { return cg_t[c]; }
+        case 4u: { return cg_x[c] + hold_u(c); }
+        default: { return hold_u(c); }
+    }
+}
+
+fn lap_w(i: u32, j: u32, c: u32, which: u32) -> f32 {
+    let ii = i32(i);
+    let jj = i32(j);
+    let vc = lap_src(c, which);
+    var acc_v = 0.0;
+    for (var dj = -1; dj <= 1; dj++) {
+        for (var di = -1; di <= 1; di++) {
+            if di == 0 && dj == 0 { continue; }
+            let x = ii + di;
+            let y = jj + dj;
+            if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
+            if !cell_active(u32(x), u32(y)) { continue; }
+            let n = idx(u32(x), u32(y));
+            if h[n] <= 0.0 { continue; }
+            var w = W_AXIS;
+            if di != 0 && dj != 0 { w = W_DIAG_LAP; }
+            acc_v += w * (lap_src(n, which) - vc);
+        }
+    }
+    return acc_v;
+}
+
+fn lap_diag(i: u32, j: u32, c: u32) -> f32 {
+    let ii = i32(i);
+    let jj = i32(j);
+    var s1 = 0.0;
+    var s2 = 0.0;
+    for (var dj = -1; dj <= 1; dj++) {
+        for (var di = -1; di <= 1; di++) {
+            if di == 0 && dj == 0 { continue; }
+            let x = ii + di;
+            let y = jj + dj;
+            if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
+            if !cell_active(u32(x), u32(y)) { continue; }
+            if h[idx(u32(x), u32(y))] <= 0.0 { continue; }
+            var w = W_AXIS;
+            if di != 0 && dj != 0 { w = W_DIAG_LAP; }
+            s1 += w;
+            s2 += w * w;
+        }
+    }
+    return s1 * s1 + s2;
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_lap_p(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    cg_t[c] = lap_w(id.x, id.y, c, 0u);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_lap_h(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    cg_t[c] = lap_w(id.x, id.y, c, 1u);
+    cg_t2[c] = lap_w(id.x, id.y, c, 5u);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_lap_u(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    cg_t[c] = lap_w(id.x, id.y, c, 4u);
+}
+
+fn apply_a(i: u32, j: u32, c: u32) -> f32 {
+    let k = kappa();
+    let pc = cg_p[c];
+    var acc_v = pc;
+    for (var f = 0u; f < 8u; f++) {
+        let nb = cg_nb(f, i, j);
+        if nb.m > 0.0 { acc_v += k * nb.m * (pc - cg_p[nb.c]); }
+    }
+    if h[c] > 0.0 { acc_v += P.front3.x * lap_w(i, j, c, 3u); }
+    return acc_v;
+}
+
+var<workgroup> wg_sum: array<f32, 256>;
+var<workgroup> wg_sum2: array<f32, 256>;
+
+fn wg_reduce(li: u32, v: f32, slot: u32) {
+    wg_sum[li] = v;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if li < s { wg_sum[li] += wg_sum[li + s]; }
+        workgroupBarrier();
+    }
+    if li == 0u { cg_part[slot] = wg_sum[0]; }
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_init(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let id = tile_cell(wid, lid);
+    var v = 0.0;
+    if in_grid(id) {
+        let c = idx(id.x, id.y);
+        let k = kappa();
+        let hc = h[c];
+        let uc = hold_u(c);
+        var diag = 1.0;
+        var b = hc;
+        var ax = hc;
+        for (var f = 0u; f < 8u; f++) {
+            let nb = cg_nb(f, id.x, id.y);
+            if nb.m > 0.0 {
+                diag += k * nb.m;
+                b += k * nb.m * (hold_u(nb.c) - uc);
+                ax += k * nb.m * (hc - h[nb.c]);
+            }
+        }
+        if hc > 0.0 {
+            let cc = P.front3.x;
+            diag += cc * lap_diag(id.x, id.y, c);
+            b -= cc * lap_w(id.x, id.y, c, 2u);
+            ax += cc * lap_w(id.x, id.y, c, 3u);
+        }
+        let r = b - ax;
+        cg_d[c] = diag;
+        cg_x[c] = hc;
+        cg_r[c] = r;
+        cg_p[c] = r / diag;
+        v = r * r / diag;
+    }
+    wg_reduce(li, v, wid.x);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_iter_a(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let id = tile_cell(wid, lid);
+    var v = 0.0;
+    if in_grid(id) {
+        let c = idx(id.x, id.y);
+        let q = apply_a(id.x, id.y, c);
+        cg_q[c] = q;
+        v = cg_p[c] * q;
+    }
+    wg_reduce(li, v, wid.x);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_iter_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let id = tile_cell(wid, lid);
+    var v = 0.0;
+    if in_grid(id) {
+        let c = idx(id.x, id.y);
+        let alpha = cg_s[0].z;
+        let r = cg_r[c] - alpha * cg_q[c];
+        cg_x[c] = cg_x[c] + alpha * cg_p[c];
+        cg_r[c] = r;
+        v = r * r / cg_d[c];
+    }
+    wg_reduce(li, v, wid.x);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_iter_c(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    let beta = cg_s[0].w;
+    cg_p[c] = cg_r[c] / cg_d[c] + beta * cg_p[c];
+}
+
+fn total_parts(li: u32) -> f32 {
+    let n = atomicLoad(&active_count[0]);
+    var v = 0.0;
+    for (var t = li; t < n; t += 256u) { v += cg_part[t]; }
+    wg_sum[li] = v;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if li < s { wg_sum[li] += wg_sum[li + s]; }
+        workgroupBarrier();
+    }
+    return wg_sum[0];
+}
+
+@compute @workgroup_size(256)
+fn cg_reduce_init(@builtin(local_invocation_index) li: u32) {
+    let rz = total_parts(li);
+    if li == 0u {
+        cg_s[0] = vec4<f32>(rz, 0.0, 0.0, 0.0);
+        cg_s[1] = vec4<f32>(rz, 0.0, 0.0, 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn cg_reduce_mass(@builtin(local_invocation_index) li: u32) {
+    let n = atomicLoad(&active_count[0]);
+    var d = 0.0;
+    var tot = 0.0;
+    for (var t = li; t < n; t += 256u) { d += cg_part[t]; tot += cg_part2[t]; }
+    wg_sum[li] = d;
+    wg_sum2[li] = tot;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if li < s { wg_sum[li] += wg_sum[li + s]; wg_sum2[li] += wg_sum2[li + s]; }
+        workgroupBarrier();
+    }
+    if li == 0u {
+        let s1 = cg_s[1];
+        cg_s[1] = vec4<f32>(s1.x, wg_sum[0], wg_sum2[0], cg_s[0].x);
+    }
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_rescale(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    let s1 = cg_s[1];
+    if s1.z <= 0.0 { return; }
+    let f = 1.0 - s1.y / s1.z;
+    h[c] = max(h[c] * f, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn cg_reduce_a(@builtin(local_invocation_index) li: u32) {
+    let pq = total_parts(li);
+    if li == 0u {
+        let s = cg_s[0];
+        var alpha = 0.0;
+        if pq > 0.0 { alpha = s.x / pq; }
+        cg_s[0] = vec4<f32>(s.x, pq, alpha, 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn cg_reduce_b(@builtin(local_invocation_index) li: u32) {
+    let rz = total_parts(li);
+    if li == 0u {
+        let s = cg_s[0];
+        var beta = 0.0;
+        if s.x > 0.0 { beta = rz / s.x; }
+        cg_s[0] = vec4<f32>(rz, s.y, s.z, beta);
+    }
+}
+
+fn pot(c: u32) -> f32 {
+    return cg_x[c] + hold_u(c);
+}
+
+@compute @workgroup_size(16, 16)
+fn cg_finish(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    begin_motion(li);
+    let id = tile_cell(wid, lid);
+    var moved = false;
+    var dv = 0.0;
+    var tv = 0.0;
+    if in_grid(id) {
+        let c = idx(id.x, id.y);
+        let h0 = h[c];
+        let hn = max(cg_x[c], 0.0);
+        let rg = P.phys.x * P.g.z * P.inv_dx;
+        let pc = pot(c);
+        var f = vec4<f32>(0.0);
+        let mob = cg_m[c];
+        if mob.x > 0.0 { f.x = W_AXIS * mob.x * rg * (pc - pot(idx(id.x + 1u, id.y))); }
+        if mob.y > 0.0 { f.y = W_AXIS * mob.y * rg * (pc - pot(idx(id.x, id.y + 1u))); }
+        if mob.z > 0.0 { f.z = W_DIAG_FLUX * mob.z * rg * (pc - pot(idx(id.x + 1u, id.y + 1u))) * 0.70710678; }
+        if mob.w > 0.0 { f.w = W_DIAG_FLUX * mob.w * rg * (pc - pot(idx(id.x + 1u, id.y - 1u))) * 0.70710678; }
+        if h0 > 0.0 {
+            let kc = P.front3.y;
+            let tc = cg_t[c];
+            if id.x + 1u < P.size.x { let n = idx(id.x + 1u, id.y); if h[n] > 0.0 && cell_active(id.x + 1u, id.y) { f.x += W_AXIS * kc * (cg_t[n] - tc); } }
+            if id.y + 1u < P.size.y { let n = idx(id.x, id.y + 1u); if h[n] > 0.0 && cell_active(id.x, id.y + 1u) { f.y += W_AXIS * kc * (cg_t[n] - tc); } }
+            if id.x + 1u < P.size.x && id.y + 1u < P.size.y { let n = idx(id.x + 1u, id.y + 1u); if h[n] > 0.0 && cell_active(id.x + 1u, id.y + 1u) { f.z += W_DIAG_FLUX * kc * (cg_t[n] - tc) * 0.70710678; } }
+            if id.x + 1u < P.size.x && id.y > 0u { let n = idx(id.x + 1u, id.y - 1u); if h[n] > 0.0 && cell_active(id.x + 1u, id.y - 1u) { f.w += W_DIAG_FLUX * kc * (cg_t[n] - tc) * 0.70710678; } }
+        }
+        acc[c] += f * P.front.w;
+        h[c] = hn;
+        moved = abs(hn - h0) > MOVE_EPS;
+        dv = hn - h0;
+        tv = hn;
+    }
+    wg_sum2[li] = tv;
+    wg_reduce(li, dv, wid.x);
+    if li == 0u {
+        var t = 0.0;
+        for (var k = 0u; k < 256u; k++) { t += wg_sum2[k]; }
+        cg_part2[wid.x] = t;
+    }
+    end_motion(moved, wid, li);
+}
+
 @compute @workgroup_size(16, 16)
 fn pool8(@builtin(global_invocation_id) id: vec3<u32>) {
     let pw = (P.size.x + 3u) / 4u;
@@ -682,12 +1306,14 @@ fn mark_tiles(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     let i = wid.x * 16u + lid.x;
     let j = wid.y * 16u + lid.y;
     if i < P.size.x && j < P.size.y {
-        if h[idx(i, j)] > 0.0 {
+        let c = idx(i, j);
+        if h[c] > 0.0 {
             var bits = 1u;
             if lid.x < 2u { bits |= 2u; }
             if lid.x > 13u { bits |= 4u; }
             if lid.y < 2u { bits |= 8u; }
             if lid.y > 13u { bits |= 16u; }
+            if abs(h[c] - h_frame[c]) > FRAME_EPS { bits |= MOVED; }
             atomicOr(&wg_any, bits);
         }
     }
@@ -741,4 +1367,5 @@ fn clear_acc(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
     if !in_grid(id) { return; }
     let c = idx(id.x, id.y);
     acc[c] = vec4<f32>(0.0);
+    h_frame[c] = h[c];
 }

@@ -34,9 +34,12 @@ pub struct CoarseSurface {
     pub sub: Vec<f32>,
     pub caps: Vec<RecentCap>,
     grid: HashMap<u32, Vec<u32>>,
+    flat: bool,
+    no_recent: bool,
 }
 
 const RECENT_FRAMES: u32 = 6;
+const JITTER: f64 = 0.003;
 
 fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let abx = b[0] - a[0];
@@ -53,7 +56,7 @@ fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 
 impl CoarseSurface {
     pub fn new(w: usize, h: usize, cell: f64) -> Self {
-        Self { w, h, cell, data: vec![0.0; w * h], sub: vec![0.0; w * h], caps: Vec::new(), grid: HashMap::new() }
+        Self { w, h, cell, data: vec![0.0; w * h], sub: vec![0.0; w * h], caps: Vec::new(), grid: HashMap::new(), flat: std::env::var("PAINT_FLAT_SURFACE").is_ok(), no_recent: std::env::var("PAINT_NO_RECENT").is_ok() }
     }
 
     fn sample(&self, arr: &[f32], x: f64, y: f64) -> f64 {
@@ -149,7 +152,9 @@ impl CoarseSurface {
 
 impl Surface for CoarseSurface {
     fn height(&self, x: f64, y: f64) -> f64 {
+        if self.flat { return 0.0; }
         let s = self.sample(&self.data, x, y);
+        if self.no_recent { return s; }
         s.max(self.recent_at(x, y))
     }
 }
@@ -245,11 +250,13 @@ pub struct Airborne {
     pub next_id: u64,
     pub landed_volume: f64,
     pub emitted_volume: f64,
+    pub prof: [f32; 3],
+    pub rod_steps: u32,
 }
 
 impl Airborne {
     pub fn new() -> Self {
-        Self { rods: Vec::new(), drops: Vec::new(), next_id: 1, landed_volume: 0.0, emitted_volume: 0.0 }
+        Self { rods: Vec::new(), drops: Vec::new(), next_id: 1, landed_volume: 0.0, emitted_volume: 0.0, prof: [0.0; 3], rod_steps: 0 }
     }
 
     pub fn detach(&mut self) {
@@ -300,6 +307,7 @@ impl Airborne {
             }
         }
         let n_rods = self.rods.len();
+        let t_rods = std::time::Instant::now();
         let outs: Vec<RodOut> = self
             .rods
             .par_iter_mut()
@@ -327,7 +335,10 @@ impl Airborne {
                     };
                     let dt = (frame_dt - t).min(dt_cfl.clamp(floor, 1.0e-3));
                     if let (Some((pe, ve)), Some(nz)) = (nozzle_end, rod.nozzle.as_mut()) {
-                        nz.pos = pe - ve * (frame_dt - (t + dt));
+                        let k = rod.step_count.wrapping_add(rod.id.wrapping_mul(7919));
+                        let jx = (k.wrapping_mul(2654435761) % 1000003) as f64 / 500001.5 - 1.0;
+                        let jy = (k.wrapping_mul(40503).wrapping_add(7) % 999983) as f64 / 499991.5 - 1.0;
+                        nz.pos = pe - ve * (frame_dt - (t + dt)) + DVec3::new(jx, jy, 0.0) * (JITTER * nz.radius);
                     }
                     rod.step(dt, surface as &dyn Surface, &mut out, gravity);
                     t += dt;
@@ -370,6 +381,9 @@ impl Airborne {
             })
             .collect();
         let _ = n_rods;
+        self.prof[0] = t_rods.elapsed().as_secs_f32() * 1e3;
+        self.rod_steps = self.rods.iter().map(|r| r.step_count as u32).sum();
+        let t_land = std::time::Instant::now();
         let mut new_rods = Vec::new();
         let mut rng = rand::rng();
         let mut splashes: Vec<Drop> = Vec::new();
@@ -410,6 +424,8 @@ impl Airborne {
         self.rods.extend(new_rods);
         self.drops.extend(splashes);
         self.drops.retain(|d| d.x.is_finite() && d.x.x > -0.5 && d.x.y > -0.5 && d.x.x < bounds[0] + 0.5 && d.x.y < bounds[1] + 0.5 && d.x.z < 3.0);
+        self.prof[1] = t_land.elapsed().as_secs_f32() * 1e3;
+        let t_drops = std::time::Instant::now();
         let mut i = 0;
         let mut secondary: Vec<Drop> = Vec::new();
         while i < self.drops.len() {
@@ -459,6 +475,7 @@ impl Airborne {
         if self.drops.len() < 20000 {
             self.drops.extend(secondary);
         }
+        self.prof[2] = t_drops.elapsed().as_secs_f32() * 1e3;
     }
 }
 

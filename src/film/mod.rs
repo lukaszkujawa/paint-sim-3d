@@ -17,6 +17,9 @@ pub struct Params {
     pub cure: [f32; 4],
     pub misc: [f32; 4],
     pub flags: [u32; 4],
+    pub front: [f32; 4],
+    pub front2: [f32; 4],
+    pub front3: [f32; 4],
 }
 
 #[repr(C)]
@@ -107,11 +110,15 @@ impl Deposit {
     }
 
     fn sampled_volume(&self, lattice: f32) -> f32 {
+        self.sampled_volume_in(lattice, [f32::NEG_INFINITY, f32::NEG_INFINITY], [f32::INFINITY, f32::INFINITY])
+    }
+
+    fn sampled_volume_in(&self, lattice: f32, lo: [f32; 2], hi: [f32; 2]) -> f32 {
         let rm = self.max_radius() + lattice;
-        let x0 = ((self.p0[0].min(self.p1[0]) - rm) / lattice).floor() as i32;
-        let x1 = ((self.p0[0].max(self.p1[0]) + rm) / lattice).ceil() as i32;
-        let y0 = ((self.p0[1].min(self.p1[1]) - rm) / lattice).floor() as i32;
-        let y1 = ((self.p0[1].max(self.p1[1]) + rm) / lattice).ceil() as i32;
+        let x0 = ((self.p0[0].min(self.p1[0]) - rm).max(lo[0]) / lattice).floor() as i32;
+        let x1 = ((self.p0[0].max(self.p1[0]) + rm).min(hi[0]) / lattice).ceil() as i32;
+        let y0 = ((self.p0[1].min(self.p1[1]) - rm).max(lo[1]) / lattice).floor() as i32;
+        let y1 = ((self.p0[1].max(self.p1[1]) + rm).min(hi[1]) / lattice).ceil() as i32;
         let mut sum = 0.0;
         for i in x0..x1 {
             for j in y0..y1 {
@@ -119,6 +126,20 @@ impl Deposit {
             }
         }
         sum * lattice * lattice
+    }
+
+    pub fn inside_fraction(&self, w: f32, h: f32) -> f32 {
+        let rb = self.max_radius();
+        let full = self.p0[0].min(self.p1[0]) - rb >= 0.0 && self.p0[1].min(self.p1[1]) - rb >= 0.0 && self.p0[0].max(self.p1[0]) + rb <= w && self.p0[1].max(self.p1[1]) + rb <= h;
+        if full {
+            return 1.0;
+        }
+        let lattice = 0.25 * self.r0.min(self.r1).max(1e-4);
+        let all = self.sampled_volume(lattice);
+        if all <= 0.0 {
+            return 0.0;
+        }
+        (self.sampled_volume_in(lattice, [0.0, 0.0], [w, h]) / all).clamp(0.0, 1.0)
     }
 
     pub fn height_at(&self, p: [f32; 2]) -> f32 {
@@ -245,6 +266,7 @@ pub struct FilmSettings {
     pub n_index: f32,
     pub m_cap: f32,
     pub contact_angle_deg: f32,
+    pub hysteresis_deg: f32,
     pub h_star: f32,
     pub raw_canvas: bool,
     pub weave_um: f32,
@@ -261,6 +283,11 @@ pub struct FilmSettings {
     pub m_cap_hydro: f32,
     pub max_substeps: u32,
     pub min_substeps: u32,
+    pub implicit_iters: u32,
+    pub implicit_hydro: bool,
+    pub slump: bool,
+    pub capillary: bool,
+    pub capillary_implicit: bool,
 }
 
 impl Default for FilmSettings {
@@ -273,6 +300,7 @@ impl Default for FilmSettings {
             n_index: 1.0,
             m_cap: 1.0e-8,
             contact_angle_deg: 45.0,
+            hysteresis_deg: 15.0,
             h_star: 2.0e-5,
             raw_canvas: true,
             weave_um: 25.0,
@@ -289,11 +317,16 @@ impl Default for FilmSettings {
             m_cap_hydro: 1.0e-7,
             max_substeps: 64,
             min_substeps: 4,
+            implicit_iters: 40,
+            implicit_hydro: true,
+            slump: false,
+            capillary: true,
+            capillary_implicit: false,
         }
     }
 }
 
-const FULL_SHADE_EVERY: u32 = 30;
+const FULL_SHADE_EVERY: u32 = 1;
 
 pub struct Film {
     pub w: u32,
@@ -388,6 +421,23 @@ pub struct Film {
     p_strata_limit: wgpu::ComputePipeline,
     p_strata_update: wgpu::ComputePipeline,
     p_strata_fill: wgpu::ComputePipeline,
+    p_cg_setup: wgpu::ComputePipeline,
+    p_cg_init: wgpu::ComputePipeline,
+    p_cg_ia: wgpu::ComputePipeline,
+    p_cg_ib: wgpu::ComputePipeline,
+    p_cg_ic: wgpu::ComputePipeline,
+    p_cg_rinit: wgpu::ComputePipeline,
+    p_cg_ra: wgpu::ComputePipeline,
+    p_cg_rb: wgpu::ComputePipeline,
+    p_cg_finish: wgpu::ComputePipeline,
+    p_cg_rmass: wgpu::ComputePipeline,
+    p_cg_rescale: wgpu::ComputePipeline,
+    p_cg_lap_p: wgpu::ComputePipeline,
+    p_cg_lap_h: wgpu::ComputePipeline,
+    p_cg_lap_u: wgpu::ComputePipeline,
+    cg_bufs: Vec<wgpu::Buffer>,
+    pub cg_report: [f32; 4],
+    pub implicit_steps: u32,
     p_deposit: wgpu::ComputePipeline,
     p_cure: wgpu::ComputePipeline,
     p_shade: wgpu::ComputePipeline,
@@ -439,6 +489,21 @@ impl Film {
         let stats_buf = gpu.storage("stats", ntiles * 8);
         let tiles16 = [(w + 15) / 16, (h + 15) / 16];
         let nt16 = (tiles16[0] * tiles16[1]) as u64;
+        let cg_bufs = vec![
+            gpu.storage("cg_m", n * 16),
+            gpu.storage("cg_d", n * 4),
+            gpu.storage("cg_x", n * 4),
+            gpu.storage("cg_r", n * 4),
+            gpu.storage("cg_p", n * 4),
+            gpu.storage("cg_q", n * 4),
+            gpu.storage("cg_part", nt16 * 4),
+            gpu.storage("cg_s", 32),
+            gpu.storage("cg_part2", nt16 * 4),
+            gpu.storage("h_frame", n * 4),
+            gpu.storage("fnorm", n * 8),
+            gpu.storage("cg_t", n * 4),
+            gpu.storage("cg_t2", n * 4),
+        ];
         let tile_flags = gpu.storage("tile_flags", nt16 * 4);
         let tile_list = gpu.storage("tile_list", nt16 * 4);
         let tile_indirect = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -466,7 +531,7 @@ impl Film {
         let reservoir = gpu.storage("reservoir", (MAX_BRISTLES * 17 * 4) as u64);
         let res_read = [gpu.readback("res_r0", (MAX_BRISTLES * 17 * 4) as u64), gpu.readback("res_r1", (MAX_BRISTLES * 17 * 4) as u64)];
         let res_pending = [std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))];
-        let stats_read = [gpu.readback("stats_r0", ntiles * 8 + 16), gpu.readback("stats_r1", ntiles * 8 + 16)];
+        let stats_read = [gpu.readback("stats_r0", ntiles * 8 + 48), gpu.readback("stats_r1", ntiles * 8 + 48)];
         let stats_pending = [std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))];
         let deposits = gpu.storage("deposits", (max_deposits * std::mem::size_of::<Deposit>()) as u64);
         let tile_start = gpu.storage("tile_start", ntiles * 4);
@@ -533,6 +598,19 @@ impl Film {
         let (l_fac, bg_fac) = BindBuilder::new(stages)
             .storage(&stats_buf, false)
             .storage(&pool_buf, false)
+            .storage(&cg_bufs[0], false)
+            .storage(&cg_bufs[1], false)
+            .storage(&cg_bufs[2], false)
+            .storage(&cg_bufs[3], false)
+            .storage(&cg_bufs[4], false)
+            .storage(&cg_bufs[5], false)
+            .storage(&cg_bufs[6], false)
+            .storage(&cg_bufs[7], false)
+            .storage(&cg_bufs[8], false)
+            .storage(&cg_bufs[9], false)
+            .storage(&cg_bufs[10], false)
+            .storage(&cg_bufs[11], false)
+            .storage(&cg_bufs[12], false)
             .build(&gpu.device, "fac");
         let (l_dep, bg_dep) = BindBuilder::new(stages)
             .storage(&deposits, true)
@@ -598,6 +676,20 @@ impl Film {
         let p_strata_limit = compute_pipeline(d, "strata_limit", &sm_strata, "strata_limit", &ls);
         let p_strata_update = compute_pipeline(d, "strata_update", &sm_strata, "strata_update", &ls);
         let p_strata_fill = compute_pipeline(d, "strata_fill", &sm_strata, "strata_fill", &ls);
+        let p_cg_setup = compute_pipeline(d, "cg_setup", &sm_film, "cg_setup", &lf);
+        let p_cg_init = compute_pipeline(d, "cg_init", &sm_film, "cg_init", &lf);
+        let p_cg_ia = compute_pipeline(d, "cg_iter_a", &sm_film, "cg_iter_a", &lf);
+        let p_cg_ib = compute_pipeline(d, "cg_iter_b", &sm_film, "cg_iter_b", &lf);
+        let p_cg_ic = compute_pipeline(d, "cg_iter_c", &sm_film, "cg_iter_c", &lf);
+        let p_cg_rinit = compute_pipeline(d, "cg_reduce_init", &sm_film, "cg_reduce_init", &lf);
+        let p_cg_ra = compute_pipeline(d, "cg_reduce_a", &sm_film, "cg_reduce_a", &lf);
+        let p_cg_rb = compute_pipeline(d, "cg_reduce_b", &sm_film, "cg_reduce_b", &lf);
+        let p_cg_finish = compute_pipeline(d, "cg_finish", &sm_film, "cg_finish", &lf);
+        let p_cg_rmass = compute_pipeline(d, "cg_reduce_mass", &sm_film, "cg_reduce_mass", &lf);
+        let p_cg_rescale = compute_pipeline(d, "cg_rescale", &sm_film, "cg_rescale", &lf);
+        let p_cg_lap_p = compute_pipeline(d, "cg_lap_p", &sm_film, "cg_lap_p", &lf);
+        let p_cg_lap_h = compute_pipeline(d, "cg_lap_h", &sm_film, "cg_lap_h", &lf);
+        let p_cg_lap_u = compute_pipeline(d, "cg_lap_u", &sm_film, "cg_lap_u", &lf);
         let p_copy_back = compute_pipeline(d, "strata_copy_back", &sm_strata, "strata_copy_back", &ls);
         let p_deposit = compute_pipeline(d, "deposit", &sm_dep, "deposit", &[&l0, &l1, &l_dep, &l_tiles]);
         let p_cure = compute_pipeline(d, "cure", &sm_cure, "cure_step", &ls);
@@ -619,6 +711,9 @@ impl Film {
             cure: [0.0; 4],
             misc: [0.0; 4],
             flags: [0; 4],
+            front: [0.0; 4],
+            front2: [0.0; 4],
+            front3: [0.0; 4],
         };
         let mut f = Self {
             w, h, dx, tiles, settings, params, params_buf,
@@ -627,7 +722,7 @@ impl Film {
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
-            p_strata_limit, p_strata_update, p_strata_fill, p_deposit, p_cure, p_shade,
+            p_strata_limit, p_strata_update, p_strata_fill, p_cg_setup, p_cg_init, p_cg_ia, p_cg_ib, p_cg_ic, p_cg_rinit, p_cg_ra, p_cg_rb, p_cg_finish, p_cg_rmass, p_cg_rescale, p_cg_lap_p, p_cg_lap_h, p_cg_lap_u, cg_bufs, cg_report: [0.0; 4], implicit_steps: 1, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,
         };
         f.update_params(gpu, 1.0 / 60.0, 1);
@@ -643,6 +738,7 @@ impl Film {
     }
 
     pub fn update_params(&mut self, gpu: &Gpu, frame_dt: f32, substeps: u32) {
+        if std::env::var("PAINT_NO_IMPLICIT").is_ok() { self.settings.implicit_hydro = false; }
         let s = &self.settings;
         let g = self.gravity_vec();
         let theta = s.contact_angle_deg.to_radians();
@@ -655,12 +751,39 @@ impl Film {
         self.params.dt = dt;
         self.params.frame_dt = frame_dt;
         self.params.g = [g[0], g[1], g[2], s.gravity];
-        self.params.phys = [s.rho, s.sigma, s.n_index, m_cap];
+        self.params.phys = [s.rho, s.sigma, s.n_index, if s.capillary && std::env::var("PAINT_NO_CAP").is_err() { m_cap } else { 0.0 }];
         let lc = (s.sigma / (s.rho * 9.81)).sqrt();
         self.params.ein = [theta.tan().max(0.05), lc * (0.5 * theta).sin(), pi_a, s.h_min];
         self.params.cure = [s.cure_rate, s.tau_cure, s.lnmu_cure, s.h_star];
         self.params.misc = [2.0e-6, 0.12, s.medium_mu, m_exp.min(s.m_cap_hydro)];
-        self.params.flags = [s.debug_view, 0, 0, 0];
+        self.params.flags = [s.debug_view, s.slump as u32, 0, 0];
+        let lc_z = (s.sigma / (s.rho * g[2].max(0.1))).sqrt();
+        let cap_explicit = m_exp.min(s.m_cap_hydro);
+        let h_big = self.h_max.max(self.h_max_pending).max(1e-4);
+        let m_phys = h_big * h_big * h_big / (3.0 * self.mu_min.max(1e-3)) - cap_explicit;
+        let k_max = 40.0f32;
+        let kappa_frame = frame_dt * s.rho * g[2].max(0.1) / (dx * dx);
+        let n_i = if m_phys <= 0.0 { 0 } else { ((kappa_frame * m_phys / k_max).ceil().max(1.0) as u32).min(4) };
+        let dt_i = frame_dt / n_i.max(1) as f32;
+        let m_imp_max = k_max * dx * dx / (dt_i * s.rho * g[2].max(0.1));
+        self.implicit_steps = n_i;
+        let m_phys_cap = h_big * h_big * h_big / (3.0 * self.mu_min.max(1e-3));
+        let cap_cond: f32 = std::env::var("PAINT_CAPCOND").ok().and_then(|v| v.parse().ok()).unwrap_or(80.0);
+        let m_cap_impl = (cap_cond / 28.0) * dx.powi(4) / (dt_i * s.sigma);
+        let m_c = if s.capillary_implicit { m_phys_cap.min(m_cap_impl) } else { 0.0 };
+        let cc = dt_i * s.sigma * m_c / dx.powi(4);
+        let kc = m_c * s.sigma / (dx * dx * dx);
+        let fcap_exp: f32 = std::env::var("PAINT_FCAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2.5);
+        self.params.front3 = [cc, kc, m_c, fcap_exp];
+        let no_hold = std::env::var("PAINT_NO_HOLD").is_ok();
+        self.params.front = [if no_hold { 0.0 } else { 2.0 * lc_z * (0.5 * theta).sin() }, dx / lc_z, m_imp_max, dt_i];
+        let kshape: f32 = std::env::var("PAINT_KSHAPE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let no_transl = std::env::var("PAINT_NO_TRANSL").is_ok();
+        let no_shape = std::env::var("PAINT_NO_SHAPE").is_ok();
+        let kline: f32 = std::env::var("PAINT_KLINE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let flags = (no_transl as u32) | ((no_shape as u32) << 1);
+        let hyst: f32 = std::env::var("PAINT_HYST").ok().and_then(|v| v.parse().ok()).unwrap_or(s.hysteresis_deg);
+        self.params.front2 = [hyst.to_radians(), kshape, kline, flags as f32];
         gpu.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
     }
 
@@ -698,6 +821,8 @@ impl Film {
                     self.h_max = hm;
                     self.mu_min = if mm > 1e8 { 1.0 } else { mm };
                     self.active_tiles = *bytemuck::from_bytes(&view[nt * 8..nt * 8 + 4]);
+                    let s1: [f32; 4] = *bytemuck::from_bytes(&view[nt * 8 + 32..nt * 8 + 48]);
+                    self.cg_report = s1;
                 }
                 {
                     let view = self.pool_read[k].slice(..).get_mapped_range().expect("map");
@@ -726,6 +851,7 @@ impl Film {
         let nt = (self.tiles[0] * self.tiles[1]) as u64;
         enc.copy_buffer_to_buffer(&self.stats_buf, 0, &self.stats_read[k], 0, nt * 8);
         enc.copy_buffer_to_buffer(&self.active_count, 0, &self.stats_read[k], nt * 8, 4);
+        enc.copy_buffer_to_buffer(&self.cg_bufs[7], 0, &self.stats_read[k], nt * 8 + 16, 32);
         let np = (self.pool_dims[0] * self.pool_dims[1]) as u64;
         enc.copy_buffer_to_buffer(&self.pool_buf, 0, &self.pool_read[k], 0, np * 8);
         self.stats_pending[k].store(1, std::sync::atomic::Ordering::Release);
@@ -917,7 +1043,7 @@ impl Film {
             let inside = d.p0[0].max(d.p1[0]) + rb > 0.0 && d.p0[1].max(d.p1[1]) + rb > 0.0 && d.p0[0].min(d.p1[0]) - rb < self.settings.width_m && d.p0[1].min(d.p1[1]) - rb < self.settings.height_m;
             if !inside { continue; }
             if d.kind & DEPOSIT_RECYCLED == 0 {
-                self.total_deposited += d.vol as f64;
+                self.total_deposited += d.vol as f64 * d.inside_fraction(self.settings.width_m, self.settings.height_m) as f64;
             }
             let minx = d.p0[0].min(d.p1[0]) - rb;
             let maxx = d.p0[0].max(d.p1[0]) + rb;
@@ -993,15 +1119,38 @@ impl Film {
             let gf: [&wgpu::BindGroup; 4] = [&self.bg0, &self.bg1, &self.bg_fac, g];
             dispatch(&mut pass, &self.p_cure, &gf, gx, gy, 1);
             ind(&mut pass, &self.p_clear_acc, &gf);
+            if self.settings.implicit_hydro {
+                for _ in 0..self.implicit_steps {
+                    ind(&mut pass, &self.p_lap, &gf);
+                    ind(&mut pass, &self.p_cg_setup, &gf);
+                    ind(&mut pass, &self.p_cg_lap_h, &gf);
+                    ind(&mut pass, &self.p_cg_init, &gf);
+                    dispatch(&mut pass, &self.p_cg_rinit, &gf, 1, 1, 1);
+                    for _ in 0..self.settings.implicit_iters {
+                        ind(&mut pass, &self.p_cg_lap_p, &gf);
+                        ind(&mut pass, &self.p_cg_ia, &gf);
+                        dispatch(&mut pass, &self.p_cg_ra, &gf, 1, 1, 1);
+                        ind(&mut pass, &self.p_cg_ib, &gf);
+                        dispatch(&mut pass, &self.p_cg_rb, &gf, 1, 1, 1);
+                        ind(&mut pass, &self.p_cg_ic, &gf);
+                    }
+                    ind(&mut pass, &self.p_cg_lap_u, &gf);
+                    ind(&mut pass, &self.p_cg_finish, &gf);
+                    dispatch(&mut pass, &self.p_cg_rmass, &gf, 1, 1, 1);
+                    ind(&mut pass, &self.p_cg_rescale, &gf);
+                }
+            }
             for _ in 0..substeps {
                 ind(&mut pass, &self.p_lap, &gf);
                 ind(&mut pass, &self.p_flux, &gf);
                 ind(&mut pass, &self.p_limit, &gf);
                 ind(&mut pass, &self.p_apply, &gf);
                 ind(&mut pass, &self.p_nose, &gf);
-                ind(&mut pass, &self.p_shed, &gf);
-                ind(&mut pass, &self.p_slump, &gf);
-                ind(&mut pass, &self.p_commit_tmp, &gf);
+                if self.settings.slump {
+                    ind(&mut pass, &self.p_shed, &gf);
+                    ind(&mut pass, &self.p_slump, &gf);
+                    ind(&mut pass, &self.p_commit_tmp, &gf);
+                }
             }
             ind(&mut pass, &self.p_lap, &gf);
             ind(&mut pass, &self.p_split, &gf);

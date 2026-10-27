@@ -552,7 +552,7 @@ impl Rod {
         let r = self.edge_radius(0);
         let speed = self.vimp[0].max(self.vimp[1]);
         let spread = impact_spread_factor(speed, 2.0 * r, &self.fluid);
-        if let Some(done) = self.landed.push(self.x[0].truncate(), self.x[1].truncate(), self.vol[0], speed, spread) {
+        if let Some(done) = self.landed.push(self.x[0].truncate(), self.x[1].truncate(), self.vol[0], speed, spread, r) {
             self.landed_done.push(done);
         }
         self.remove_vertex_front();
@@ -1017,6 +1017,99 @@ mod tests {
                 let top: Vec<String> = (n.saturating_sub(4)..n.saturating_sub(1)).map(|e| format!("L{:.1}mm r{:.2}mm v{:.3}", (r.x[e + 1] - r.x[e]).length() * 1e3, r.edge_radius(e) * 1e3, r.vol[e] * 1e6)).collect();
                 println!("t {:.2} rods {} n {} air {:.3} mL landed {:.3} mL zmin {:.3} frozen {} top {:?}", t, rods.len(), n, air * 1e6, landed * 1e6, zmin, r.frozen.iter().filter(|f| **f).count(), top);
             }
+        }
+    }
+
+    #[test]
+    fn coil_trace() {
+        let fluid = Fluid { mu: 2.7, rho: 1000.0, sigma: 0.0585 };
+        let nz = Nozzle { pos: DVec3::new(0.6, 0.4, 0.12), vel: DVec3::ZERO, dir: DVec3::new(0.0, 0.0, -1.0), radius: 1.5e-3, flow: 1.5e-6 };
+        let mut rods = vec![Rod::from_nozzle(nz.clone(), fluid, [0; 8], 1)];
+        let mut t: f64 = 0.0;
+        let mut next_print = 0.1;
+        let mut landings = Vec::new();
+        while t < 3.0 {
+            let dt = 1.0e-4;
+            let mut new_rods = Vec::new();
+            for rod in rods.iter_mut() {
+                let mut out = RodOut { landings: vec![], drops: vec![], fragments: vec![] };
+                if let Some(n) = rod.nozzle.as_mut() {
+                    let k = (t * 1e4) as u64;
+                    let hx = (k.wrapping_mul(2654435761) % 1000003) as f64 / 500001.5 - 1.0;
+                    let hy = (k.wrapping_mul(40503).wrapping_add(7) % 999983) as f64 / 499991.5 - 1.0;
+                    n.pos.x = 0.6 + 5e-5 * hx;
+                    n.pos.y = 0.4 + 5e-5 * hy;
+                }
+                rod.step(dt, &Flat, &mut out, DVec3::new(0.0, 0.0, -G));
+                rod.drain_landings(4e-4, rod.is_empty(), &mut out.landings);
+                landings.extend(out.landings.into_iter().map(|l| (t, l.seg.p0, l.seg.r0, l.seg.vol)));
+                new_rods.extend(out.fragments);
+            }
+            rods.retain(|r| !r.is_empty());
+            rods.extend(new_rods);
+            t += dt;
+            if t >= next_print {
+                next_print += 0.1;
+                let r = &rods[0];
+                let low: Vec<String> = r.x.iter().zip(r.frozen.iter()).filter(|(x, _)| x.z < 0.02).map(|(x, f)| format!("({:.1},{:.1},{:.1}{})", (x.x - 0.6) * 1e3, (x.y - 0.4) * 1e3, x.z * 1e3, if *f { "*" } else { "" })).collect();
+                println!("t {:.2} n {} low {:?}", t, r.n(), low);
+            }
+        }
+        let recent: Vec<String> = landings.iter().rev().take(30).map(|(t, p, r, v)| format!("t{:.2} ({:.1},{:.1}) r{:.2} v{:.1}", t, (p.x - 0.6) * 1e3, (p.y - 0.4) * 1e3, r * 1e3, v * 1e9)).collect();
+        println!("landings {} last {:?}", landings.len(), recent);
+        let spread = landings.iter().map(|(_, p, _, _)| ((p.x - 0.6).powi(2) + (p.y - 0.4).powi(2)).sqrt()).fold(0.0f64, f64::max);
+        println!("max landing offset {:.2} mm", spread * 1e3);
+    }
+
+    #[test]
+    fn drag_trace() {
+        for &speed in &[0.3f64, 1.0, 2.0] {
+            let fluid = Fluid { mu: 5.1, rho: 1000.0, sigma: 0.04 };
+            let nz = Nozzle { pos: DVec3::new(0.1, 0.4, 0.10), vel: DVec3::new(speed, 0.0, 0.0), dir: DVec3::new(0.0, 0.0, -1.0), radius: 2.5e-3, flow: 1.8e-6 };
+            let mut rods = vec![Rod::from_nozzle(nz.clone(), fluid, [0; 8], 1)];
+            let mut t: f64 = 0.0;
+            let mut landings: Vec<(f64, glam::DVec2, f64, f64)> = Vec::new();
+            let mut drops = 0usize;
+            let mut shape = String::new();
+            while t < 1.0 / speed.max(0.5) + 0.3 {
+                let dt = 1.0e-4;
+                let mut new_rods = Vec::new();
+                for rod in rods.iter_mut() {
+                    let mut out = RodOut { landings: vec![], drops: vec![], fragments: vec![] };
+                    if let Some(n) = rod.nozzle.as_mut() {
+                        let k = (t * 1e4) as u64;
+                        let hx = (k.wrapping_mul(2654435761) % 1000003) as f64 / 500001.5 - 1.0;
+                        let hy = (k.wrapping_mul(40503).wrapping_add(7) % 999983) as f64 / 499991.5 - 1.0;
+                        n.pos = DVec3::new(0.1 + speed * t + 7.5e-6 * hx, 0.4 + 7.5e-6 * hy, 0.10);
+                    }
+                    rod.step(dt, &Flat, &mut out, DVec3::new(0.0, 0.0, -G));
+                    rod.drain_landings(4e-4, rod.is_empty(), &mut out.landings);
+                    landings.extend(out.landings.into_iter().map(|l| (t, l.seg.p0, l.seg.r0, l.seg.vol)));
+                    drops += out.drops.len();
+                    new_rods.extend(out.fragments);
+                }
+                rods.retain(|r| !r.is_empty());
+                rods.extend(new_rods);
+                t += dt;
+                if (t * 1e4).round() as i64 % 2500 == 0 && !rods.is_empty() {
+                    let r = &rods[0];
+                    let low: Vec<String> = r.x.iter().zip(r.frozen.iter()).filter(|(x, _)| x.z < 0.012).map(|(x, f)| format!("({:.1},{:.1},{:.1}{})", (x.x - 0.1 - speed * t) * 1e3, (x.y - 0.4) * 1e3, x.z * 1e3, if *f { "*" } else { "" })).collect();
+                    shape += &format!("
+   t {:.2} n {} low(rel nozzle) {:?}", t, r.n(), low);
+                }
+            }
+            let n = landings.len();
+            let ys: Vec<f64> = landings.iter().map(|l| (l.1.y - 0.4) * 1e3).collect();
+            let mean = ys.iter().sum::<f64>() / n.max(1) as f64;
+            let sd = (ys.iter().map(|y| (y - mean).powi(2)).sum::<f64>() / n.max(1) as f64).sqrt();
+            let xs: Vec<f64> = landings.iter().map(|l| (l.1.x - 0.1) * 1e3).collect();
+            let xmax = xs.iter().cloned().fold(0.0, f64::max);
+            let rs: Vec<f64> = landings.iter().map(|l| l.2 * 1e3).collect();
+            let rmean = rs.iter().sum::<f64>() / n.max(1) as f64;
+            let sample: Vec<String> = landings.iter().filter(|l| l.1.x - 0.1 > 0.6 * xmax * 1e-3).take(25).map(|l| format!("({:.1},{:.1},r{:.2},v{:.1})", (l.1.x - 0.1) * 1e3, (l.1.y - 0.4) * 1e3, l.2 * 1e3, l.3 * 1e9)).collect();
+            println!("speed {} landings {} drops {} xmax {:.0} mm y sd {:.2} mm r mean {:.2} mm", speed, n, drops, xmax, sd, rmean);
+            println!("   sample {:?}", sample);
+            println!("{}", shape);
         }
     }
 

@@ -80,11 +80,11 @@ impl Ribbon {
         finished
     }
 
-    fn pile(&mut self, step: f64, out: &mut Vec<Segment>) -> bool {
+    fn pile(&mut self, step: f64, flush: bool, out: &mut Vec<Segment>) -> bool {
         let last = *self.nodes.last().unwrap();
         let pending = last.v - self.emitted;
         let rt = last.r.max(1e-5);
-        if pending <= 4.0 * PI * rt * rt * rt {
+        if pending <= 0.0 || (!flush && pending <= 4.0 * PI * rt * rt * rt) {
             return false;
         }
         let len = last.s - self.cursor;
@@ -93,6 +93,10 @@ impl Ribbon {
         }
         let p = if len > step && self.nodes.len() > 1 { (self.position_integral(last.s) - self.position_integral(self.cursor)) / len } else { last.p };
         out.push(pile_segment(p, pending, rt, last.spread, last.speed));
+        if flush {
+            *self = Ribbon::default();
+            return true;
+        }
         self.nodes.clear();
         self.nodes.push(Node { p: last.p, s: 0.0, v: 0.0, w: 0.0, q: DVec2::ZERO, speed: last.speed, spread: last.spread, r: last.r });
         self.cursor = 0.0;
@@ -106,7 +110,7 @@ impl Ribbon {
         if n == 0 {
             return;
         }
-        if !flush && self.pile(step, out) {
+        if self.pile(step, flush, out) {
             return;
         }
         if n == 1 {

@@ -95,6 +95,7 @@ struct AutoScript {
     pig: i32,
     layer: String,
     seed: u64,
+    dry: u32,
     stop: u64,
 }
 
@@ -273,6 +274,14 @@ impl App {
                 }
                 self.tool.kind = c.kind;
                 self.prev_kind = c.kind;
+                if c.kind == ToolKind::Brush && c.brush_width > 0.0 {
+                    let b = &self.brush;
+                    if b.shape != brush::BrushShape::Flat || (b.width - c.brush_width).abs() > 1e-4 || b.bristles.len() != c.brush_count {
+                        self.rebuild_brush(brush::BrushShape::Flat, c.brush_count, 0.05, c.brush_width);
+                    }
+                    self.brush.capacity = c.brush_capacity;
+                    self.brush.release = c.brush_release;
+                }
                 self.tool.pos = c.pos;
                 self.tool.vel = c.vel;
                 self.tool.flowing = c.flowing;
@@ -291,7 +300,11 @@ impl App {
                     if c.kind == ToolKind::Brush {
                         let mut f = c.mix;
                         f[14] = (c.mu as f32).ln() + 10.0;
-                        self.brush.dip(&f);
+                        if c.brush_width > 0.0 {
+                            self.brush.dip_uneven(&f, self.frame_index as u64);
+                        } else {
+                            self.brush.dip(&f);
+                        }
                     } else {
                         self.tool.reload();
                     }
@@ -958,6 +971,9 @@ impl App {
         }
         let scripted = self.scripted_tool();
         if let Some(a) = &self.auto {
+            if a.dry > 0 && self.frame_index == a.dry as u64 {
+                self.film.dry_now(&self.gpu);
+            }
             if a.stop > 0 && self.frame_index >= a.stop {
                 let was = self.tool.flowing;
                 self.tool.flowing = false;
@@ -1071,8 +1087,9 @@ impl App {
                 contacts = c;
                 for r in rel {
                     let pig = color::PaintMix { frac: r.comp }.normalized().packed();
-                    deposits.push(Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, self.film.dx).laid_by(Method::Brush).recycled());
-                    self.brush_released += r.vol;
+                    let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, self.film.dx).laid_by(Method::Brush).recycled();
+                    self.brush_released += r.vol * d.inside_fraction(self.film.settings.width_m, self.film.settings.height_m) as f64;
+                    deposits.push(d);
                 }
             }
         }
@@ -1290,6 +1307,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.paused, "pause");
                 ui.checkbox(&mut self.film.settings.raw_canvas, "raw canvas (on clear)");
+                if ui.button("dry canvas").clicked() {
+                    self.film.dry_now(&self.gpu);
+                }
                 if ui.button("clear canvas").clicked() {
                     self.film.clear(&self.gpu);
                     self.air = Airborne::new();
@@ -1550,6 +1570,7 @@ impl ApplicationHandler for Pending {
                         PhysicalKey::Code(KeyCode::KeyR) => {
                             if app.tool.kind == ToolKind::Brush { app.brush.dip(&app.paint.frac); } else { app.tool.reload(); }
                         }
+                        PhysicalKey::Code(KeyCode::KeyD) => app.film.dry_now(&app.gpu),
                         PhysicalKey::Code(KeyCode::Equal) => app.cam.dist = (app.cam.dist * 0.8).max(0.05),
                         PhysicalKey::Code(KeyCode::Minus) => app.cam.dist = (app.cam.dist * 1.25).min(6.0),
                         PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
@@ -1586,6 +1607,7 @@ fn parse_auto() -> Option<AutoScript> {
     let mut pig = -1i32;
     let mut layer = String::new();
     let mut seed: u64 = 7;
+    let mut dry: u32 = 0;
     let mut mu = -1.0f64;
     let mut angle = -1.0f32;
     let mut stop = 0u64;
@@ -1605,6 +1627,7 @@ fn parse_auto() -> Option<AutoScript> {
             "--pig" => { pig = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1); i += 1; }
             "--layer" => { layer = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--seed" => { seed = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(7); i += 1; }
+            "--dry" => { dry = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
             "--yield" => { yield_pa = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--mu" => { mu = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--angle" => { angle = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
@@ -1614,7 +1637,7 @@ fn parse_auto() -> Option<AutoScript> {
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, stop })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, stop })
 }
 
 fn main() {

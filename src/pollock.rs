@@ -21,6 +21,10 @@ pub struct Command {
     pub pour_radius: f64,
     pub knife_width: f64,
     pub knife_height: f64,
+    pub brush_width: f64,
+    pub brush_count: usize,
+    pub brush_capacity: f64,
+    pub brush_release: f64,
     pub tilt: Option<(f64, f64)>,
     pub reload: bool,
     pub cut: bool,
@@ -39,6 +43,7 @@ enum Style {
     Dry,
     Wash,
     Scrape,
+    Scrub,
     Tilt,
 }
 
@@ -70,6 +75,8 @@ struct Layer {
     flow: f64,
     pour_radius: f64,
     knife_width: f64,
+    brush_width: f64,
+    shades: Vec<[f32; 16]>,
     tilt: (f64, f64),
 }
 
@@ -106,6 +113,11 @@ pub struct Painter {
     height_noise: f64,
     cut_pending: bool,
     reload_pending: bool,
+    ground_angle: f64,
+    stroke_len: f64,
+    dip_len: f64,
+    stroke_mix: [f32; 16],
+    cover: Vec<f32>,
     pub palette: String,
     pub ground: String,
     pub seed: u64,
@@ -114,6 +126,8 @@ pub struct Painter {
 
 const RHO: f64 = 1000.0;
 const G: f64 = 9.81;
+const COVER_W: usize = 16;
+const COVER_H: usize = 11;
 
 fn mix(parts: &[(usize, f32)], thinner: f32, yield_pa: f32) -> [f32; 16] {
     let mut m = [0.0f32; 16];
@@ -288,8 +302,38 @@ fn layer(name: String, p: &Paint, style: Style, duration: f64) -> Layer {
         Style::Dots => (0.0, 0.0, 0.09, 0.011, 4.0e-7),
         Style::Wash => (0.35, 0.0, 0.1, 0.01, 1.2e-5),
         Style::Scrape => (0.18, 0.0, 0.0, 0.01, 0.0),
+        Style::Scrub => (0.2, 0.0, 0.62, 0.01, 0.0),
     };
-    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, tilt: (0.0, 0.0) }
+    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, brush_width: 0.09, shades: Vec::new(), tilt: (0.0, 0.0) }
+}
+
+fn shade(rng: &mut StdRng, base: &[f32; 16], partner: &[f32; 16], light: f32, dark: f32, cross: f32) -> [f32; 16] {
+    let mut m = [0.0f32; 16];
+    let total: f32 = base[..12].iter().sum::<f32>().max(1e-6);
+    for i in 0..12 {
+        m[i] = base[i] / total * lognormal(rng, 1.0, 0.15) as f32 + partner[i] / partner[..12].iter().sum::<f32>().max(1e-6) * cross;
+    }
+    m[0] += light;
+    m[1] += 0.4 * dark;
+    m[9] += 0.6 * dark;
+    m[12] = base[12];
+    m[13] = base[13];
+    m
+}
+
+fn shades(rng: &mut StdRng, base: &Paint, partner: &Paint, pass: usize) -> Vec<[f32; 16]> {
+    let n = rng.random_range(3..=4);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let cross = rng.random_range(0.0..0.25);
+        let (light, dark) = match pass {
+            0 => (rng.random_range(0.0..0.3), rng.random_range(0.0..0.15)),
+            1 => (rng.random_range(0.4..1.0), rng.random_range(0.0..0.04)),
+            _ => (rng.random_range(0.0..0.08), rng.random_range(0.3..0.7)),
+        };
+        out.push(shade(rng, &base.mix, &partner.mix, light, dark, cross));
+    }
+    out
 }
 
 fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
@@ -300,7 +344,7 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
             layers.push(layer("drying".to_string(), &Paint { name: String::new(), mix: mix(&[(1, 1.0)], 0.2, 0.0), mu: 10.0 }, Style::Dry, d));
         }
     };
-    let grounds = [("raw canvas", 1.0), ("floods", 2.0), ("washes", 2.0), ("scraped", 1.5), ("tilt run", 1.3)];
+    let grounds = [("brushed", 6.0), ("raw canvas", 0.5), ("floods", 1.0), ("washes", 1.0), ("scraped", 0.8), ("tilt run", 0.8)];
     let ground = *weighted(rng, &grounds);
     let mut gcols: Vec<Paint> = pal.ground.clone();
     for i in (1..gcols.len()).rev() {
@@ -308,6 +352,27 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
         gcols.swap(i, j);
     }
     match ground {
+        "brushed" => {
+            let base = gcols[0].clone();
+            let partner = gcols[1 % gcols.len()].clone();
+            let passes = rng.random_range(2..=3);
+            for k in 0..passes {
+                let (what, dur) = match k {
+                    0 => ("ground", rng.random_range(95.0..130.0)),
+                    1 => ("lights", rng.random_range(35.0..55.0)),
+                    _ => ("darks", rng.random_range(18.0..30.0)),
+                };
+                let mut l = layer(format!("{} brushed {}", base.name, what), &thinned(&base, 0.12, 20.0, 18.0), Style::Scrub, dur);
+                l.shades = shades(rng, &base, &partner, k);
+                l.brush_width = rng.random_range(0.08..0.12);
+                layers.push(l);
+            }
+            if rng.random::<f64>() < 0.35 {
+                let p = &gcols[gcols.len() - 1];
+                let d = rng.random_range(6.0..10.0);
+                layers.push(layer(format!("{} flood", p.name), p, Style::Flood, d));
+            }
+        }
         "floods" => {
             let n = rng.random_range(1..=gcols.len().min(3));
             for p in gcols.iter().take(n) {
@@ -458,6 +523,11 @@ impl Painter {
             height_noise: 0.0,
             cut_pending: false,
             reload_pending: false,
+            ground_angle: 0.0,
+            stroke_len: 0.0,
+            dip_len: 0.0,
+            stroke_mix: [0.0; 16],
+            cover: vec![0.0; COVER_W * COVER_H],
             palette: pal.name.to_string(),
             ground,
             seed,
@@ -506,6 +576,22 @@ impl Painter {
     fn teleport(&mut self) {
         self.pos = DVec2::new(self.w * self.rng.random_range(0.1..0.9), self.h * self.rng.random_range(0.1..0.9));
         self.cut_pending = true;
+    }
+
+    fn cover_at(&self, p: DVec2) -> f32 {
+        let i = ((p.x / self.w) * COVER_W as f64).floor().clamp(0.0, COVER_W as f64 - 1.0) as usize;
+        let j = ((p.y / self.h) * COVER_H as f64).floor().clamp(0.0, COVER_H as f64 - 1.0) as usize;
+        self.cover[j * COVER_W + i]
+    }
+
+    fn cover_path(&mut self, start: DVec2, dir: DVec2, len: f64) {
+        let n = (len / 0.03).ceil().max(1.0) as usize;
+        for k in 0..n {
+            let p = start + dir * (len * (k as f64 + 0.5) / n as f64);
+            let i = ((p.x / self.w) * COVER_W as f64).floor().clamp(0.0, COVER_W as f64 - 1.0) as usize;
+            let j = ((p.y / self.h) * COVER_H as f64).floor().clamp(0.0, COVER_H as f64 - 1.0) as usize;
+            self.cover[j * COVER_W + i] += 1.0;
+        }
     }
 
     fn run_to_border(&self, from: DVec2, dir: DVec2, margin: f64) -> f64 {
@@ -589,6 +675,49 @@ impl Painter {
                 let radius = self.lognormal(self.layers[li].pour_radius, 0.3).clamp(0.008, 0.04);
                 Gesture { t_end: self.t + dur, speed, height: hm, turn_sigma: speed / r_turn, flow_until: self.t + dur, radius, ..base }
             }
+            Style::Scrub => {
+                let speed = self.lognormal(pace, 0.2).clamp(0.08, 0.35);
+                let m = 0.04;
+                let mut a = if self.rng.random::<f64>() < 0.25 { self.rng.random_range(0.0..6.28) } else { self.ground_angle + self.gauss() * 0.3 };
+                let mut start = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
+                let mut best = self.cover_at(start);
+                for _ in 0..3 {
+                    let q = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
+                    let c = self.cover_at(q);
+                    if c < best {
+                        best = c;
+                        start = q;
+                    }
+                }
+                let mut dir = DVec2::new(a.cos(), a.sin());
+                if self.run_to_border(start, dir, m) < 0.1 {
+                    a += std::f64::consts::PI;
+                    dir = -dir;
+                }
+                let reach = self.run_to_border(start, dir, m);
+                let len = self.lognormal(0.3, 0.35).clamp(0.12, 0.55).min(reach.max(0.05));
+                self.cover_path(start, dir, len);
+                let curv = self.gauss() * 0.5;
+                let period = self.rng.random_range(0.25..0.8);
+                let phase = self.rng.random_range(0.0..6.28);
+                let dur = len / speed + 0.25;
+                self.stroke_len += len;
+                if self.stroke_len > self.dip_len {
+                    self.reload_pending = true;
+                    self.stroke_len = 0.0;
+                    self.dip_len = self.rng.random_range(0.5..1.1);
+                    let shades = &self.layers[li].shades;
+                    if !shades.is_empty() {
+                        self.stroke_mix = shades[self.rng.random_range(0..shades.len())];
+                    } else {
+                        self.stroke_mix = self.layers[li].mix;
+                    }
+                }
+                self.pos = start;
+                self.heading = a;
+                self.cut_pending = true;
+                Gesture { t_end: self.t + dur, speed, height: self.lognormal(hm, 0.08).clamp(0.5, 0.75), flow_until: self.t + len / speed, centre: start, drift: dir * speed, radius: period, phase0: curv, wobble: phase, ..base }
+            }
             Style::Scrape => {
                 let speed = self.lognormal(pace, 0.25).clamp(0.08, 0.35);
                 let m = 0.06;
@@ -604,7 +733,7 @@ impl Painter {
                 Gesture { t_end: self.t + dur, speed, height: 0.0, flow_until: self.t + len / speed, centre: start, drift: dir * speed, ..base }
             }
         };
-        if !matches!(style, Style::Fling | Style::Snap | Style::Scrape) {
+        if !matches!(style, Style::Fling | Style::Snap | Style::Scrape | Style::Scrub) {
             self.heading = self.heading + self.gauss() * 0.8;
         }
         self.gesture = Some(g);
@@ -651,6 +780,8 @@ impl Painter {
             self.gesture = None;
             self.cut_pending = true;
             self.reload_pending = true;
+            self.ground_angle = self.rng.random_range(0.0..6.28);
+            self.stroke_len = 1e9;
             if self.layer >= self.layers.len() {
                 self.done = true;
                 return None;
@@ -659,7 +790,7 @@ impl Painter {
         let mut reload = false;
         if self.gesture.as_ref().map(|g| self.t >= g.t_end).unwrap_or(true) {
             let style = self.layers[self.layer].style;
-            if self.gesture.is_some() && style != Style::Scrape && self.rng.random::<f64>() < 0.35 {
+            if self.gesture.is_some() && !matches!(style, Style::Scrape | Style::Scrub) && self.rng.random::<f64>() < 0.35 {
                 self.teleport();
             }
             self.new_gesture();
@@ -668,7 +799,7 @@ impl Painter {
         self.noise(dt);
         let li = self.layer;
         let layer = &self.layers[li];
-        let (mix, mu, sd, flow, pour_radius, knife_width, tilt) = (layer.mix, layer.mu, layer.stick_diameter, layer.flow, layer.pour_radius, layer.knife_width, layer.tilt);
+        let (mut mix, mu, sd, flow, pour_radius, knife_width, brush_width, tilt) = (layer.mix, layer.mu, layer.stick_diameter, layer.flow, layer.pour_radius, layer.knife_width, layer.brush_width, layer.tilt);
         let style = layer.style;
         let g = self.gesture.as_ref().unwrap();
         let (gt_start, gt_end, gspeed, gheight, turn_sigma, flow_until, hop_at) = (g.t_start, g.t_end, g.speed, g.height, g.turn_sigma, g.flow_until, g.hop_at);
@@ -748,6 +879,13 @@ impl Painter {
                 let tl = (self.t - gt_start).min((flow_until - gt_start).max(0.0));
                 forced = Some(centre + drift * tl);
             }
+            Style::Scrub => {
+                let tl = (self.t - gt_start).min((flow_until - gt_start).max(0.0));
+                let along = drift * tl;
+                let s = along.length();
+                let perp = DVec2::new(-drift.y, drift.x).normalize_or_zero();
+                forced = Some(centre + along + perp * phase0 * s * s);
+            }
         }
         let dir = DVec2::new(self.heading.cos(), self.heading.sin());
         let prev = self.pos;
@@ -763,15 +901,23 @@ impl Painter {
         self.pos.y = self.pos.y.clamp(0.02, self.h - 0.02);
         let v = (self.pos - prev) / dt.max(1e-6);
         let hmod = if style == Style::Drip || style == Style::Pour { self.height_noise.exp() } else { 1.0 };
-        let height = if style == Style::Scrape { 0.0 } else { (gheight * hmod).clamp(0.03, 0.6) };
+        let height = match style {
+            Style::Scrape => 0.0,
+            Style::Scrub => (gheight * (1.0 + 0.1 * (std::f64::consts::TAU * (self.t - gt_start) / radius.max(0.05) + wobble).sin())).clamp(0.45, 0.85),
+            _ => (gheight * hmod).clamp(0.03, 0.6),
+        };
+        if style == Style::Scrub {
+            mix = self.stroke_mix;
+        }
         let kind = match style {
             Style::Pour | Style::Lasso => ToolKind::Bottle,
             Style::Flood => ToolKind::Bucket,
             Style::Wash => ToolKind::Pour,
             Style::Scrape => ToolKind::Knife,
+            Style::Scrub => ToolKind::Brush,
             _ => ToolKind::Stick,
         };
-        if matches!(style, Style::Lasso | Style::Snap | Style::Scrape) {
+        if matches!(style, Style::Lasso | Style::Snap | Style::Scrape | Style::Scrub) {
             self.speed = v.length();
         }
         let cut = self.cut_pending;
@@ -800,6 +946,10 @@ impl Painter {
             pour_radius: if style == Style::Wash { radius } else { pour_radius },
             knife_width,
             knife_height: 0.0004,
+            brush_width: if style == Style::Scrub { brush_width } else { 0.0 },
+            brush_count: 400,
+            brush_capacity: 2.0e-8,
+            brush_release: 0.5,
             tilt: tilt_cmd,
             reload,
             cut,

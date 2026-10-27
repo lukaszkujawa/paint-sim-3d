@@ -114,6 +114,18 @@ impl Brush {
         }
     }
 
+    pub fn dip_uneven(&mut self, frac: &[f32; 16], seed: u64) {
+        for (k, b) in self.bristles.iter_mut().enumerate() {
+            let mut h = (k as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seed.wrapping_mul(0xD1B54A32D192ED03));
+            h ^= h >> 29;
+            h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+            h ^= h >> 32;
+            let u = (h & 0xffff) as f64 / 65535.0;
+            b.load = self.capacity * (0.35 + 0.65 * u);
+            b.comp = *frac;
+        }
+    }
+
     pub fn clean(&mut self) {
         for b in &mut self.bristles {
             b.load = 0.0;
@@ -141,6 +153,25 @@ impl Brush {
     }
 
     pub fn update(&mut self, handle: DVec3, dt: f64, floor: &(dyn Fn(f64, f64) -> f64 + Sync), dx: f64) -> (Vec<Contact>, Vec<Release>) {
+        let l = self.len / self.segs as f64;
+        let travel = if self.placed { (handle - self.handle).length() } else { 0.0 };
+        if !self.placed || travel > 0.1 {
+            return self.substep(handle, dt, floor, dx);
+        }
+        let k = ((travel / (0.4 * l)).ceil() as usize).clamp(1, 12);
+        let start = self.handle;
+        let mut contacts = Vec::new();
+        let mut releases = Vec::new();
+        for s in 1..=k {
+            let hk = start.lerp(handle, s as f64 / k as f64);
+            let (c, r) = self.substep(hk, dt / k as f64, floor, dx);
+            contacts = c;
+            releases.extend(r);
+        }
+        (contacts, releases)
+    }
+
+    fn substep(&mut self, handle: DVec3, dt: f64, floor: &(dyn Fn(f64, f64) -> f64 + Sync), dx: f64) -> (Vec<Contact>, Vec<Release>) {
         let segs = self.segs;
         let l = self.len / segs as f64;
         let radius = self.radius;

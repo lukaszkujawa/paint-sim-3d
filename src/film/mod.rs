@@ -1086,6 +1086,22 @@ impl Film {
         ((self.w + 15) / 16, (self.h + 15) / 16)
     }
 
+    pub fn dry_now(&mut self, gpu: &Gpu) {
+        let saved = self.params.cure;
+        self.params.cure[0] = 4.0 / self.params.frame_dt.max(1e-4);
+        gpu.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        let (gx, gy) = self.groups();
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dry") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dry"), timestamp_writes: None });
+            dispatch(&mut pass, &self.p_cure, &[&self.bg0, &self.bg1, &self.bg_fac, &self.bg_tiles], gx, gy, 1);
+        }
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        self.params.cure = saved;
+        gpu.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.needs_full_shade = true;
+    }
+
     pub fn encode_frame(&mut self, enc: &mut wgpu::CommandEncoder, substeps: u32) {
         let (gx, gy) = self.groups();
         let nt16 = self.tiles16[0] * self.tiles16[1];

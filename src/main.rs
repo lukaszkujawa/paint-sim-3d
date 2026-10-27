@@ -152,7 +152,7 @@ impl App {
             tool: Tool::default(),
             air: Airborne::new(),
             surface,
-            brush: brush::Brush::new(160, 0.035, 0.008, 0.00015),
+            brush: if std::env::var("PAINT_BRUSH_FLAT").is_ok() { brush::Brush::build(brush::BrushShape::Flat, 160, 0.035, 0.025, 0.00015) } else { brush::Brush::new(160, 0.035, 0.008, 0.00015) },
             brush_scraped: 0.0,
             brush_released: 0.0,
             prev_kind: ToolKind::Stick,
@@ -227,6 +227,37 @@ impl App {
             let mut paint = color::PaintMix::pure(5);
             paint.frac[12] = 0.1;
             deposits.push(Deposit::capsule([w * 0.5, hgt * 0.5], [w * 0.52, hgt * 0.51], 0.008, 4.0e-6 * dt, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+        }
+    }
+
+    fn rebuild_brush(&mut self, shape: brush::BrushShape, n: usize, len: f64, size: f64) {
+        let old = &self.brush;
+        let (st, fr, rl, radius) = (old.stiffness, old.friction, old.release, old.radius);
+        let load = old.total_load();
+        let cap = old.total_capacity();
+        let mut comp = [0.0f32; 16];
+        if load > 0.0 {
+            for b in &old.bristles {
+                for i in 0..16 {
+                    comp[i] += b.comp[i] * (b.load / load) as f32;
+                }
+            }
+        }
+        let press = (old.len - self.tool.height).max(0.0);
+        let mut b = brush::Brush::build(shape, n, len, size, radius);
+        b.stiffness = st;
+        b.friction = fr;
+        b.release = rl;
+        if load > 0.0 && cap > 0.0 {
+            b.dip(&comp);
+            let f = (load / cap).min(1.0);
+            for br in &mut b.bristles {
+                br.load *= f;
+            }
+        }
+        self.brush = b;
+        if self.tool.kind == ToolKind::Brush {
+            self.tool.height = (len - press).clamp(0.002, len - 0.003);
         }
     }
 
@@ -1352,23 +1383,20 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.brush.friction, 0.0..=0.95).text("bristle friction"));
                     ui.add(egui::Slider::new(&mut self.brush.release, 0.1..=10.0).logarithmic(true).text("paint release 1/s"));
                     ui.add(egui::Slider::new(&mut self.brush_sink, 0.0..=1.0).text("sink into wet paint"));
+                    let mut shape = self.brush.shape;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut shape, brush::BrushShape::Round, "round");
+                        ui.selectable_value(&mut shape, brush::BrushShape::Flat, "flat");
+                    });
+                    let mut size = self.brush.size() * 1e3;
+                    let mut len = self.brush.len * 1e3;
                     let mut n = self.brush.bristles.len();
-                    if ui.add(egui::Slider::new(&mut n, 16..=400).text("bristle count")).changed() {
-                        let b = brush::Brush::new(n, self.brush.len, self.brush.ferrule_r, self.brush.radius);
-                        let (st, fr, rl) = (self.brush.stiffness, self.brush.friction, self.brush.release);
-                        self.brush = b;
-                        self.brush.stiffness = st;
-                        self.brush.friction = fr;
-                        self.brush.release = rl;
-                    }
-                    let mut fr = self.brush.ferrule_r * 1e3;
-                    if ui.add(egui::Slider::new(&mut fr, 1.0..=25.0).text("ferrule radius mm")).changed() {
-                        let n = self.brush.bristles.len();
-                        let (st, frc, rl) = (self.brush.stiffness, self.brush.friction, self.brush.release);
-                        self.brush = brush::Brush::new(n, self.brush.len, fr * 1e-3, self.brush.radius);
-                        self.brush.stiffness = st;
-                        self.brush.friction = frc;
-                        self.brush.release = rl;
+                    let size_label = if shape == brush::BrushShape::Flat { "brush width mm" } else { "brush diameter mm" };
+                    let c1 = ui.add(egui::Slider::new(&mut size, 3.0..=60.0).text(size_label)).changed();
+                    let c2 = ui.add(egui::Slider::new(&mut len, 10.0..=60.0).text("bristle length mm")).changed();
+                    let c3 = ui.add(egui::Slider::new(&mut n, 16..=400).text("bristle count")).changed();
+                    if shape != self.brush.shape || c1 || c2 || c3 {
+                        self.rebuild_brush(shape, n, len * 1e-3, size * 1e-3);
                     }
                 }
             }

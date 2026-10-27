@@ -21,8 +21,17 @@ pub struct Release {
     pub comp: [f32; 16],
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BrushShape {
+    Round,
+    Flat,
+}
+
 pub struct Brush {
     pub bristles: Vec<Bristle>,
+    pub shape: BrushShape,
+    pub width: f64,
+    pub angle: f64,
     pub len: f64,
     pub segs: usize,
     pub ferrule_r: f64,
@@ -38,18 +47,56 @@ pub struct Brush {
 
 impl Brush {
     pub fn new(n: usize, len: f64, ferrule_r: f64, radius: f64) -> Self {
+        Self::build(BrushShape::Round, n, len, 2.0 * ferrule_r, radius)
+    }
+
+    pub fn build(shape: BrushShape, n: usize, len: f64, size: f64, radius: f64) -> Self {
         let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
         let segs = 8;
         let mut bristles = Vec::with_capacity(n);
-        for k in 0..n {
-            let r = ferrule_r * ((k as f64 + 0.5) / n as f64).sqrt();
-            let a = k as f64 * golden;
-            let root = DVec3::new(r * a.cos(), r * a.sin(), 0.0);
-            let splay = 0.35 * r / ferrule_r;
-            let rest = DVec3::new(a.cos() * splay, a.sin() * splay, -1.0).normalize();
-            bristles.push(Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1] });
-        }
-        Self { bristles, len, segs, ferrule_r, radius, stiffness: 0.35, friction: 0.7, capacity: 6.0e-9, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+        let blank = |root: DVec3, rest: DVec3| Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1] };
+        let (ferrule_r, width) = match shape {
+            BrushShape::Round => {
+                let ferrule_r = 0.5 * size;
+                for k in 0..n {
+                    let r = ferrule_r * ((k as f64 + 0.5) / n as f64).sqrt();
+                    let a = k as f64 * golden;
+                    let root = DVec3::new(r * a.cos(), r * a.sin(), 0.0);
+                    let splay = 0.35 * r / ferrule_r;
+                    let rest = DVec3::new(a.cos() * splay, a.sin() * splay, -1.0).normalize();
+                    bristles.push(blank(root, rest));
+                }
+                (ferrule_r, size)
+            }
+            BrushShape::Flat => {
+                let width = size;
+                let thick = (0.18 * width).clamp(1.5e-3, 6.0e-3);
+                let cols = ((n as f64 * width / thick).sqrt().ceil() as usize).max(2);
+                let rows = n.div_ceil(cols).max(1);
+                for k in 0..n {
+                    let c = (k % cols) as f64;
+                    let r = (k / cols) as f64;
+                    let jx = (k as f64 * golden).fract() - 0.5;
+                    let jy = (k as f64 * golden * 1.7).fract() - 0.5;
+                    let x = (-0.5 + (c + 0.5 + 0.4 * jx) / cols as f64) * width;
+                    let y = (-0.5 + (r + 0.5 + 0.4 * jy) / rows as f64) * thick;
+                    let root = DVec3::new(x, y, 0.0);
+                    let rest = DVec3::new(0.3 * x / (0.5 * width), 0.15 * y / (0.5 * thick), -1.0).normalize();
+                    bristles.push(blank(root, rest));
+                }
+                (0.5 * width, width)
+            }
+        };
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, stiffness: 0.35, friction: 0.7, capacity: 6.0e-9, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+    }
+
+    pub fn size(&self) -> f64 {
+        self.width
+    }
+
+    fn rooted(&self, root: DVec3) -> DVec3 {
+        let (s, c) = self.angle.sin_cos();
+        DVec3::new(c * root.x - s * root.y, s * root.x + c * root.y, root.z)
     }
 
     pub fn total_load(&self) -> f64 {
@@ -100,18 +147,30 @@ impl Brush {
         let stiffness = self.stiffness;
         let friction = self.friction;
         let vel = if self.placed { (handle - self.handle) / dt.max(1e-6) } else { DVec3::ZERO };
+        if self.shape == BrushShape::Flat && vel.truncate().length() > 0.03 {
+            let want = vel.y.atan2(vel.x) + std::f64::consts::FRAC_PI_2;
+            let mut d = want - self.angle;
+            while d > std::f64::consts::FRAC_PI_2 {
+                d -= std::f64::consts::PI;
+            }
+            while d < -std::f64::consts::FRAC_PI_2 {
+                d += std::f64::consts::PI;
+            }
+            self.angle += d * (6.0 * dt).min(1.0);
+        }
+        let roots: Vec<DVec3> = self.bristles.iter().map(|b| self.rooted(b.root)).collect();
         if !self.placed || (handle - self.handle).length() > 0.1 {
-            for b in &mut self.bristles {
+            for (b, root) in self.bristles.iter_mut().zip(&roots) {
                 for i in 0..=segs {
-                    b.pts[i] = handle + b.root + b.rest * (l * i as f64);
+                    b.pts[i] = handle + *root + b.rest * (l * i as f64);
                     b.prev[i] = b.pts[i];
                 }
             }
             self.placed = true;
         }
         self.handle = handle;
-        self.bristles.par_iter_mut().for_each(|b| {
-            b.pts[0] = handle + b.root;
+        self.bristles.par_iter_mut().zip(roots.par_iter()).for_each(|(b, root)| {
+            b.pts[0] = handle + *root;
             for _ in 0..8 {
                 for i in 1..=segs {
                     let dir_prev = if i == 1 { b.rest } else { (b.pts[i - 1] - b.pts[i - 2]).normalize_or_zero() };

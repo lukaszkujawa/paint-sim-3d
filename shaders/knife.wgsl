@@ -8,6 +8,12 @@ struct KnifeParams {
     enabled: u32,
     pad0: u32,
     pad1: u32,
+    fill: f32,
+    pad2: u32,
+    pad3: u32,
+    pad4: u32,
+    pig0: vec4<u32>,
+    pig1: vec4<u32>,
 }
 
 struct Scrap {
@@ -30,16 +36,41 @@ fn knife(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = idx(id.x, id.y);
     let hv = h[c];
     let cap = max(K.height - m[c], 0.0);
-    if hv <= cap { return; }
+    let level = min(K.fill, cap);
+    if hv <= cap && hv >= level { return; }
     let p = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * P.dx;
     let ab = K.b - K.a;
-    let l2 = max(dot(ab, ab), 1e-12);
-    let t = dot(p - K.a, ab) / l2;
+    let mv = K.dir * K.sweep;
+    let det = ab.x * mv.y - ab.y * mv.x;
+    if abs(det) < 1e-12 { return; }
+    let q = p - K.a;
+    let t = (q.x * mv.y - q.y * mv.x) / det;
+    let u = -(ab.x * q.y - ab.y * q.x) / det;
     if t < 0.0 || t > 1.0 { return; }
-    let foot = K.a + ab * t;
-    let off = dot(p - foot, K.dir);
-    if off > 0.0 || off < -(K.sweep + P.dx) { return; }
+    if u < -P.dx / max(K.sweep, 1e-9) || u > 1.0 { return; }
+    let lay_dir = normalize(mv + vec2<f32>(1e-9, 0.0));
     var s = stack_load(c);
+    if hv < level {
+        let add = level - hv;
+        stack_push_top(&s, add, unpack_pig(K.pig0, K.pig1), 0.0);
+        h[c] = level;
+        lay[c] = lay_pack(METHOD_KNIFE, lay_dir);
+        mark_moved(id.x, id.y);
+        stack_compact(&s);
+        stack_store(c, s);
+        let slot = atomicAdd(&scrap_count, 1u);
+        if slot < arrayLength(&scraps) {
+            var r: Scrap;
+            r.cell = c;
+            r.vol = -add * P.dx * P.dx;
+            r.pad0 = 0u;
+            r.pad1 = 0u;
+            r.pig0 = vec4<u32>(0u);
+            r.pig1 = vec4<u32>(0u);
+            scraps[slot] = r;
+        }
+        return;
+    }
     var excess = hv - cap;
     var removed = 0.0;
     var pig: array<f32, 16>;
@@ -60,7 +91,7 @@ fn knife(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if removed <= 0.0 { return; }
     h[c] = hv - removed;
-    lay[c] = lay_pack(METHOD_KNIFE, K.dir);
+    lay[c] = lay_pack(METHOD_KNIFE, lay_dir);
     mark_moved(id.x, id.y);
     stack_compact(&s);
     stack_store(c, s);

@@ -27,6 +27,7 @@ const PI: f32 = 3.14159265;
 const METHOD_BRUSH: f32 = 4.0;
 const METHOD_KNIFE: f32 = 5.0;
 const METHOD_ROLLER: f32 = 6.0;
+const FLOOR_COLOR: vec3<f32> = vec3<f32>(0.052, 0.055, 0.061);
 const ROLLER_STIPPLE_DEPTH: f32 = 14e-6;
 const ROLLER_STIPPLE_SCALE: f32 = 0.7e-3;
 const ROLLER_STIPPLE_STRETCH: f32 = 1.6;
@@ -1040,7 +1041,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let W = cam.canvas.x;
     let H = cam.canvas.y;
     if p.x < 0.0 || p.y < 0.0 || p.x > W || p.y > H {
-        let fl = cam.ground.rgb * 0.6;
+        let fl = FLOOR_COLOR;
         return vec4<f32>(to_srgb(tonemap(fl)), 1.0);
     }
     let v = -dir;

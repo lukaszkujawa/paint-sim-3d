@@ -2,6 +2,7 @@ mod brush;
 mod color;
 mod pollock;
 mod film;
+mod gizmo;
 mod gpu;
 mod panels;
 mod render;
@@ -22,6 +23,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+const KNIFE_TURN_MIN: f64 = 2.0e-4;
+const KNIFE_TURN_DIST: f64 = 0.04;
+const KNIFE_CAPACITY_PER_WIDTH: f64 = 5.0e-5;
+const KNIFE_HOLD_PER_WIDTH: f64 = 1.2e-5;
+const KNIFE_SPILL_PER_M: f64 = 2.5;
+const KNIFE_END_RIDGE: f64 = 0.8;
 const PEN_FLOW_MIN: f64 = 0.1;
 const PEN_FLOW_MAX: f64 = 1.5;
 const PEN_WIDTH_MIN: f32 = 0.35;
@@ -61,6 +68,10 @@ struct App {
     surface: CoarseSurface,
     prev_tool_pos: Option<DVec3>,
     knife_dir: [f64; 2],
+    knife_load: f64,
+    knife_comp: [f32; 16],
+    knife_prev: Option<DVec3>,
+    knife_track: Option<DVec3>,
     pending_deposits: Vec<Deposit>,
     scrap_total: f64,
     view_rect: [f32; 4],
@@ -211,6 +222,10 @@ impl App {
             painter_rounds_left: 0,
             prev_tool_pos: None,
             knife_dir: [1.0, 0.0],
+            knife_load: 0.0,
+            knife_comp: [0.0; 16],
+            knife_prev: None,
+            knife_track: None,
             pending_deposits: Vec::new(),
             scrap_total: 0.0,
             view_rect: [0.0, 0.0, size.width as f32, size.height.max(1) as f32],
@@ -1113,6 +1128,15 @@ impl App {
         self.block_rects.iter().any(|r| r.expand(4.0).contains(p))
     }
 
+    fn load_knife(&mut self) {
+        self.knife_load = self.tool.knife_width * KNIFE_CAPACITY_PER_WIDTH;
+        self.knife_comp = self.paint.frac;
+    }
+
+    fn knife_capacity(&self) -> f64 {
+        self.tool.knife_width * KNIFE_CAPACITY_PER_WIDTH
+    }
+
     fn pen(&self) -> Option<f64> {
         if self.pen_down && self.pen_pressure {
             Some((self.pen_raw.clamp(0.0, 1.0) as f64).powf(self.pen_curve as f64))
@@ -1306,65 +1330,106 @@ impl App {
         self.film.settings.sigma = self.tool.sigma as f32;
         self.tool.paint = self.paint;
         let mut knife = None;
-        if self.tool.kind == ToolKind::Knife && self.tool.flowing {
-            let dir = DVec3::new(self.tool.vel.x, self.tool.vel.y, 0.0);
-            let speed = dir.length();
-            if speed > 1e-4 {
-                let d = dir / speed;
-                let blade_dir = DVec3::new(-d.y, d.x, 0.0);
-                let hw = self.tool.knife_width * 0.5;
-                let p = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
-                let a = p - blade_dir * hw;
-                let b = p + blade_dir * hw;
-                knife = Some(KnifeParams {
-                    a: [a.x as f32, a.y as f32],
-                    b: [b.x as f32, b.y as f32],
-                    dir: [d.x as f32, d.y as f32],
-                    sweep: (speed * frame_dt as f64) as f32,
-                    height: (self.tool.knife_height * pen.map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0)) as f32,
-                    half_width: hw as f32,
-                    active: 1,
-                    pad0: 0,
-                    pad1: 0,
-                });
-                self.knife_dir = [d.x, d.y];
+        if self.tool.kind == ToolKind::Knife {
+            let here = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
+            let moved = self.knife_track.map(|q| here - q).unwrap_or(DVec3::ZERO);
+            let dist = moved.length();
+            if dist > KNIFE_TURN_MIN {
+                let k = (dist / KNIFE_TURN_DIST).min(1.0);
+                let flip = if moved.x * self.knife_dir[0] + moved.y * self.knife_dir[1] < 0.0 { -1.0 } else { 1.0 };
+                let nx = self.knife_dir[0] + (flip * moved.x / dist - self.knife_dir[0]) * k;
+                let ny = self.knife_dir[1] + (flip * moved.y / dist - self.knife_dir[1]) * k;
+                let l = (nx * nx + ny * ny).sqrt().max(1e-9);
+                self.knife_dir = [flip * nx / l, flip * ny / l];
             }
-        }
-        self.scrap_total += scraps.iter().map(|s| s.vol as f64).sum::<f64>();
-        if !scraps.is_empty() {
+            self.knife_track = Some(here);
             let d = DVec3::new(self.knife_dir[0], self.knife_dir[1], 0.0);
-            let blade = DVec3::new(-d.y, d.x, 0.0);
-            let center = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
-            let mut total = 0.0f64;
-            let mut mix = [0.0f32; 16];
-            let mut lo = f64::MAX;
-            let mut hi = f64::MIN;
-            for s in &scraps {
-                let i = (s.cell % self.film.w) as f64 + 0.5;
-                let j = (s.cell / self.film.w) as f64 + 0.5;
-                let cell = DVec3::new(i * self.film.dx as f64, j * self.film.dx as f64, 0.0);
-                let along = (cell - center).dot(blade);
-                lo = lo.min(along);
-                hi = hi.max(along);
-                total += s.vol as f64;
-                for k in 0..8 {
-                    let a = half::f16::from_bits((s.pig[k] & 0xffff) as u16).to_f32();
-                    let b = half::f16::from_bits((s.pig[k] >> 16) as u16).to_f32();
-                    mix[2 * k] += a * s.vol;
-                    mix[2 * k + 1] += b * s.vol;
+            let blade_dir = DVec3::new(-d.y, d.x, 0.0);
+            let hw = self.tool.knife_width * 0.5;
+            let p = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
+            let gap = self.tool.knife_height * pen.map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0);
+            let hold = self.tool.knife_width * KNIFE_HOLD_PER_WIDTH;
+            if self.tool.flowing && !self.paused {
+                let step = self.knife_prev.map(|q| p - q).unwrap_or(DVec3::ZERO);
+                let ahead = step.length();
+                let across = if ahead > 0.0 { (step / ahead).dot(d) } else { 0.0 };
+                if ahead > 1e-6 && across > 0.2 {
+                    let mdir = step / ahead;
+                    let a = p - blade_dir * hw;
+                    let b = p + blade_dir * hw;
+                    let need = gap.max(1e-6) * self.tool.knife_width * (ahead + self.film.dx as f64);
+                    let fill = gap * (self.knife_load / need).min(1.0);
+                    knife = Some(KnifeParams {
+                        a: [a.x as f32, a.y as f32],
+                        b: [b.x as f32, b.y as f32],
+                        dir: [mdir.x as f32, mdir.y as f32],
+                        sweep: ahead as f32,
+                        height: gap as f32,
+                        half_width: hw as f32,
+                        active: 1,
+                        pad0: 0,
+                        pad1: 0,
+                        fill: fill as f32,
+                        pad2: 0,
+                        pad3: 0,
+                        pad4: 0,
+                        pig: color::PaintMix { frac: self.knife_comp }.normalized().packed(),
+                    });
                 }
+                if let Some(q) = self.knife_prev {
+                    let dist = (p - q).length();
+                    let bow = self.knife_load - hold;
+                    if bow > 0.0 && dist > 0.0 {
+                        let spill = bow * (dist * KNIFE_SPILL_PER_M).min(1.0);
+                        self.knife_load -= spill;
+                        let pig = color::PaintMix { frac: self.knife_comp }.normalized().packed();
+                        let r = (0.75 * 0.5 * spill / dist).sqrt().max(self.film.dx as f64) as f32;
+                        for side in [-1.0, 1.0] {
+                            let e0 = q + blade_dir * (side * (hw + r as f64 * 0.6));
+                            let e1 = p + blade_dir * (side * (hw + r as f64 * 0.6));
+                            deposits.push(Deposit::stroke([e0.x as f32, e0.y as f32], [e1.x as f32, e1.y as f32], r, (0.5 * spill) as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                        }
+                    }
+                }
+                self.knife_prev = Some(p);
+            } else {
+                if self.knife_prev.is_some() {
+                    let bow = self.knife_load - hold;
+                    if bow > 0.0 {
+                        let vol = bow * KNIFE_END_RIDGE;
+                        self.knife_load -= vol;
+                        let r = (0.75 * vol / self.tool.knife_width).sqrt().max(self.film.dx as f64);
+                        let q = self.knife_prev.unwrap_or(p) + d * r;
+                        let a = q - blade_dir * hw;
+                        let b = q + blade_dir * hw;
+                        let pig = color::PaintMix { frac: self.knife_comp }.normalized().packed();
+                        deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, vol as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                    }
+                }
+                self.knife_prev = None;
             }
-            if total > 0.0 {
-                let dxm = self.film.dx as f64;
-                let span = (hi - lo).max(dxm);
-                let sweep = knife.as_ref().map(|k| k.sweep as f64).unwrap_or(0.0);
-                let r = (2.0 * total / (std::f64::consts::PI * span)).sqrt().max(0.5 * sweep + dxm).max(0.8 * dxm);
-                let ahead = r + 0.5 * dxm;
-                let a = center + blade * lo + d * ahead;
-                let b = center + blade * hi + d * ahead;
-                let pig = color::PaintMix { frac: mix }.normalized().packed();
-                deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, total as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+        } else {
+            self.knife_prev = None;
+            self.knife_track = None;
+        }
+        self.scrap_total += scraps.iter().map(|s| s.vol.max(0.0) as f64).sum::<f64>();
+        for s in &scraps {
+            let vol = s.vol as f64;
+            if vol < 0.0 {
+                self.knife_load = (self.knife_load + vol).max(0.0);
+                continue;
             }
+            let newload = self.knife_load + vol;
+            if newload <= 0.0 {
+                continue;
+            }
+            for k in 0..8 {
+                let a = half::f16::from_bits((s.pig[k] & 0xffff) as u16).to_f32() as f64;
+                let b = half::f16::from_bits((s.pig[k] >> 16) as u16).to_f32() as f64;
+                self.knife_comp[2 * k] = ((self.knife_comp[2 * k] as f64 * self.knife_load + a * vol) / newload) as f32;
+                self.knife_comp[2 * k + 1] = ((self.knife_comp[2 * k + 1] as f64 * self.knife_load + b * vol) / newload) as f32;
+            }
+            self.knife_load = newload;
         }
         let mut contacts = Vec::new();
         if self.tool.kind == ToolKind::Brush {
@@ -1442,12 +1507,25 @@ impl App {
             if w > 0.0 { [c[0] / w, c[1] / w, c[2] / w] } else { [0.5, 0.5, 0.5] }
         };
         let mut marker = self.air.drops.clone();
-        if !matches!(self.tool.kind, ToolKind::Pour | ToolKind::Roller) {
-            let r = match self.tool.kind { ToolKind::Knife => 0.002, ToolKind::Brush => self.brush.ferrule_r, _ => 0.004 };
-            let mpos = if self.tool.kind == ToolKind::Brush { self.brush.handle } else { self.tool.pos };
-            marker.push(rod::Drop { x: mpos, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() });
+        if self.tool.kind == ToolKind::Brush {
+            let r = self.brush.ferrule_r;
+            marker.push(rod::Drop { x: self.brush.handle, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() });
         }
         let (mut tv, mut ti) = tools::tube_mesh(&self.air.rods, &marker, &color_of);
+        if self.auto.is_none() && (self.painter_active || !self.cursor_over_panel()) {
+            let ground = if self.painter_active { Some(DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0)) } else { self.cam.plane_hit(self.ndc(), 0.0).map(|g| DVec3::new(g.x as f64, g.y as f64, 0.0)) };
+            let gx = gizmo::GizmoCtx {
+                ground,
+                knife_dir: glam::DVec2::new(self.knife_dir[0], self.knife_dir[1]),
+                paint: color_of(&self.paint.normalized().packed()),
+                px: self.cam.dist as f64 * 0.0012,
+                knife_fill: (self.knife_load / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32,
+                knife_paint: color_of(&color::PaintMix { frac: self.knife_comp }.normalized().packed()),
+                knife_gap: self.tool.knife_height * self.pen().map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0),
+                pour_radius: self.pour_radius as f64 * self.pen().map(|p| PEN_WIDTH_MIN as f64 + (1.0 - PEN_WIDTH_MIN as f64) * p).unwrap_or(1.0),
+            };
+            gizmo::tool_gizmo(&mut tv, &mut ti, &self.tool, &gx);
+        }
         if self.tool.kind == ToolKind::Brush {
             let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
             self.brush.mesh(&mut tv, &mut ti, &pc, (self.cam.dist as f64 * 0.0012).max(1.5e-4));
@@ -1766,6 +1844,7 @@ impl ApplicationHandler for Pending {
                             match app.tool.kind {
                                 ToolKind::Brush => app.brush.dip(&app.paint.frac),
                                 ToolKind::Roller => app.roller.dip(&app.paint.frac),
+                                ToolKind::Knife => app.load_knife(),
                                 _ => app.tool.reload(),
                             }
                         }

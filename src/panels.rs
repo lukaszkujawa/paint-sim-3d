@@ -6,7 +6,20 @@ use glam::Vec3;
 const LABEL_W: f32 = 104.0;
 const TOOLBAR_W: f32 = 74.0;
 const INSPECTOR_W: f32 = 320.0;
-const ACCENT: Color32 = Color32::from_rgb(222, 150, 72);
+const ACCENT: Color32 = Color32::from_rgb(78, 132, 204);
+const ACCENT_DIM: Color32 = Color32::from_rgb(46, 78, 120);
+const BAR_BG: Color32 = Color32::from_rgb(22, 23, 25);
+const STRIP_BG: Color32 = Color32::from_rgb(26, 27, 29);
+const PANEL_BG: Color32 = Color32::from_rgb(30, 31, 34);
+const WIDGET_BG: Color32 = Color32::from_rgb(42, 44, 48);
+const WIDGET_HOVER: Color32 = Color32::from_rgb(52, 55, 60);
+const WIDGET_ACTIVE: Color32 = Color32::from_rgb(60, 64, 70);
+const BORDER: Color32 = Color32::from_rgb(45, 47, 51);
+const TEXT: Color32 = Color32::from_rgb(208, 211, 216);
+const TEXT_MUTED: Color32 = Color32::from_rgb(138, 143, 151);
+const OK: Color32 = Color32::from_rgb(104, 178, 128);
+const WARN: Color32 = Color32::from_rgb(214, 172, 92);
+const INFO: Color32 = Color32::from_rgb(150, 178, 214);
 
 const TOOLS: [(ToolKind, &str, &str, &str); 7] = [
     (ToolKind::Stick, "Stick", "1", "Drip paint from a loaded stick"),
@@ -35,24 +48,41 @@ pub fn apply_style(ctx: &egui::Context) {
         s.spacing.window_margin = egui::Margin::same(10);
         s.spacing.menu_margin = egui::Margin::same(6);
         let v = &mut s.visuals;
-        v.panel_fill = Color32::from_rgb(30, 31, 34);
-        v.window_fill = Color32::from_rgb(36, 37, 41);
-        v.extreme_bg_color = Color32::from_rgb(22, 23, 25);
-        v.faint_bg_color = Color32::from_rgb(38, 39, 43);
-        v.window_stroke = Stroke::new(1.0, Color32::from_rgb(52, 54, 58));
+        v.panel_fill = PANEL_BG;
+        v.window_fill = Color32::from_rgb(34, 35, 38);
+        v.extreme_bg_color = BAR_BG;
+        v.faint_bg_color = Color32::from_rgb(36, 37, 40);
+        v.window_stroke = Stroke::new(1.0, BORDER);
+        v.window_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(110) };
+        v.popup_shadow = egui::epaint::Shadow { offset: [0, 3], blur: 12, spread: 0, color: Color32::from_black_alpha(100) };
+        v.override_text_color = None;
+        v.hyperlink_color = ACCENT;
         v.window_corner_radius = CornerRadius::same(6);
         v.menu_corner_radius = CornerRadius::same(6);
-        v.selection.bg_fill = ACCENT.linear_multiply(0.55);
-        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(196, 214, 238));
         v.slider_trailing_fill = true;
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open, &mut v.widgets.noninteractive] {
             w.corner_radius = CornerRadius::same(4);
         }
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(48, 50, 54));
-        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 46, 50);
-        v.widgets.inactive.bg_fill = Color32::from_rgb(44, 46, 50);
-        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(56, 58, 63);
-        v.widgets.active.weak_bg_fill = Color32::from_rgb(64, 66, 72);
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.noninteractive.bg_fill = PANEL_BG;
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.weak_bg_fill = WIDGET_BG;
+        v.widgets.inactive.bg_fill = WIDGET_BG;
+        v.widgets.inactive.bg_stroke = Stroke::NONE;
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.hovered.weak_bg_fill = WIDGET_HOVER;
+        v.widgets.hovered.bg_fill = WIDGET_HOVER;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(70, 74, 80));
+        v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::from_rgb(236, 238, 241));
+        v.widgets.active.weak_bg_fill = WIDGET_ACTIVE;
+        v.widgets.active.bg_fill = WIDGET_ACTIVE;
+        v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+        v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+        v.widgets.open.weak_bg_fill = WIDGET_HOVER;
+        v.widgets.open.bg_fill = WIDGET_HOVER;
+        v.widgets.open.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     });
 }
 
@@ -60,7 +90,7 @@ fn prop<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R)
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(Vec2::new(LABEL_W, ui.spacing().interact_size.y), Layout::left_to_right(Align::Center), |ui| {
             ui.set_min_width(LABEL_W);
-            ui.add(egui::Label::new(RichText::new(label).color(Color32::from_gray(150))).truncate());
+            ui.add(egui::Label::new(RichText::new(label).color(TEXT_MUTED)).truncate());
         });
         ui.spacing_mut().slider_width = (ui.available_width() - 84.0).max(40.0);
         add(ui)
@@ -126,6 +156,7 @@ impl App {
         match self.tool.kind {
             ToolKind::Brush => self.brush.dip(&self.paint.frac),
             ToolKind::Roller => self.roller.dip(&self.paint.frac),
+            ToolKind::Knife => self.load_knife(),
             _ => self.tool.reload(),
         }
     }
@@ -135,11 +166,11 @@ impl App {
         self.menu_open = false;
         self.block_rects.clear();
         let central = ctx.root_ui(|ui| {
-            egui::Panel::top("menubar").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 27)).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.menu_bar(ui));
-            egui::Panel::bottom("status").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 27)).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
-            egui::Panel::left("tools").exact_size(TOOLBAR_W).resizable(false).frame(egui::Frame::new().fill(Color32::from_rgb(27, 28, 31)).inner_margin(egui::Margin::symmetric(6, 8))).show(ui, |ui| self.tool_strip(ui));
+            egui::Panel::top("menubar").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(8, 3)).stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.menu_bar(ui));
+            egui::Panel::bottom("status").frame(egui::Frame::new().fill(BAR_BG).inner_margin(egui::Margin::symmetric(10, 3)).stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.status_bar(ui));
+            egui::Panel::left("tools").exact_size(TOOLBAR_W).resizable(false).frame(egui::Frame::new().fill(STRIP_BG).inner_margin(egui::Margin::symmetric(6, 8)).stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.tool_strip(ui));
             let mut open = self.show_inspector;
-            egui::Panel::right("inspector").exact_size(INSPECTOR_W).resizable(false).frame(egui::Frame::new().fill(Color32::from_rgb(30, 31, 34)).inner_margin(egui::Margin::symmetric(10, 8))).show_collapsible(ui, &mut open, |ui| {
+            egui::Panel::right("inspector").exact_size(INSPECTOR_W).resizable(false).frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(10, 8)).stroke(Stroke::new(1.0, BORDER))).show_collapsible(ui, &mut open, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.inspector(ui));
             });
             self.show_inspector = open;
@@ -158,7 +189,7 @@ impl App {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.label(RichText::new("Paint Sim").strong().color(ACCENT));
+            ui.label(RichText::new("Paint Sim").strong().color(Color32::WHITE));
             ui.add_space(8.0);
             let file = ui.menu_button("File", |ui| {
                 if ui.add(egui::Button::new("Save screenshot").shortcut_text("F12")).clicked() {
@@ -251,7 +282,7 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
-            let (dot, state) = if self.paused { (Color32::from_rgb(220, 170, 60), "Paused") } else { (Color32::from_rgb(90, 190, 110), "Running") };
+            let (dot, state) = if self.paused { (WARN, "Paused") } else { (OK, "Running") };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
@@ -265,7 +296,7 @@ impl App {
             ui.label(small(format!("{:.2} mL on canvas", self.film.total_deposited * 1e6)));
             if let Some(p) = &self.painter {
                 if !p.done {
-                    ui.label(RichText::new(format!("Painter: {}", p.status())).small().color(ACCENT));
+                    ui.label(RichText::new(format!("Painter: {}", p.status())).small().color(INFO));
                 }
             }
             if self.pen_seen {
@@ -273,12 +304,12 @@ impl App {
                 ui.label(RichText::new(format!("Pen {:.0} %", p * 100.0)).small().weak());
             }
             if self.tool.kind == ToolKind::Stick && self.tool.stick_load <= 1e-9 && !self.tool.infinite {
-                ui.label(RichText::new("Stick is empty, press R").small().color(Color32::from_rgb(235, 190, 70)));
+                ui.label(RichText::new("Stick is empty, press R").small().color(WARN));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(small("Left: paint   Right: orbit   Middle: pan   Wheel: height   Ctrl+wheel: zoom".to_string()));
                 if !self.last_beauty.is_empty() {
-                    ui.label(RichText::new(format!("Saved {}", self.last_beauty)).small().color(Color32::from_rgb(150, 200, 150)));
+                    ui.label(RichText::new(format!("Saved {}", self.last_beauty)).small().color(OK));
                 }
             });
         });
@@ -374,6 +405,19 @@ impl App {
             ToolKind::Knife => {
                 num(ui, "Blade width", &mut self.tool.knife_width, 0.005, 0.15, 1e3, " mm", false);
                 num(ui, "Blade gap", &mut self.tool.knife_height, 0.0, 0.003, 1e3, " mm", false);
+                prop(ui, "Load", |ui| {
+                    let frac = (self.knife_load / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32;
+                    ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.2} mL", self.knife_load * 1e6)).small()));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Load knife").on_hover_text("R: pick up the current mix").clicked() {
+                        self.load_knife();
+                    }
+                    if ui.button("Wipe knife").clicked() {
+                        self.knife_load = 0.0;
+                    }
+                });
+                ui.add(egui::Label::new(RichText::new("Drag to level the paint under the blade to the gap. Excess is carried on the blade and spread into thin or bare spots further on; surplus squeezes out as ridges along both ends, and lifting the knife leaves an end ridge.").small().weak()).wrap());
             }
             ToolKind::Brush => self.brush_settings(ui),
             ToolKind::Roller => {}
@@ -555,7 +599,7 @@ impl App {
                     }
                 }
             } else {
-                let full = egui::Button::new(RichText::new("Full painting").strong().color(Color32::from_rgb(25, 20, 15))).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
+                let full = egui::Button::new(RichText::new("Full painting").strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
                 if ui.add(full).on_hover_text("Background, foreground and two or three more rounds of lines with this palette").clicked() {
                     let seed = rand::random::<u64>() % 100000;
                     self.painter = Some(pollock::Painter::full(seed, w, h, self.pollock_pal.clone()));

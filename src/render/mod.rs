@@ -146,16 +146,16 @@ impl Renderer {
             sky: [0.55, 0.62, 0.75],
             ground: [0.22, 0.2, 0.18],
             aperture_mm: 0.8,
-            exposure: 0.45,
+            exposure: -0.35,
             bloom: 0.25,
             grain: 0.006,
-            vignette: 0.15,
+            vignette: 0.05,
             sharpen: 0.9,
-            agx: true,
-            key_elevation_deg: 35.0,
+            agx: false,
+            key_elevation_deg: 40.0,
             key_azimuth_deg: 145.0,
-            key_power: 3.5,
-            fill: 0.4,
+            key_power: 3.2,
+            fill: 0.95,
         }
     }
 

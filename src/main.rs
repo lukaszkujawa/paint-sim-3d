@@ -45,6 +45,8 @@ struct App {
     painter_cure_saved: Option<f32>,
     painter_tilt_saved: Option<(f32, f32)>,
     painter_last_pour: Option<[f32; 2]>,
+    painter_active: bool,
+    painter_rounds_left: u32,
     tool: Tool,
     air: Airborne,
     surface: CoarseSurface,
@@ -98,12 +100,14 @@ struct AutoScript {
     dry: u32,
     export: String,
     stop: u64,
+    rounds: u32,
     snap_save: String,
     snap_load: String,
     camat: String,
     vres: [u32; 2],
     spp: u32,
     light: Vec<f32>,
+    aces: bool,
 }
 
 struct Pending {
@@ -180,6 +184,8 @@ impl App {
             painter_cure_saved: None,
             painter_tilt_saved: None,
             painter_last_pour: None,
+            painter_active: false,
+            painter_rounds_left: 0,
             prev_tool_pos: None,
             knife_dir: [1.0, 0.0],
             pending_deposits: Vec::new(),
@@ -211,6 +217,9 @@ impl App {
         let snap = app.auto.as_ref().map(|a| a.snap_load.clone()).unwrap_or_default();
         if !snap.is_empty() {
             app.load_snapshot(&snap);
+        }
+        if app.auto.as_ref().map(|a| a.aces).unwrap_or(false) {
+            app.renderer.agx = false;
         }
         let light = app.auto.as_ref().map(|a| a.light.clone()).unwrap_or_default();
         if light.len() >= 3 {
@@ -300,6 +309,7 @@ impl App {
         }
         match p.step(self.sim_dt) {
             Some(c) => {
+                self.painter_active = true;
                 if self.tool.kind != c.kind {
                     self.tool.reload();
                 }
@@ -379,16 +389,19 @@ impl App {
                 true
             }
             None => {
-                self.tool.flowing = false;
-                self.painter_last_pour = None;
-                if let Some(v) = self.painter_cure_saved.take() {
-                    self.film.settings.cure_rate = v;
+                if self.painter_active {
+                    self.painter_active = false;
+                    self.tool.flowing = false;
+                    self.painter_last_pour = None;
+                    if let Some(v) = self.painter_cure_saved.take() {
+                        self.film.settings.cure_rate = v;
+                    }
+                    if let Some((deg, dir)) = self.painter_tilt_saved.take() {
+                        self.film.settings.tilt_deg = deg;
+                        self.film.settings.tilt_dir_deg = dir;
+                    }
                 }
-                if let Some((deg, dir)) = self.painter_tilt_saved.take() {
-                    self.film.settings.tilt_deg = deg;
-                    self.film.settings.tilt_dir_deg = dir;
-                }
-                true
+                false
             }
         }
     }
@@ -405,6 +418,13 @@ impl App {
                     p.skip_to(&a.layer);
                 }
                 self.painter = Some(p);
+                self.painter_rounds_left = a.rounds;
+            }
+            if self.painter_rounds_left > 0 && self.painter.as_ref().map(|p| p.done).unwrap_or(false) {
+                self.painter_rounds_left -= 1;
+                if let Some(p) = self.painter.as_mut() {
+                    p.continue_painting();
+                }
             }
             return self.apply_painter();
         }
@@ -1594,20 +1614,18 @@ impl App {
             ui.horizontal(|ui| {
                 let running = self.painter.as_ref().map(|p| !p.done).unwrap_or(false);
                 if !running {
-                    if ui.button("Pollock: paint (experimental)").clicked() {
+                    if ui.button("Pollock: new painting").clicked() {
                         let seed = rand::random::<u64>() % 100000;
                         self.painter = Some(pollock::Painter::new(seed, self.film.settings.width_m as f64, self.film.settings.height_m as f64));
                     }
-                } else if ui.button("Pollock: stop").clicked() {
-                    self.painter = None;
-                    self.tool.flowing = false;
-                    self.painter_last_pour = None;
-                    if let Some(v) = self.painter_cure_saved.take() {
-                        self.film.settings.cure_rate = v;
+                    if let Some(p) = self.painter.as_mut() {
+                        if ui.button("Pollock: continue (same palette)").on_hover_text("adds another round of lines, pours, lassos and drops in this painting's palette on top of what is there").clicked() {
+                            p.continue_painting();
+                        }
                     }
-                    if let Some((deg, dir)) = self.painter_tilt_saved.take() {
-                        self.film.settings.tilt_deg = deg;
-                        self.film.settings.tilt_dir_deg = dir;
+                } else if ui.button("Pollock: stop").clicked() {
+                    if let Some(p) = self.painter.as_mut() {
+                        p.stop();
                     }
                 }
                 if let Some(p) = &self.painter {
@@ -1869,12 +1887,14 @@ fn parse_auto() -> Option<AutoScript> {
     let mut mu = -1.0f64;
     let mut angle = -1.0f32;
     let mut stop = 0u64;
+    let mut rounds = 0u32;
     let mut snap_save = String::new();
     let mut snap_load = String::new();
     let mut camat = String::new();
     let mut vres = [3072u32, 2048u32];
     let mut spp = 64u32;
     let mut light = Vec::new();
+    let mut aces = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1898,7 +1918,9 @@ fn parse_auto() -> Option<AutoScript> {
             "--angle" => { angle = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--cure" => { cure = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0); i += 1; }
             "--stop" => { stop = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
+            "--aces" => { aces = true; }
             "--light" => { light = args.get(i + 1).map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect()).unwrap_or_default(); i += 1; }
+            "--rounds" => { rounds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
             "--snap-save" => { snap_save = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--snap-load" => { snap_load = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--camat" => { camat = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
@@ -1912,11 +1934,40 @@ fn parse_auto() -> Option<AutoScript> {
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, snap_save, snap_load, camat, vres, spp, light })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, rounds, snap_save, snap_load, camat, vres, spp, light, aces })
+}
+
+fn pollock_stats(seeds: u64) {
+    let settings = FilmSettings::default();
+    let dt = 1.0 / 60.0;
+    let mut ratios = Vec::new();
+    let mut rings = vec![0.0f32; 8];
+    for seed in 0..seeds {
+        let mut p = pollock::Painter::new(seed, settings.width_m as f64, settings.height_m as f64);
+        while !p.done {
+            p.step(dt);
+        }
+        let (edge, inner) = p.ink_balance();
+        ratios.push(edge / inner.max(1e-6));
+        for (k, v) in p.ink_rings().iter().enumerate() {
+            rings[k] += v / seeds as f32;
+        }
+    }
+    let mean = ratios.iter().sum::<f32>() / ratios.len().max(1) as f32;
+    let min = ratios.iter().cloned().fold(f32::MAX, f32::min);
+    let max = ratios.iter().cloned().fold(0.0f32, f32::max);
+    println!("edge/interior ink over {} seeds: mean {:.2} min {:.2} max {:.2}", seeds, mean, min, max);
+    let profile: Vec<String> = rings.iter().map(|v| format!("{:.2}", v)).collect();
+    println!("ink density by ring, edge to centre: {}", profile.join(" "));
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(n) = args.windows(2).find(|p| p[0] == "--pollock-stats").and_then(|p| p[1].parse::<u64>().ok()) {
+        pollock_stats(n);
+        return;
+    }
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut pending = Pending { window: None, app: None };

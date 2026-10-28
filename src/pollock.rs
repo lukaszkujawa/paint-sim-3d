@@ -1,3 +1,4 @@
+use crate::color;
 use crate::tools::ToolKind;
 use glam::{DVec2, DVec3};
 use rand::rngs::StdRng;
@@ -54,9 +55,11 @@ struct Paint {
     mu: f64,
 }
 
+#[derive(Clone)]
 struct Palette {
-    name: &'static str,
+    name: String,
     ground: Vec<Paint>,
+    ground_dark: Option<Paint>,
     main: Paint,
     second: Paint,
     accents: Vec<Paint>,
@@ -78,6 +81,8 @@ struct Layer {
     brush_width: f64,
     shades: Vec<[f32; 16]>,
     tilt: (f64, f64),
+    margin: f64,
+    edge_bias: bool,
 }
 
 struct Gesture {
@@ -118,6 +123,9 @@ pub struct Painter {
     dip_len: f64,
     stroke_mix: [f32; 16],
     cover: Vec<f32>,
+    ink: Vec<f32>,
+    pal: Palette,
+    pub round: usize,
     pub palette: String,
     pub ground: String,
     pub seed: u64,
@@ -128,6 +136,29 @@ const RHO: f64 = 1000.0;
 const G: f64 = 9.81;
 const COVER_W: usize = 16;
 const COVER_H: usize = 11;
+const CLASSIC_SHARE: f64 = 0.3;
+const LINE_CANDIDATES: usize = 60;
+const MIN_GROUND_CONTRAST: f64 = 45.0;
+const MIN_LINE_SPREAD: f64 = 26.0;
+const MAIN_PICK_JITTER: f64 = 60.0;
+const GROUND_MARGIN_BLEED: f64 = -0.03;
+const GROUND_MARGIN_BORDER: f64 = 0.05;
+const GROUND_MARGIN_FLOATING: f64 = 0.04;
+const EDGE_BAND: f64 = 0.13;
+const INITIAL_ROUNDS_MIN: usize = 2;
+const EDGE_MARGIN: f64 = 0.03;
+const EDGE_LOOKAHEAD: f64 = 0.15;
+const EDGE_LOOKAHEAD_MAX: f64 = 0.1;
+const EDGE_TURN_GAIN: f64 = 5.0;
+const EDGE_STOP: f64 = 0.005;
+const EDGE_OVERSHOOT: f64 = 0.06;
+const TOOL_EDGE: f64 = 0.02;
+const INK_W: usize = 24;
+const INK_H: usize = 16;
+const START_CANDIDATES: usize = 4;
+const START_INSET: f64 = 0.015;
+const INWARD_REACH: f64 = 0.25;
+const INITIAL_ROUNDS_MAX: usize = 3;
 
 fn mix(parts: &[(usize, f32)], thinner: f32, yield_pa: f32) -> [f32; 16] {
     let mut m = [0.0f32; 16];
@@ -185,11 +216,230 @@ fn paint(rng: &mut StdRng, name: &str, parts: &[(usize, f32)], thinner: f32, yie
     Paint { name: name.to_string(), mix: mix(&jittered, th, yield_pa), mu: lognormal(rng, mu, 0.2) }
 }
 
+const CHROMATIC: [usize; 10] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const DEEP_PIGMENTS: [usize; 7] = [4, 5, 6, 7, 10, 4, 9];
+
+struct ColourModel {
+    set: color::PigmentSet,
+    cmf: Vec<f32>,
+}
+
+impl ColourModel {
+    fn load() -> Self {
+        Self { set: color::load_pigments(), cmf: color::cmf_table() }
+    }
+
+    fn lab(&self, m: &[f32; 16]) -> [f64; 3] {
+        let l = color::mix_lab(&self.set, &self.cmf, m);
+        [l[0] as f64, l[1] as f64, l[2] as f64]
+    }
+}
+
+fn delta_e(a: [f64; 3], b: [f64; 3]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn colour_name(lab: [f64; 3]) -> String {
+    let (l, a, b) = (lab[0], lab[1], lab[2]);
+    let chroma = (a * a + b * b).sqrt();
+    if chroma < 9.0 {
+        return match l {
+            x if x > 88.0 => "white",
+            x if x > 68.0 => "light grey",
+            x if x > 45.0 => "grey",
+            x if x > 25.0 => "charcoal",
+            _ => "black",
+        }
+        .to_string();
+    }
+    let hue = b.atan2(a).to_degrees().rem_euclid(360.0);
+    let word = match hue {
+        h if h < 15.0 => "crimson",
+        h if h < 45.0 => if l < 45.0 { "brown" } else { "red" },
+        h if h < 65.0 => if l < 50.0 { "umber" } else { "orange" },
+        h if h < 80.0 => if l < 62.0 { "ochre" } else { "yellow" },
+        h if h < 105.0 => if l < 65.0 { "olive" } else { "yellow" },
+        h if h < 160.0 => "green",
+        h if h < 215.0 => "teal",
+        h if h < 285.0 => "blue",
+        h if h < 330.0 => "violet",
+        _ => "magenta",
+    };
+    let tone = if l > 80.0 { "pale " } else if l < 32.0 { "deep " } else { "" };
+    format!("{}{}", tone, word)
+}
+
+fn random_parts(rng: &mut StdRng) -> Vec<(usize, f32)> {
+    random_parts_from(rng, &CHROMATIC)
+}
+
+fn random_parts_from(rng: &mut StdRng, bases: &[usize]) -> Vec<(usize, f32)> {
+    let base = *pick(rng, bases);
+    let mut parts = vec![(base, 1.0f32)];
+    if rng.random::<f64>() < 0.45 {
+        let other = *pick(rng, &CHROMATIC);
+        if other != base {
+            parts.push((other, rng.random_range(0.1..0.6) as f32));
+        }
+    }
+    parts
+}
+
+fn tone_to(cm: &ColourModel, parts: &[(usize, f32)], target_l: f64, darkener: usize) -> [f32; 16] {
+    let base = mix(parts, 0.0, 0.0);
+    let l0 = cm.lab(&base)[0];
+    let toward = if target_l > l0 { 0 } else { darkener };
+    let blend_at = |t: f32| {
+        let mut m = [0.0f32; 16];
+        let total: f32 = base[..12].iter().sum::<f32>().max(1e-6);
+        for i in 0..12 {
+            m[i] = base[i] / total * (1.0 - t);
+        }
+        m[toward] += t;
+        m
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..22 {
+        let mid = 0.5 * (lo + hi);
+        let l = cm.lab(&blend_at(mid))[0];
+        let reached = if toward == 0 { l >= target_l } else { l <= target_l };
+        if reached { hi = mid; } else { lo = mid; }
+    }
+    blend_at(hi)
+}
+
+fn named_paint(cm: &ColourModel, rng: &mut StdRng, m: [f32; 16], thinner: f32, yield_pa: f32, mu: f64) -> Paint {
+    let mut m = m;
+    m[12] = (thinner + 0.05 * gauss(rng) as f32).clamp(0.0, 0.75);
+    m[13] = yield_pa;
+    Paint { name: colour_name(cm.lab(&m)), mix: m, mu: lognormal(rng, mu, 0.2) }
+}
+
+fn generated_palette(rng: &mut StdRng, cm: &ColourModel) -> Palette {
+    let key = *weighted(rng, &[("dark", 1.2), ("mid", 1.3), ("light", 0.6)]);
+    let target_l = match key {
+        "dark" => rng.random_range(28.0..38.0),
+        "mid" => rng.random_range(36.0..56.0),
+        _ => rng.random_range(64.0..80.0),
+    };
+    let darkener = if target_l < 42.0 || rng.random::<f64>() < 0.5 { 1 } else { 9 };
+    let ground_parts = match key {
+        "dark" => random_parts_from(rng, &DEEP_PIGMENTS),
+        _ => random_parts(rng),
+    };
+    let g0 = tone_to(cm, &ground_parts, target_l, darkener);
+    let g_light = tone_to(cm, &ground_parts, (target_l + rng.random_range(8.0..16.0)).min(95.0), darkener);
+    let g_dark = tone_to(cm, &ground_parts, (target_l - rng.random_range(10.0..20.0)).max(6.0), darkener);
+    let ground_lab = cm.lab(&g0);
+    let mut partner_parts = random_parts(rng);
+    if rng.random::<f64>() < 0.5 {
+        partner_parts = ground_parts.clone();
+        partner_parts.push((*pick(rng, &CHROMATIC), 0.35));
+    }
+    let g_partner = tone_to(cm, &partner_parts, target_l + rng.random_range(-8.0..8.0), darkener);
+    let ground = vec![
+        named_paint(cm, rng, g0, 0.45, 0.0, 4.0),
+        named_paint(cm, rng, g_partner, 0.45, 0.0, 4.0),
+        named_paint(cm, rng, g_light, 0.45, 0.0, 4.0),
+    ];
+    let ground_dark = Some(named_paint(cm, rng, g_dark, 0.45, 0.0, 4.0));
+    let mut candidates: Vec<[f32; 16]> = vec![mix(&[(0, 1.0)], 0.0, 0.0), mix(&[(1, 1.0)], 0.0, 0.0), mix(&[(0, 0.7), (1, 0.3)], 0.0, 0.0), mix(&[(9, 0.6), (1, 0.4)], 0.0, 0.0)];
+    for _ in 0..LINE_CANDIDATES {
+        let parts = random_parts(rng);
+        let lift = rng.random::<f64>();
+        let m = if lift < 0.45 {
+            mix(&parts, 0.0, 0.0)
+        } else if lift < 0.8 {
+            let target = rng.random_range(55.0..90.0);
+            tone_to(cm, &parts, target, darkener)
+        } else {
+            let target = rng.random_range(12.0..35.0);
+            tone_to(cm, &parts, target, darkener)
+        };
+        candidates.push(m);
+    }
+    let labs: Vec<[f64; 3]> = candidates.iter().map(|m| cm.lab(m)).collect();
+    let ground_name = colour_name(ground_lab);
+    let contrast = |lab: [f64; 3]| (lab[0] - ground_lab[0]).abs() * 1.4 + delta_e(lab, ground_lab);
+    let mut chosen: Vec<usize> = Vec::new();
+    let want = rng.random_range(5..=7);
+    while chosen.len() < want {
+        let mut best = None;
+        let mut best_score = f64::MIN;
+        for (i, lab) in labs.iter().enumerate() {
+            if chosen.contains(&i) {
+                continue;
+            }
+            let c = contrast(*lab);
+            if c < MIN_GROUND_CONTRAST && !chosen.is_empty() {
+                continue;
+            }
+            let nm = colour_name(*lab);
+            if nm == ground_name || chosen.iter().any(|&j| colour_name(labs[j]) == nm) {
+                continue;
+            }
+            let spread = chosen.iter().map(|&j| delta_e(*lab, labs[j])).fold(200.0f64, f64::min);
+            if spread < MIN_LINE_SPREAD {
+                continue;
+            }
+            let score = if chosen.is_empty() { c + MAIN_PICK_JITTER * rng.random::<f64>() } else { c * 0.6 + spread.min(70.0) + 25.0 * rng.random::<f64>() };
+            if score > best_score {
+                best_score = score;
+                best = Some(i);
+            }
+        }
+        match best {
+            Some(i) => chosen.push(i),
+            None => break,
+        }
+    }
+    let mut paints: Vec<Paint> = Vec::new();
+    for (k, &i) in chosen.iter().enumerate() {
+        let (thinner, yield_pa, mu) = match k {
+            0 => (0.2, 0.0, 10.0),
+            1 => (0.15, 5.0, 10.0),
+            _ => (0.22, 0.0, 7.5),
+        };
+        let mut p = named_paint(cm, rng, candidates[i], thinner, yield_pa, mu);
+        if paints.iter().any(|q| q.name == p.name) {
+            p.name = format!("{} {}", p.name, k + 1);
+        }
+        paints.push(p);
+    }
+    while paints.len() < 3 {
+        paints.push(named_paint(cm, rng, mix(&[(0, 1.0)], 0.0, 0.0), 0.2, 0.0, 8.0));
+    }
+    if rng.random::<f64>() < 0.35 {
+        paints.push(paint(rng, "silver", &[(0, 0.75), (1, 0.25)], 0.35, 0.0, 1.5));
+    }
+    let main = paints[0].clone();
+    let second = paints[1].clone();
+    let accents = paints[2..].to_vec();
+    let used: Vec<String> = accents.iter().map(|p| p.name.clone()).collect();
+    let name = format!("{} {} ground: {}, {}, {}", key, ground[0].name, main.name, second.name, used.join(", "));
+    Palette { name, ground, ground_dark, main, second, accents }
+}
+
 fn palette(rng: &mut StdRng) -> Palette {
+    if rng.random::<f64>() >= CLASSIC_SHARE {
+        let cm = ColourModel::load();
+        return generated_palette(rng, &cm);
+    }
+    let mut pal = classic_palette(rng);
+    let darkest = pal.ground.iter().map(|p| p.mix).next().unwrap_or(mix(&[(9, 1.0)], 0.4, 0.0));
+    let mut dark = darkest;
+    dark[1] += 0.15;
+    dark[9] += 0.25;
+    pal.ground_dark = Some(Paint { name: format!("dark {}", pal.ground[0].name), mix: dark, mu: 4.0 });
+    pal
+}
+
+fn classic_palette(rng: &mut StdRng) -> Palette {
     let family = rng.random_range(0..6);
     match family {
         0 => Palette {
-            name: "autumn rhythm",
+            name: "autumn rhythm".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "umber", &[(9, 0.6), (8, 0.3), (1, 0.1)], 0.45, 0.0, 4.0),
                 paint(rng, "white", &[(0, 0.9), (8, 0.1)], 0.4, 0.0, 4.0),
@@ -205,7 +455,8 @@ fn palette(rng: &mut StdRng) -> Palette {
             ],
         },
         1 => Palette {
-            name: "blue poles",
+            name: "blue poles".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "teal", &[(10, 0.4), (6, 0.2), (0, 0.3), (9, 0.1)], 0.5, 0.0, 3.0),
                 paint(rng, "pale yellow", &[(2, 0.25), (0, 0.55), (8, 0.2)], 0.5, 0.0, 3.0),
@@ -221,7 +472,8 @@ fn palette(rng: &mut StdRng) -> Palette {
             ],
         },
         2 => Palette {
-            name: "convergence",
+            name: "convergence".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "black", &[(1, 0.9), (9, 0.1)], 0.4, 0.0, 4.0),
                 paint(rng, "umber", &[(9, 0.8), (1, 0.2)], 0.4, 0.0, 4.0),
@@ -236,7 +488,8 @@ fn palette(rng: &mut StdRng) -> Palette {
             ],
         },
         3 => Palette {
-            name: "earth",
+            name: "earth".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "ochre", &[(8, 0.8), (0, 0.15), (9, 0.05)], 0.45, 0.0, 4.0),
                 paint(rng, "umber", &[(9, 0.7), (1, 0.1), (8, 0.2)], 0.45, 0.0, 4.0),
@@ -251,7 +504,8 @@ fn palette(rng: &mut StdRng) -> Palette {
             ],
         },
         4 => Palette {
-            name: "monochrome",
+            name: "monochrome".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "grey", &[(0, 0.7), (1, 0.3)], 0.45, 0.0, 4.0),
                 paint(rng, "white", &[(0, 1.0)], 0.4, 0.0, 4.0),
@@ -265,7 +519,8 @@ fn palette(rng: &mut StdRng) -> Palette {
             ],
         },
         _ => Palette {
-            name: "lavender mist",
+            name: "lavender mist".to_string(),
+            ground_dark: None,
             ground: vec![
                 paint(rng, "white", &[(0, 1.0)], 0.45, 0.0, 3.0),
                 paint(rng, "pink", &[(0, 0.85), (4, 0.15)], 0.5, 0.0, 3.0),
@@ -304,7 +559,7 @@ fn layer(name: String, p: &Paint, style: Style, duration: f64) -> Layer {
         Style::Scrape => (0.18, 0.0, 0.0, 0.01, 0.0),
         Style::Scrub => (0.2, 0.0, 0.62, 0.01, 0.0),
     };
-    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, brush_width: 0.09, shades: Vec::new(), tilt: (0.0, 0.0) }
+    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, brush_width: 0.09, shades: Vec::new(), tilt: (0.0, 0.0), margin: GROUND_MARGIN_FLOATING, edge_bias: false }
 }
 
 fn shade(rng: &mut StdRng, base: &[f32; 16], partner: &[f32; 16], light: f32, dark: f32, cross: f32) -> [f32; 16] {
@@ -327,9 +582,9 @@ fn shades(rng: &mut StdRng, base: &Paint, partner: &Paint, pass: usize) -> Vec<[
     for _ in 0..n {
         let cross = rng.random_range(0.0..0.25);
         let (light, dark) = match pass {
-            0 => (rng.random_range(0.0..0.3), rng.random_range(0.0..0.15)),
-            1 => (rng.random_range(0.4..1.0), rng.random_range(0.0..0.04)),
-            _ => (rng.random_range(0.0..0.08), rng.random_range(0.3..0.7)),
+            0 => (rng.random_range(0.0..0.1), rng.random_range(0.0..0.08)),
+            1 => (rng.random_range(0.12..0.35), rng.random_range(0.0..0.02)),
+            _ => (rng.random_range(0.0..0.04), rng.random_range(0.15..0.4)),
         };
         out.push(shade(rng, &base.mix, &partner.mix, light, dark, cross));
     }
@@ -340,8 +595,7 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     let mut layers: Vec<Layer> = Vec::new();
     let dry = |rng: &mut StdRng, layers: &mut Vec<Layer>, chance: f64| {
         if rng.random::<f64>() < chance {
-            let d = rng.random_range(3.5..6.0);
-            layers.push(layer("drying".to_string(), &Paint { name: String::new(), mix: mix(&[(1, 1.0)], 0.2, 0.0), mu: 10.0 }, Style::Dry, d));
+            layers.push(dry_layer(rng));
         }
     };
     let grounds = [("brushed", 6.0), ("raw canvas", 0.5), ("floods", 1.0), ("washes", 1.0), ("scraped", 0.8), ("tilt run", 0.8)];
@@ -351,6 +605,12 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
         let j = rng.random_range(0..=i);
         gcols.swap(i, j);
     }
+    let layout = *weighted(rng, &[("bleed", 0.55), ("border", 0.25), ("floating", 0.2)]);
+    let margin = match layout {
+        "bleed" => GROUND_MARGIN_BLEED,
+        "border" => GROUND_MARGIN_BORDER,
+        _ => GROUND_MARGIN_FLOATING,
+    };
     match ground {
         "brushed" => {
             let base = gcols[0].clone();
@@ -358,13 +618,30 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
             let passes = rng.random_range(2..=3);
             for k in 0..passes {
                 let (what, dur) = match k {
-                    0 => ("ground", rng.random_range(95.0..130.0)),
+                    0 => ("ground", rng.random_range(110.0..150.0)),
                     1 => ("lights", rng.random_range(35.0..55.0)),
                     _ => ("darks", rng.random_range(18.0..30.0)),
                 };
                 let mut l = layer(format!("{} brushed {}", base.name, what), &thinned(&base, 0.12, 20.0, 18.0), Style::Scrub, dur);
                 l.shades = shades(rng, &base, &partner, k);
                 l.brush_width = rng.random_range(0.08..0.12);
+                l.margin = margin;
+                layers.push(l);
+            }
+            let edge_chance = match layout {
+                "bleed" => 0.8,
+                "border" => 0.45,
+                _ => 0.25,
+            };
+            if rng.random::<f64>() < edge_chance {
+                let deep = pal.ground_dark.clone().unwrap_or_else(|| base.clone());
+                let mut dark = blend(rng, &deep, &base);
+                dark.name = format!("{} edges", base.name);
+                let mut l = layer(dark.name.clone(), &thinned(&dark, 0.12, 20.0, 18.0), Style::Scrub, rng.random_range(18.0..28.0));
+                l.shades = shades(rng, &dark, &base, 0);
+                l.brush_width = rng.random_range(0.07..0.1);
+                l.margin = margin;
+                l.edge_bias = true;
                 layers.push(l);
             }
             if rng.random::<f64>() < 0.35 {
@@ -421,6 +698,133 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     if ground != "raw canvas" {
         dry(rng, &mut layers, 0.85);
     }
+    layers.extend(figure(rng, pal));
+    (layers, format!("{} {}", ground, layout))
+}
+
+fn dry_layer(rng: &mut StdRng) -> Layer {
+    let d = rng.random_range(3.5..6.0);
+    layer("drying".to_string(), &Paint { name: String::new(), mix: mix(&[(1, 1.0)], 0.2, 0.0), mu: 10.0 }, Style::Dry, d)
+}
+
+fn blend(rng: &mut StdRng, a: &Paint, b: &Paint) -> Paint {
+    let t = rng.random_range(0.25..0.75) as f32;
+    let sa: f32 = a.mix[..12].iter().sum::<f32>().max(1e-6);
+    let sb: f32 = b.mix[..12].iter().sum::<f32>().max(1e-6);
+    let mut m = [0.0f32; 16];
+    for i in 0..12 {
+        m[i] = (1.0 - t) * a.mix[i] / sa + t * b.mix[i] / sb;
+    }
+    m[12] = (1.0 - t) * a.mix[12] + t * b.mix[12];
+    m[13] = (1.0 - t) * a.mix[13] + t * b.mix[13];
+    let mu = (a.mu.ln() * (1.0 - t as f64) + b.mu.ln() * t as f64).exp();
+    Paint { name: format!("{}-{}", a.name, b.name), mix: m, mu }
+}
+
+fn palette_colours(pal: &Palette) -> Vec<Paint> {
+    let mut all = vec![pal.main.clone(), pal.second.clone()];
+    for p in pal.accents.iter().chain(pal.ground.iter()) {
+        if !all.iter().any(|q| q.name == p.name) {
+            all.push(p.clone());
+        }
+    }
+    all
+}
+
+fn line_layer(rng: &mut StdRng, p: &Paint, styles: &[(Style, f64)], fine: f64) -> Layer {
+    let style = *weighted(rng, styles);
+    let (name, pp, dur) = match style {
+        Style::Snap => (format!("{} snaps", p.name), thinned(p, 0.45, 0.0, 1.5), rng.random_range(10.0..16.0)),
+        Style::Fling => (format!("{} flings", p.name), thinned(p, 0.5, 0.0, 1.0), rng.random_range(8.0..14.0)),
+        Style::Lasso => (format!("{} lasso", p.name), thinned(p, 0.12, 0.0, 12.0), rng.random_range(10.0..18.0)),
+        Style::Dots => (format!("{} dots", p.name), p.clone(), rng.random_range(8.0..13.0)),
+        Style::Pour => (format!("{} pours", p.name), p.clone(), rng.random_range(18.0..32.0)),
+        _ => (format!("{} lines", p.name), p.clone(), rng.random_range(16.0..28.0)),
+    };
+    let mut l = layer(name, &pp, style, dur);
+    if matches!(style, Style::Drip | Style::Lasso | Style::Snap | Style::Fling) {
+        l.stick_diameter = (l.stick_diameter * lognormal(rng, 1.0 - 0.25 * fine, 0.18)).clamp(0.0045, 0.016);
+    }
+    if style == Style::Pour {
+        l.flow *= lognormal(rng, 1.0 - 0.35 * fine, 0.25);
+    }
+    l.pace *= lognormal(rng, 1.0 + 0.15 * fine, 0.1);
+    l
+}
+
+fn continuation(rng: &mut StdRng, pal: &Palette, round: usize) -> Vec<Layer> {
+    let mut layers: Vec<Layer> = Vec::new();
+    if rng.random::<f64>() < 0.75 {
+        layers.push(dry_layer(rng));
+    }
+    let colours = palette_colours(pal);
+    let mut theme = pick(rng, &colours).clone();
+    if rng.random::<f64>() < 0.35 {
+        let other = pick(rng, &colours).clone();
+        if other.name != theme.name {
+            theme = blend(rng, &theme, &other);
+        }
+    }
+    let fine = (round as f64 / 4.0).min(1.0);
+    let n = rng.random_range(4..=7);
+    let mut last_name = String::new();
+    for _ in 0..n {
+        let which = *weighted(rng, &[("theme", 0.35), ("main", 0.2), ("second", 0.15), ("accent", 0.2), ("blend", 0.1)]);
+        let p = match which {
+            "theme" => theme.clone(),
+            "main" => pal.main.clone(),
+            "second" => pal.second.clone(),
+            "blend" => {
+                let a = pick(rng, &colours).clone();
+                let b = pick(rng, &colours).clone();
+                if a.name == b.name { a } else { blend(rng, &a, &b) }
+            }
+            _ => pick(rng, &pal.accents).clone(),
+        };
+        if p.name == last_name && rng.random::<f64>() < 0.7 {
+            continue;
+        }
+        last_name = p.name.clone();
+        let l = line_layer(rng, &p, &[(Style::Drip, 3.5), (Style::Pour, 2.0), (Style::Lasso, 1.4), (Style::Snap, 1.0), (Style::Fling, 0.8), (Style::Dots, 0.5)], fine);
+        let style = l.style;
+        layers.push(l);
+        if matches!(style, Style::Pour | Style::Lasso) && rng.random::<f64>() < 0.25 {
+            layers.push(dry_layer(rng));
+        }
+    }
+    if rng.random::<f64>() < 0.6 {
+        let p = if rng.random::<f64>() < 0.5 { pal.main.clone() } else { theme.clone() };
+        let mut l = layer(format!("{} tracery", p.name), &thinned(&p, p.mix[12], 0.0, 6.0), Style::Drip, rng.random_range(16.0..26.0));
+        l.stick_diameter = rng.random_range(0.0045..0.006);
+        l.pace = 2.1;
+        l.loop_chance = 0.06;
+        layers.push(l);
+    }
+    if rng.random::<f64>() < 0.5 {
+        let p = pick(rng, &pal.accents).clone();
+        let style = *weighted(rng, &[(Style::Dots, 1.0), (Style::Fling, 1.0), (Style::Snap, 0.8)]);
+        let (name, pp) = match style {
+            Style::Dots => (format!("{} drops", p.name), p.clone()),
+            Style::Fling => (format!("{} spatter", p.name), thinned(&p, 0.55, 0.0, 0.6)),
+            _ => (format!("{} snaps", p.name), thinned(&p, 0.45, 0.0, 1.2)),
+        };
+        layers.push(layer(name, &pp, style, rng.random_range(7.0..12.0)));
+    }
+    for l in layers.iter_mut() {
+        if l.style != Style::Dry {
+            l.name = format!("r{} {}", round + 1, l.name);
+        }
+    }
+    layers
+}
+
+fn figure(rng: &mut StdRng, pal: &Palette) -> Vec<Layer> {
+    let mut layers: Vec<Layer> = Vec::new();
+    let dry = |rng: &mut StdRng, layers: &mut Vec<Layer>, chance: f64| {
+        if rng.random::<f64>() < chance {
+            layers.push(dry_layer(rng));
+        }
+    };
     let skel_style = *weighted(rng, &[(Style::Pour, 1.0), (Style::Drip, 1.0)]);
     let mut skel = layer(format!("{} skeleton", pal.main.name), &pal.main, skel_style, rng.random_range(30.0..50.0));
     skel.loop_chance = rng.random_range(0.08..0.22);
@@ -494,14 +898,18 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     if rng.random::<f64>() < 0.4 {
         layers.push(layer(format!("{} drops", pal.main.name), &pal.main, Style::Dots, rng.random_range(6.0..10.0)));
     }
-    (layers, ground.to_string())
+    layers
 }
 
 impl Painter {
     pub fn new(seed: u64, w: f64, h: f64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let pal = palette(&mut rng);
-        let (layers, ground) = plan(&mut rng, &pal);
+        let (mut layers, ground) = plan(&mut rng, &pal);
+        let rounds = rng.random_range(INITIAL_ROUNDS_MIN..=INITIAL_ROUNDS_MAX);
+        for r in 1..=rounds {
+            layers.extend(continuation(&mut rng, &pal, r));
+        }
         let total: f64 = layers.iter().map(|l| l.duration).sum();
         let names: Vec<String> = layers.iter().map(|l| format!("{} {:.0}s", l.name, l.duration)).collect();
         log::warn!("pollock seed {} palette {} ground {} total {:.0} s: {}", seed, pal.name, ground, total, names.join(", "));
@@ -528,11 +936,36 @@ impl Painter {
             dip_len: 0.0,
             stroke_mix: [0.0; 16],
             cover: vec![0.0; COVER_W * COVER_H],
+            ink: vec![0.0; INK_W * INK_H],
+            round: rounds,
             palette: pal.name.to_string(),
             ground,
             seed,
             done: false,
+            pal,
         }
+    }
+
+    pub fn continue_painting(&mut self) {
+        self.round += 1;
+        let added = continuation(&mut self.rng, &self.pal, self.round);
+        let total: f64 = added.iter().map(|l| l.duration).sum();
+        let names: Vec<String> = added.iter().map(|l| format!("{} {:.0}s", l.name, l.duration)).collect();
+        log::warn!("pollock continue round {} palette {} total {:.0} s: {}", self.round + 1, self.pal.name, total, names.join(", "));
+        self.layer = self.layers.len();
+        self.layers.extend(added);
+        self.layer_t = 0.0;
+        self.gesture = None;
+        self.cut_pending = true;
+        self.reload_pending = true;
+        self.stroke_len = 1e9;
+        self.done = false;
+    }
+
+    pub fn stop(&mut self) {
+        self.done = true;
+        self.layer = self.layers.len();
+        self.gesture = None;
     }
 
     pub fn skip_to(&mut self, name: &str) {
@@ -545,7 +978,7 @@ impl Painter {
 
     pub fn status(&self) -> String {
         if self.done {
-            return format!("{} on {}: finished", self.palette, self.ground);
+            return format!("{} on {}: {} layers in {} rounds, paused", self.palette, self.ground, self.layers.len(), self.round + 1);
         }
         let l = &self.layers[self.layer];
         format!("{} on {}  layer {}/{} {}  {:.0}/{:.0} s", self.palette, self.ground, self.layer + 1, self.layers.len(), l.name, self.layer_t, l.duration)
@@ -574,8 +1007,88 @@ impl Painter {
     }
 
     fn teleport(&mut self) {
-        self.pos = DVec2::new(self.w * self.rng.random_range(0.1..0.9), self.h * self.rng.random_range(0.1..0.9));
+        let m = START_INSET;
+        let mut best = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
+        let mut best_ink = self.ink_at(best);
+        for _ in 1..START_CANDIDATES {
+            let q = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
+            let k = self.ink_at(q);
+            if k < best_ink {
+                best_ink = k;
+                best = q;
+            }
+        }
+        self.pos = best;
+        let dir = DVec2::new(self.heading.cos(), self.heading.sin());
+        if self.run_to_border(self.pos, dir, 0.0) < INWARD_REACH {
+            let inward = DVec2::new(self.w * 0.5, self.h * 0.5) - self.pos;
+            let spread = self.gauss() * 0.9;
+            self.heading = inward.y.atan2(inward.x) + spread;
+        }
         self.cut_pending = true;
+    }
+
+    fn ink_cell(&self, p: DVec2) -> Option<usize> {
+        if p.x < 0.0 || p.y < 0.0 || p.x >= self.w || p.y >= self.h {
+            return None;
+        }
+        let i = ((p.x / self.w) * INK_W as f64) as usize;
+        let j = ((p.y / self.h) * INK_H as f64) as usize;
+        Some(j.min(INK_H - 1) * INK_W + i.min(INK_W - 1))
+    }
+
+    fn ink_at(&self, p: DVec2) -> f32 {
+        self.ink_cell(p).map(|c| self.ink[c]).unwrap_or(f32::MAX)
+    }
+
+    pub fn ink_rings(&self) -> Vec<f32> {
+        let rings = INK_H / 2;
+        let mut sum = vec![0.0f32; rings];
+        let mut count = vec![0usize; rings];
+        for j in 0..INK_H {
+            for i in 0..INK_W {
+                let r = (i.min(INK_W - 1 - i) * INK_H / INK_W).min(j.min(INK_H - 1 - j)).min(rings - 1);
+                sum[r] += self.ink[j * INK_W + i];
+                count[r] += 1;
+            }
+        }
+        let total: f32 = self.ink.iter().sum::<f32>() / self.ink.len() as f32;
+        sum.iter().zip(count.iter()).map(|(s, c)| s / *c as f32 / total.max(1e-6)).collect()
+    }
+
+    pub fn ink_balance(&self) -> (f32, f32) {
+        let mut edge = (0.0f32, 0usize);
+        let mut inner = (0.0f32, 0usize);
+        for j in 0..INK_H {
+            for i in 0..INK_W {
+                let v = self.ink[j * INK_W + i];
+                if i < 2 || j < 2 || i >= INK_W - 2 || j >= INK_H - 2 {
+                    edge.0 += v;
+                    edge.1 += 1;
+                } else {
+                    inner.0 += v;
+                    inner.1 += 1;
+                }
+            }
+        }
+        (edge.0 / edge.1 as f32, inner.0 / inner.1 as f32)
+    }
+
+    fn edge_start(&mut self, margin: f64) -> (DVec2, f64) {
+        let perimeter = 2.0 * (self.w + self.h);
+        let u = self.rng.random_range(0.0..perimeter);
+        let inset = margin.max(0.0) + EDGE_BAND * self.rng.random::<f64>().powi(2);
+        let (p, along) = if u < self.w {
+            (DVec2::new(u, inset), 0.0)
+        } else if u < self.w + self.h {
+            (DVec2::new(self.w - inset, u - self.w), std::f64::consts::FRAC_PI_2)
+        } else if u < 2.0 * self.w + self.h {
+            (DVec2::new(u - self.w - self.h, self.h - inset), 0.0)
+        } else {
+            (DVec2::new(inset, u - 2.0 * self.w - self.h), std::f64::consts::FRAC_PI_2)
+        };
+        let flip = if self.rng.random::<f64>() < 0.5 { std::f64::consts::PI } else { 0.0 };
+        (p, along + flip)
     }
 
     fn cover_at(&self, p: DVec2) -> f32 {
@@ -627,7 +1140,7 @@ impl Painter {
                 let turns = self.rng.random_range(1.2..2.6);
                 let dur = turns * std::f64::consts::TAU * radius / speed;
                 let lissajous = self.rng.random::<f64>() < 0.4;
-                let m = radius + 0.05;
+                let m = START_INSET;
                 let centre = DVec2::new(self.pos.x.clamp(m, self.w - m), self.pos.y.clamp(m, self.h - m));
                 let phase0 = self.rng.random_range(0.0..6.28);
                 let da: f64 = self.rng.random_range(0.0..6.28);
@@ -677,16 +1190,22 @@ impl Painter {
             }
             Style::Scrub => {
                 let speed = self.lognormal(pace, 0.2).clamp(0.08, 0.35);
-                let m = 0.04;
+                let m = self.layers[li].margin;
                 let mut a = if self.rng.random::<f64>() < 0.25 { self.rng.random_range(0.0..6.28) } else { self.ground_angle + self.gauss() * 0.3 };
                 let mut start = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
-                let mut best = self.cover_at(start);
-                for _ in 0..3 {
-                    let q = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
-                    let c = self.cover_at(q);
-                    if c < best {
-                        best = c;
-                        start = q;
+                if self.layers[li].edge_bias {
+                    let (p, along) = self.edge_start(m);
+                    start = p;
+                    a = along + self.gauss() * 0.25;
+                } else {
+                    let mut best = self.cover_at(start);
+                    for _ in 0..3 {
+                        let q = DVec2::new(self.rng.random_range(m..self.w - m), self.rng.random_range(m..self.h - m));
+                        let c = self.cover_at(q);
+                        if c < best {
+                            best = c;
+                            start = q;
+                        }
                     }
                 }
                 let mut dir = DVec2::new(a.cos(), a.sin());
@@ -705,7 +1224,7 @@ impl Painter {
                 if self.stroke_len > self.dip_len {
                     self.reload_pending = true;
                     self.stroke_len = 0.0;
-                    self.dip_len = self.rng.random_range(0.5..1.1);
+                    self.dip_len = self.rng.random_range(0.35..0.7);
                     let shades = &self.layers[li].shades;
                     if !shades.is_empty() {
                         self.stroke_mix = shades[self.rng.random_range(0..shades.len())];
@@ -740,19 +1259,27 @@ impl Painter {
     }
 
     fn steer(&mut self, dt: f64, turn_sigma: f64) {
-        let margin = 0.08;
-        let c = DVec2::new(self.w * 0.5, self.h * 0.5);
-        let to_c = c - self.pos;
-        let out = ((margin - self.pos.x).max(0.0) + (margin - self.pos.y).max(0.0) + (self.pos.x - (self.w - margin)).max(0.0) + (self.pos.y - (self.h - margin)).max(0.0)) / margin;
-        let target = to_c.y.atan2(to_c.x);
-        let mut d = target - self.heading;
-        while d > std::f64::consts::PI {
-            d -= std::f64::consts::TAU;
+        let dir = DVec2::new(self.heading.cos(), self.heading.sin());
+        let ahead = self.pos + dir * (self.speed * EDGE_LOOKAHEAD).min(EDGE_LOOKAHEAD_MAX);
+        let m = EDGE_MARGIN;
+        let push = DVec2::new(
+            (m - ahead.x).max(0.0) - (ahead.x - (self.w - m)).max(0.0),
+            (m - ahead.y).max(0.0) - (ahead.y - (self.h - m)).max(0.0),
+        ) / m;
+        let out = push.length();
+        if out > 0.0 {
+            let n = push / out;
+            let toward = dir.dot(n);
+            let target = if toward < 0.0 { dir - 2.0 * toward * n } else { dir };
+            let mut d = target.y.atan2(target.x) - self.heading;
+            while d > std::f64::consts::PI {
+                d -= std::f64::consts::TAU;
+            }
+            while d < -std::f64::consts::PI {
+                d += std::f64::consts::TAU;
+            }
+            self.heading += d * (out * EDGE_TURN_GAIN * dt).min(1.0);
         }
-        while d < -std::f64::consts::PI {
-            d += std::f64::consts::TAU;
-        }
-        self.heading += d * (out * 6.0 * dt).min(1.0);
         let tau = 0.35;
         let g = self.gauss();
         self.ang_vel += -self.ang_vel * dt / tau + turn_sigma * (2.0 * dt / tau).sqrt() * g;
@@ -784,6 +1311,8 @@ impl Painter {
             self.stroke_len = 1e9;
             if self.layer >= self.layers.len() {
                 self.done = true;
+                let (edge, inner) = self.ink_balance();
+                log::warn!("pollock ink per cell: edge band {:.2} s, interior {:.2} s, ratio {:.2}", edge, inner, edge / inner.max(1e-6));
                 return None;
             }
         }
@@ -897,8 +1426,25 @@ impl Painter {
                 self.pos += dir * self.speed * dt;
             }
         }
-        self.pos.x = self.pos.x.clamp(0.02, self.w - 0.02);
-        self.pos.y = self.pos.y.clamp(0.02, self.h - 0.02);
+        let reach = match style {
+            Style::Scrub => (-self.layers[li].margin).max(-TOOL_EDGE),
+            Style::Scrape | Style::Flood | Style::Wash => -TOOL_EDGE,
+            _ => EDGE_OVERSHOOT,
+        };
+        self.pos.x = self.pos.x.clamp(-reach, self.w + reach);
+        self.pos.y = self.pos.y.clamp(-reach, self.h + reach);
+        let off = self.pos.x < EDGE_STOP || self.pos.y < EDGE_STOP || self.pos.x > self.w - EDGE_STOP || self.pos.y > self.h - EDGE_STOP;
+        if off && reach > 0.0 && style != Style::Scrub {
+            if flowing {
+                self.cut_pending = true;
+            }
+            flowing = false;
+        }
+        if flowing && matches!(style, Style::Drip | Style::Pour | Style::Lasso | Style::Snap | Style::Fling | Style::Dots) {
+            if let Some(c) = self.ink_cell(self.pos) {
+                self.ink[c] += dt as f32;
+            }
+        }
         let v = (self.pos - prev) / dt.max(1e-6);
         let hmod = if style == Style::Drip || style == Style::Pour { self.height_noise.exp() } else { 1.0 };
         let height = match style {
@@ -948,7 +1494,7 @@ impl Painter {
             knife_height: 0.0004,
             brush_width: if style == Style::Scrub { brush_width } else { 0.0 },
             brush_count: 400,
-            brush_capacity: 2.0e-8,
+            brush_capacity: 3.0e-8,
             brush_release: 0.5,
             tilt: tilt_cmd,
             reload,

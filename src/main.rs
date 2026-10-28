@@ -96,7 +96,14 @@ struct AutoScript {
     layer: String,
     seed: u64,
     dry: u32,
+    export: String,
     stop: u64,
+    snap_save: String,
+    snap_load: String,
+    camat: String,
+    vres: [u32; 2],
+    spp: u32,
+    light: Vec<f32>,
 }
 
 struct Pending {
@@ -138,13 +145,20 @@ impl App {
                 "macro" => { cam.pitch = 0.9; cam.dist = 0.07; cam.yaw = -1.2; }
                 _ => {}
             }
+            let v: Vec<f32> = a.camat.split(',').filter_map(|t| t.parse().ok()).collect();
+            if v.len() == 5 {
+                cam.target = Vec3::new(v[0], v[1], 0.0);
+                cam.dist = v[2];
+                cam.pitch = v[3];
+                cam.yaw = v[4];
+            }
         }
         let ctx = egui::Context::default();
         let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, &window, Some(window.scale_factor() as f32), None, None);
         let eg_renderer = egui_wgpu::Renderer::new(&gpu.device, gpu.config.format, egui_wgpu::RendererOptions::default());
         let mut paint = color::PaintMix::pure(1);
         paint.frac[12] = 0.3;
-        Self {
+        let mut app = Self {
             window,
             gpu,
             film,
@@ -193,7 +207,24 @@ impl App {
             auto,
             shot_request: None,
             stats: String::new(),
+        };
+        let snap = app.auto.as_ref().map(|a| a.snap_load.clone()).unwrap_or_default();
+        if !snap.is_empty() {
+            app.load_snapshot(&snap);
         }
+        let light = app.auto.as_ref().map(|a| a.light.clone()).unwrap_or_default();
+        if light.len() >= 3 {
+            app.renderer.key_elevation_deg = light[0];
+            app.renderer.key_azimuth_deg = light[1];
+            app.renderer.key_power = light[2];
+            if light.len() >= 4 {
+                app.renderer.fill = light[3];
+            }
+            if light.len() >= 5 {
+                app.renderer.exposure = light[4];
+            }
+        }
+        app
     }
 
     fn scripted_deposits(&mut self, deposits: &mut Vec<Deposit>) {
@@ -639,7 +670,7 @@ impl App {
         let (w, h) = if ortho { (self.film.w * 2, self.film.h * 2) } else { (6144u32, 4096u32) };
         let t0 = Instant::now();
         self.refine.run(&self.gpu, &self.film);
-        let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, ortho, w, h, 36, Some(&self.refine));
+        let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, ortho, w, h, 64, Some(&self.refine));
         let path = format!("beauty_{}_{}.png", if ortho { "top" } else { "view" }, self.frame_index);
         let _ = img.save(&path);
         self.last_beauty = format!("{} ({}x{}, {:.1} s)", path, w, h, t0.elapsed().as_secs_f32());
@@ -675,6 +706,200 @@ impl App {
         buf.unmap();
         let _ = img.save(path);
         log::warn!("saved {}", path);
+    }
+
+    fn read_texture_f16(&self, tex: &wgpu::Texture) -> Vec<f32> {
+        let w = self.film.w;
+        let h = self.film.h;
+        let bpr = ((w * 8 + 255) / 256) * 256;
+        let buf = self.gpu.readback("export", (bpr * h) as u64);
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("export") });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.gpu.queue.submit(std::iter::once(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = slice.get_mapped_range().expect("map");
+        let mut out = vec![0.0f32; (w * h * 4) as usize];
+        for y in 0..h {
+            let row = &data[(y * bpr) as usize..(y * bpr + w * 8) as usize];
+            let halves: &[u16] = bytemuck::cast_slice(row);
+            for (i, v) in halves.iter().enumerate() {
+                out[(y * w * 4) as usize + i] = half::f16::from_bits(*v).to_f32();
+            }
+        }
+        drop(data);
+        buf.unmap();
+        out
+    }
+
+    fn read_texture_raw(&self, tex: &wgpu::Texture) -> Vec<u8> {
+        let w = self.film.w;
+        let h = self.film.h;
+        let bpr = ((w * 8 + 255) / 256) * 256;
+        let buf = self.gpu.readback("snap_tex", (bpr * h) as u64);
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("snap") });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.gpu.queue.submit(std::iter::once(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = slice.get_mapped_range().expect("map");
+        let mut out = Vec::with_capacity((w * h * 8) as usize);
+        for y in 0..h {
+            out.extend_from_slice(&data[(y * bpr) as usize..(y * bpr + w * 8) as usize]);
+        }
+        drop(data);
+        buf.unmap();
+        out
+    }
+
+    fn read_buffer_raw(&self, src: &wgpu::Buffer) -> Vec<u8> {
+        let size = src.size();
+        let buf = self.gpu.readback("snap_buf", size);
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("snap") });
+        enc.copy_buffer_to_buffer(src, 0, &buf, 0, size);
+        self.gpu.queue.submit(std::iter::once(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let out = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        out
+    }
+
+    fn save_snapshot(&mut self, path: &str) {
+        self.compute_stats();
+        let parts = [
+            self.read_buffer_raw(&self.film.h_buf),
+            self.read_buffer_raw(&self.film.m_buf),
+            self.read_buffer_raw(&self.film.tile_flags),
+            self.read_texture_raw(&self.film.color_tex),
+            self.read_texture_raw(&self.film.detail_tex),
+        ];
+        let mut out = Vec::new();
+        out.extend_from_slice(bytemuck::bytes_of(&[self.film.w, self.film.h]));
+        out.extend_from_slice(bytemuck::bytes_of(&[self.film.h_max, self.film.s_max]));
+        for p in &parts {
+            out.extend_from_slice(bytemuck::bytes_of(&(p.len() as u64)));
+            out.extend_from_slice(p);
+        }
+        let _ = std::fs::write(path, out);
+        log::warn!("saved snapshot {}", path);
+    }
+
+    fn load_snapshot(&mut self, path: &str) {
+        let Ok(data) = std::fs::read(path) else {
+            log::warn!("cannot read snapshot {}", path);
+            return;
+        };
+        let dims: [u32; 2] = bytemuck::pod_read_unaligned(&data[0..8]);
+        if dims != [self.film.w, self.film.h] {
+            log::warn!("snapshot is {}x{}, film is {}x{}", dims[0], dims[1], self.film.w, self.film.h);
+            return;
+        }
+        let maxes: [f32; 2] = bytemuck::pod_read_unaligned(&data[8..16]);
+        let mut off = 16usize;
+        let mut parts = Vec::new();
+        for _ in 0..5 {
+            let len: u64 = bytemuck::pod_read_unaligned(&data[off..off + 8]);
+            off += 8;
+            parts.push(&data[off..off + len as usize]);
+            off += len as usize;
+        }
+        let q = &self.gpu.queue;
+        q.write_buffer(&self.film.h_buf, 0, parts[0]);
+        q.write_buffer(&self.film.m_buf, 0, parts[1]);
+        q.write_buffer(&self.film.tile_flags, 0, parts[2]);
+        let w = self.film.w;
+        let h = self.film.h;
+        for (tex, bytes) in [(&self.film.color_tex, parts[3]), (&self.film.detail_tex, parts[4])] {
+            q.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+        self.film.h_max = maxes[0];
+        self.film.s_max = maxes[1];
+        self.paused = true;
+        log::warn!("loaded snapshot {}", path);
+    }
+
+    fn export_blender(&mut self, dir: &str) {
+        let _ = std::fs::create_dir_all(dir);
+        let w = self.film.w;
+        let h = self.film.h;
+        let n = (w * h) as u64;
+        let buf = self.gpu.readback("exp_h", n * 4);
+        let bufm = self.gpu.readback("exp_m", n * 4);
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("export") });
+        enc.copy_buffer_to_buffer(&self.film.h_buf, 0, &buf, 0, n * 4);
+        enc.copy_buffer_to_buffer(&self.film.m_buf, 0, &bufm, 0, n * 4);
+        self.gpu.queue.submit(std::iter::once(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        bufm.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let hv: Vec<f32> = bytemuck::cast_slice(&buf.slice(..).get_mapped_range().expect("map")).to_vec();
+        let mv: Vec<f32> = bytemuck::cast_slice(&bufm.slice(..).get_mapped_range().expect("map")).to_vec();
+        buf.unmap();
+        bufm.unmap();
+        let color = self.read_texture_f16(&self.film.color_tex);
+        let detail = self.read_texture_f16(&self.film.detail_tex);
+        let mut height = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(w, h);
+        let mut albedo = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
+        let mut rough = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(w, h);
+        let mut mask = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        let mut hmax = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let c = (y * w + x) as usize;
+                let total = hv[c].max(0.0) + mv[c].max(0.0);
+                hmax = hmax.max(total);
+                height.put_pixel(x, h - 1 - y, image::Luma([(total * 1e6).clamp(0.0, 65535.0) as u16]));
+                let col = &color[c * 4..c * 4 + 4];
+                albedo.put_pixel(x, h - 1 - y, image::Rgb([q(col[0]), q(col[1]), q(col[2])]));
+                rough.put_pixel(x, h - 1 - y, image::Luma([q(col[3])]));
+                let d = &detail[c * 4..c * 4 + 4];
+                let method = d[0].floor();
+                let angle = (d[0] - method).clamp(0.0, 1.0);
+                let brushed = if (method - 5.0).abs() < 0.5 || (method - 6.0).abs() < 0.5 { 1.0 } else { 0.0 };
+                let wet = (hv[c] / 0.5e-3).clamp(0.0, 1.0);
+                mask.put_pixel(x, h - 1 - y, image::Rgb([q(wet), q(angle), q(brushed)]));
+            }
+        }
+        let jobs: Vec<(String, Vec<u16>, image::ColorType)> = vec![
+            (format!("{}/height.png", dir), height.into_raw(), image::ColorType::L16),
+            (format!("{}/albedo.png", dir), albedo.into_raw(), image::ColorType::Rgb16),
+            (format!("{}/roughness.png", dir), rough.into_raw(), image::ColorType::L16),
+            (format!("{}/mask.png", dir), mask.into_raw(), image::ColorType::Rgb16),
+        ];
+        use rayon::prelude::*;
+        jobs.par_iter().for_each(|(path, data, ct)| {
+            let be: &[u8] = bytemuck::cast_slice(data);
+            if let Ok(f) = std::fs::File::create(path) {
+                let wr = std::io::BufWriter::new(f);
+                let enc = image::codecs::png::PngEncoder::new_with_quality(wr, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::NoFilter);
+                let _ = image::ImageEncoder::write_image(enc, be, w, h, (*ct).into());
+            }
+        });
+        let meta = format!(
+            "{{\n  \"cells\": [{}, {}],\n  \"size_m\": [{}, {}],\n  \"height_scale_m\": 0.065535,\n  \"height_max_m\": {:.6},\n  \"frame\": {}\n}}\n",
+            w, h, self.film.settings.width_m, self.film.settings.height_m, hmax, self.frame_index
+        );
+        let _ = std::fs::write(format!("{}/canvas.json", dir), meta);
+        let _ = std::fs::write(format!("{}/render.py", dir), include_str!("../blender/render.py"));
+        self.last_beauty = format!("exported {} ({}x{})", dir, w, h);
+        log::warn!("exported Blender set to {}", dir);
     }
 
     fn compute_stats(&mut self) {
@@ -1242,20 +1467,35 @@ impl App {
         }
         self.frame_index += 1;
         let mut exit = false;
+        let export_dir = self.auto.as_ref().filter(|a| self.frame_index == a.frames).map(|a| a.export.clone()).unwrap_or_default();
+        if !export_dir.is_empty() {
+            self.export_blender(&export_dir);
+        }
         if let Some(auto) = &self.auto {
             if self.frame_index == auto.frames {
                 self.shot_request = Some(auto.shot.clone());
+                if !auto.snap_save.is_empty() {
+                    let sp = auto.snap_save.clone();
+                    self.save_snapshot(&sp);
+                }
+                let auto = self.auto.as_ref().unwrap();
+                let spp = auto.spp;
+                let vres = auto.vres;
                 if !auto.beauty.is_empty() {
                     let bp = auto.beauty.clone();
                     self.refine.run(&self.gpu, &self.film);
-                    let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, true, self.film.w * 2, self.film.h * 2, 36, Some(&self.refine));
+                    let t0 = Instant::now();
+                    let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, true, self.film.w * 2, self.film.h * 2, spp, Some(&self.refine));
+                    log::warn!("beauty took {:.1} s", t0.elapsed().as_secs_f32());
                     let _ = img.save(&bp);
                     log::warn!("saved beauty {}", bp);
                 }
                 if !auto.view.is_empty() {
                     let vp = auto.view.clone();
                     self.refine.run(&self.gpu, &self.film);
-                    let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, false, 3072, 2048, 36, Some(&self.refine));
+                    let t0 = Instant::now();
+                    let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, false, vres[0], vres[1], spp, Some(&self.refine));
+                    log::warn!("view took {:.1} s", t0.elapsed().as_secs_f32());
                     let _ = img.save(&vp);
                     log::warn!("saved view {}", vp);
                 }
@@ -1320,6 +1560,23 @@ impl App {
                 }
                 if ui.button("beauty render (top)").clicked() {
                     self.beauty_render(true);
+                }
+                ui.menu_button("beauty settings", |ui| {
+                    ui.add(egui::Slider::new(&mut self.renderer.aperture_mm, 0.0..=8.0).text("aperture mm (view only)"));
+                    ui.add(egui::Slider::new(&mut self.renderer.exposure, -2.0..=2.0).text("exposure stops"));
+                    ui.add(egui::Slider::new(&mut self.renderer.key_elevation_deg, 5.0..=90.0).text("key light elevation deg"));
+                    ui.add(egui::Slider::new(&mut self.renderer.key_azimuth_deg, -180.0..=180.0).text("key light azimuth deg"));
+                    ui.add(egui::Slider::new(&mut self.renderer.key_power, 0.0..=10.0).text("key light power"));
+                    ui.add(egui::Slider::new(&mut self.renderer.fill, 0.0..=1.5).text("ambient fill"));
+                    ui.add(egui::Slider::new(&mut self.renderer.bloom, 0.0..=1.0).text("bloom"));
+                    ui.add(egui::Slider::new(&mut self.renderer.vignette, 0.0..=0.6).text("vignette"));
+                    ui.add(egui::Slider::new(&mut self.renderer.grain, 0.0..=0.05).text("grain"));
+                    ui.add(egui::Slider::new(&mut self.renderer.sharpen, 0.0..=1.5).text("sharpen"));
+                    ui.checkbox(&mut self.renderer.agx, "AgX tone mapping (off: ACES)");
+                });
+                if ui.button("export for Blender").clicked() {
+                    let dir = format!("blender_export_{}", self.frame_index);
+                    self.export_blender(&dir);
                 }
                 if ui.button("beauty render (view)").clicked() {
                     self.beauty_render(false);
@@ -1608,9 +1865,16 @@ fn parse_auto() -> Option<AutoScript> {
     let mut layer = String::new();
     let mut seed: u64 = 7;
     let mut dry: u32 = 0;
+    let mut export = String::new();
     let mut mu = -1.0f64;
     let mut angle = -1.0f32;
     let mut stop = 0u64;
+    let mut snap_save = String::new();
+    let mut snap_load = String::new();
+    let mut camat = String::new();
+    let mut vres = [3072u32, 2048u32];
+    let mut spp = 64u32;
+    let mut light = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1628,16 +1892,27 @@ fn parse_auto() -> Option<AutoScript> {
             "--layer" => { layer = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--seed" => { seed = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(7); i += 1; }
             "--dry" => { dry = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
+            "--export" => { export = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
             "--yield" => { yield_pa = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--mu" => { mu = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--angle" => { angle = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(-1.0); i += 1; }
             "--cure" => { cure = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0); i += 1; }
             "--stop" => { stop = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
+            "--light" => { light = args.get(i + 1).map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect()).unwrap_or_default(); i += 1; }
+            "--snap-save" => { snap_save = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
+            "--snap-load" => { snap_load = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
+            "--camat" => { camat = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
+            "--spp" => { spp = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(64); i += 1; }
+            "--vres" => {
+                let v: Vec<u32> = args.get(i + 1).map(|s| s.split('x').filter_map(|t| t.parse().ok()).collect()).unwrap_or_default();
+                if v.len() == 2 { vres = [v[0], v[1]]; }
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, stop })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, snap_save, snap_load, camat, vres, spp, light })
 }
 
 fn main() {

@@ -18,6 +18,9 @@ pub struct CamUniform {
     pub vp: [[f32; 4]; 4],
     pub jitter: [f32; 4],
     pub ortho: [f32; 4],
+    pub basis_r: [f32; 4],
+    pub basis_u: [f32; 4],
+    pub lens: [f32; 4],
 }
 
 pub struct Camera {
@@ -76,6 +79,17 @@ pub struct Renderer {
     pub light_intensity: f32,
     pub sky: [f32; 3],
     pub ground: [f32; 3],
+    pub aperture_mm: f32,
+    pub exposure: f32,
+    pub bloom: f32,
+    pub grain: f32,
+    pub vignette: f32,
+    pub sharpen: f32,
+    pub agx: bool,
+    pub key_elevation_deg: f32,
+    pub key_azimuth_deg: f32,
+    pub key_power: f32,
+    pub fill: f32,
 }
 
 impl Renderer {
@@ -131,6 +145,17 @@ impl Renderer {
             light_intensity: 2.6,
             sky: [0.55, 0.62, 0.75],
             ground: [0.22, 0.2, 0.18],
+            aperture_mm: 0.8,
+            exposure: 0.45,
+            bloom: 0.25,
+            grain: 0.006,
+            vignette: 0.15,
+            sharpen: 0.9,
+            agx: true,
+            key_elevation_deg: 35.0,
+            key_azimuth_deg: 145.0,
+            key_power: 3.5,
+            fill: 0.4,
         }
     }
 
@@ -148,6 +173,9 @@ impl Renderer {
             vp: vp.to_cols_array_2d(),
             jitter: [0.0; 4],
             ortho: [0.0, film.settings.contact_angle_deg.to_radians().tan().max(0.05), 0.0, 0.0],
+            basis_r: [1.0, 0.0, 0.0, 0.0],
+            basis_u: [0.0, 1.0, 0.0, 0.0],
+            lens: [0.0; 4],
         }
     }
 
@@ -342,7 +370,7 @@ impl Beauty {
             multiview_mask: None,
             cache: None,
         });
-        let res_buf = gpu.uniform("resolve", 16);
+        let res_buf = gpu.uniform("resolve", 48);
         Self { pipeline, resolve, resolve_layout, res_buf }
     }
 
@@ -381,9 +409,17 @@ impl Beauty {
             Some(f) => &f.bg_render,
             None => &renderer.bg,
         };
-        let l = renderer.light_dir.normalize();
+        let (el, az) = (renderer.key_elevation_deg.to_radians(), renderer.key_azimuth_deg.to_radians());
+        let l = Vec3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin());
+        base.sky = [renderer.sky[0] * renderer.fill, renderer.sky[1] * renderer.fill, renderer.sky[2] * renderer.fill, 1.0];
+        base.ground = [renderer.ground[0] * renderer.fill, renderer.ground[1] * renderer.fill, renderer.ground[2] * renderer.fill, 1.0];
         let u1 = if l.z.abs() < 0.9 { l.cross(Vec3::Z).normalize() } else { l.cross(Vec3::X).normalize() };
         let u2 = l.cross(u1);
+        let eye = view_cam.eye();
+        let fwd = (view_cam.target - eye).normalize();
+        let right = fwd.cross(Vec3::Z).normalize();
+        let up = right.cross(fwd);
+        let aperture = renderer.aperture_mm * 1e-3;
         let grid = (spp as f32).sqrt().ceil().max(1.0) as u32;
         for i in 0..spp {
             let sx = ((i % grid) as f32 + 0.5) / grid as f32 - 0.5;
@@ -391,11 +427,16 @@ impl Beauty {
             let phi = (i as f32 * 2.399963) % (2.0 * std::f32::consts::PI);
             let rr = 0.12 * (((i as f32 + 0.5) / spp as f32).sqrt());
             let lj = (l + u1 * (rr * phi.cos()) + u2 * (rr * phi.sin())).normalize();
+            let phi_l = (i as f32 * 2.399963 + 1.7) % (2.0 * std::f32::consts::PI);
+            let r_l = aperture * ((i as f32 + 0.37) / spp as f32).sqrt();
             let mut u = base;
             let footprint = if ortho { film.settings.width_m / width as f32 } else { pixel_footprint(&view_cam, height) };
             u.jitter = [sx * 2.0 / width as f32, sy * 2.0 / height as f32, 1.0, footprint];
             u.ortho = [if ortho { 1.0 } else { 0.0 }, base.ortho[1], base.ortho[2], 0.0];
-            u.light = [lj.x, lj.y, lj.z, renderer.light_intensity];
+            u.light = [lj.x, lj.y, lj.z, renderer.key_power * std::f32::consts::PI];
+            u.basis_r = [right.x, right.y, right.z, 0.0];
+            u.basis_u = [up.x, up.y, up.z, 0.0];
+            u.lens = [r_l * phi_l.cos(), r_l * phi_l.sin(), view_cam.dist, if !ortho && aperture > 0.0 { 1.0 } else { 0.0 }];
             gpu.queue.write_buffer(&renderer.cam_buf, 0, bytemuck::bytes_of(&u));
             let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("beauty") });
             {
@@ -418,7 +459,8 @@ impl Beauty {
             }
             gpu.queue.submit(std::iter::once(enc.finish()));
         }
-        gpu.queue.write_buffer(&self.res_buf, 0, bytemuck::bytes_of(&[1.0f32 / spp as f32, 0.0, 0.0, 0.0]));
+        let res = [1.0f32 / spp as f32, renderer.exposure, renderer.bloom, renderer.grain, renderer.vignette, width as f32, height as f32, if renderer.agx { 1.0 } else { 0.0 }, renderer.sharpen, 0.0, 0.0, 0.0];
+        gpu.queue.write_buffer(&self.res_buf, 0, bytemuck::bytes_of(&res));
         let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resolve"),
             layout: &self.resolve_layout,
@@ -463,7 +505,7 @@ impl Beauty {
             let row = &data[(y * bpr) as usize..(y * bpr + width * 4) as usize];
             for x in 0..width {
                 let o = (x * 4) as usize;
-                img.put_pixel(x, height - 1 - y, image::Rgba([row[o], row[o + 1], row[o + 2], 255]));
+                img.put_pixel(x, y, image::Rgba([row[o], row[o + 1], row[o + 2], 255]));
             }
         }
         drop(data);

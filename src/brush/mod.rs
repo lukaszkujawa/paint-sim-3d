@@ -11,6 +11,15 @@ pub struct Bristle {
     pub load: f64,
     pub comp: [f32; 16],
     pub touch: Vec<bool>,
+    pub thick: f64,
+}
+
+fn hash01(k: usize, salt: u64) -> f64 {
+    let mut h = (k as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(salt.wrapping_mul(0xD1B54A32D192ED03));
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 32;
+    (h & 0xffff) as f64 / 65535.0
 }
 
 pub struct Release {
@@ -54,17 +63,23 @@ impl Brush {
         let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
         let segs = 8;
         let mut bristles = Vec::with_capacity(n);
-        let blank = |root: DVec3, rest: DVec3| Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1] };
+        let blank = |k: usize, root: DVec3, rest: DVec3| {
+            let thick = 0.65 + 0.7 * hash01(k, 11);
+            let clump = (hash01(k / 3, 23) - 0.5) * 0.22;
+            let lean = DVec3::new(rest.x + clump * (hash01(k / 3, 29) - 0.5), rest.y + clump * (hash01(k / 3, 31) - 0.5), rest.z).normalize();
+            Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest: lean, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1], thick }
+        };
         let (ferrule_r, width) = match shape {
             BrushShape::Round => {
                 let ferrule_r = 0.5 * size;
                 for k in 0..n {
                     let r = ferrule_r * ((k as f64 + 0.5) / n as f64).sqrt();
-                    let a = k as f64 * golden;
-                    let root = DVec3::new(r * a.cos(), r * a.sin(), 0.0);
+                    let a = k as f64 * golden + (hash01(k, 3) - 0.5) * 0.5;
+                    let rj = r * (1.0 + 0.12 * (hash01(k, 5) - 0.5));
+                    let root = DVec3::new(rj * a.cos(), rj * a.sin(), 0.0);
                     let splay = 0.35 * r / ferrule_r;
                     let rest = DVec3::new(a.cos() * splay, a.sin() * splay, -1.0).normalize();
-                    bristles.push(blank(root, rest));
+                    bristles.push(blank(k, root, rest));
                 }
                 (ferrule_r, size)
             }
@@ -76,13 +91,13 @@ impl Brush {
                 for k in 0..n {
                     let c = (k % cols) as f64;
                     let r = (k / cols) as f64;
-                    let jx = (k as f64 * golden).fract() - 0.5;
-                    let jy = (k as f64 * golden * 1.7).fract() - 0.5;
-                    let x = (-0.5 + (c + 0.5 + 0.4 * jx) / cols as f64) * width;
-                    let y = (-0.5 + (r + 0.5 + 0.4 * jy) / rows as f64) * thick;
+                    let jx = hash01(k, 7) - 0.5;
+                    let jy = hash01(k, 13) - 0.5;
+                    let x = (-0.5 + (c + 0.5 + 0.9 * jx) / cols as f64) * width;
+                    let y = (-0.5 + (r + 0.5 + 0.9 * jy) / rows as f64) * thick;
                     let root = DVec3::new(x, y, 0.0);
                     let rest = DVec3::new(0.3 * x / (0.5 * width), 0.15 * y / (0.5 * thick), -1.0).normalize();
-                    bristles.push(blank(root, rest));
+                    bristles.push(blank(k, root, rest));
                 }
                 (0.5 * width, width)
             }
@@ -228,11 +243,9 @@ impl Brush {
         });
         let mut contacts = Vec::new();
         let mut releases = Vec::new();
-        let rc = (radius * 2.0).max(0.6 * dx) as f32;
         let vxy = DVec3::new(vel.x, vel.y, 0.0);
         let sp = vxy.length();
         let dir = if sp > 1e-6 { vxy / sp } else { DVec3::ZERO };
-        let shift = dir * (2.0 * rc as f64 + sp * dt);
         let mut touching = 0;
         for (bi, b) in self.bristles.iter_mut().enumerate() {
             let segs_touching: Vec<usize> = (1..=segs).filter(|&i| b.touch[i]).collect();
@@ -240,9 +253,11 @@ impl Brush {
                 continue;
             }
             touching += 1;
+            let rc = (radius * 2.0 * b.thick).max(0.6 * dx) as f32;
+            let shift = dir * (2.0 * rc as f64 + sp * dt);
             let nseg = segs_touching.len() as f64;
             let over = (b.load - self.capacity).max(0.0) / nseg;
-            let rel = b.load.min(self.capacity) * (self.release * dt).min(1.0) / nseg;
+            let rel = b.load.min(self.capacity) * b.thick * (self.release * dt).min(1.0) / nseg;
             for &i in &segs_touching {
                 let p0 = [b.pts[i - 1].x as f32, b.pts[i - 1].y as f32];
                 let p1 = [b.pts[i].x as f32, b.pts[i].y as f32];
@@ -269,7 +284,7 @@ impl Brush {
             let pc = if f > 0.0 { paint_col(&b.comp) } else { [0.0; 3] };
             let base = [0.42f32, 0.3, 0.17];
             let col = [base[0] + (pc[0] - base[0]) * f, base[1] + (pc[1] - base[1]) * f, base[2] + (pc[2] - base[2]) * f];
-            push_tube(verts, idx, &b.pts, self.radius.max(rmin), col);
+            push_tube(verts, idx, &b.pts, (self.radius * b.thick).max(rmin), col);
         }
     }
 }

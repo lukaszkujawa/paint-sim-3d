@@ -395,6 +395,7 @@ pub struct Film {
     pub tile_items: wgpu::Buffer,
     pub color_tex: wgpu::Texture,
     pub color_view: wgpu::TextureView,
+    pub detail_tex: wgpu::Texture,
     pub detail_view: wgpu::TextureView,
     lay: wgpu::Buffer,
     bg0: wgpu::BindGroup,
@@ -544,7 +545,7 @@ impl Film {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let color_view = color_tex.create_view(&Default::default());
@@ -555,7 +556,7 @@ impl Film {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let detail_view = detail_tex.create_view(&Default::default());
@@ -720,7 +721,7 @@ impl Film {
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
             sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
-            color_tex, color_view, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
+            color_tex, color_view, detail_tex, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
             p_strata_limit, p_strata_update, p_strata_fill, p_cg_setup, p_cg_init, p_cg_ia, p_cg_ib, p_cg_ic, p_cg_rinit, p_cg_ra, p_cg_rb, p_cg_finish, p_cg_rmass, p_cg_rescale, p_cg_lap_p, p_cg_lap_h, p_cg_lap_u, cg_bufs, cg_report: [0.0; 4], implicit_steps: 1, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,

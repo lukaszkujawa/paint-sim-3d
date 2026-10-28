@@ -89,7 +89,7 @@ impl Refine {
     }
 
     pub fn run(&self, gpu: &Gpu, film: &Film) {
-        let p = RefineParams { csize: [film.w, film.h], fsize: [self.fw, self.fh], dt: 0.2, wlo: 0.4e-3, whi: 1.2e-3, eps: 2e-6 };
+        let p = RefineParams { csize: [film.w, film.h], fsize: [self.fw, self.fh], dt: 0.2, wlo: 0.03e-3, whi: 0.6e-3, eps: 2e-6 };
         gpu.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
         let gx = (self.fw + 15) / 16;
         let gy = (self.fh + 15) / 16;

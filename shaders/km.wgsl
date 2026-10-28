@@ -17,14 +17,19 @@ fn composite(rt: vec2<f32>, rb: f32) -> f32 {
 fn layer_ks(pig: array<f32, 16>, band: u32) -> vec2<f32> {
     var k = 0.0;
     var s = 0.0;
+    var amount = 0.0;
+    var weight = 0.0;
     for (var i = 0u; i < NPIG; i++) {
         let c = pig[i];
         if c > 0.0 {
-            k += c * pigtab[i * PIG_STRIDE + band];
-            s += c * pigtab[i * PIG_STRIDE + NBAND + band];
+            let w = c * pigtab[i * PIG_STRIDE + 34u];
+            k += w * pigtab[i * PIG_STRIDE + band];
+            s += w * pigtab[i * PIG_STRIDE + NBAND + band];
+            amount += c;
+            weight += w;
         }
     }
-    return vec2<f32>(k, s);
+    return vec2<f32>(k, s) * (amount / max(weight, 1e-9));
 }
 
 fn load_refl(c: u32) -> array<f32, 16> {

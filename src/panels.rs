@@ -406,15 +406,15 @@ impl App {
                 num(ui, "Blade width", &mut self.tool.knife_width, 0.005, 0.15, 1e3, " mm", false);
                 num(ui, "Blade gap", &mut self.tool.knife_height, 0.0, 0.003, 1e3, " mm", false);
                 prop(ui, "Load", |ui| {
-                    let frac = (self.knife_load / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32;
-                    ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.2} mL", self.knife_load * 1e6)).small()));
+                    let frac = (self.knife_load() / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32;
+                    ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.2} mL", self.knife_load() * 1e6)).small()));
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Load knife").on_hover_text("R: pick up the current mix").clicked() {
                         self.load_knife();
                     }
                     if ui.button("Wipe knife").clicked() {
-                        self.knife_load = 0.0;
+                        self.wipe_knife();
                     }
                 });
                 ui.add(egui::Label::new(RichText::new("Drag to level the paint under the blade to the gap. Excess is carried on the blade and spread into thin or bare spots further on; surplus squeezes out as ridges along both ends, and lifting the knife leaves an end ridge.").small().weak()).wrap());

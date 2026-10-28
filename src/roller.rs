@@ -14,7 +14,10 @@ const SUB_LANES: usize = 2;
 const LANE_OVERLAP: f64 = 3.2;
 const EDGE_RIDGE: f64 = 0.6;
 const STIPPLE_CELLS: f64 = 9.0;
-const MIX_PER_REV: f64 = 0.08;
+const MIX_PER_REV: f64 = 0.14;
+const EDGE_BLEND: f64 = 0.3;
+const ROLL_SMOOTH: f64 = 0.65;
+const PICKUP_KERNEL: [(i64, i64, f64); 5] = [(0, 0, 0.4), (0, -1, 0.2), (0, 1, 0.2), (-1, 0, 0.1), (1, 0, 0.1)];
 const MIX_MAX: f64 = 0.4;
 const MAX_SECTORS_PER_FRAME: i64 = 48;
 pub const CONTACT_ROLLER: u32 = 1;
@@ -35,6 +38,7 @@ pub struct Roller {
     pos: Option<DVec2>,
     phase: f64,
     pub pressing: bool,
+    trail: Vec<[f32; 16]>,
 }
 
 fn hash(a: u64, b: u64) -> f64 {
@@ -68,6 +72,7 @@ impl Roller {
             pos: None,
             phase: 0.0,
             pressing: false,
+            trail: vec![[0.0; 16]; NAP_LANES],
         }
     }
 
@@ -100,6 +105,9 @@ impl Roller {
 
     pub fn lift(&mut self) {
         self.pos = None;
+        for t in &mut self.trail {
+            *t = [0.0; 16];
+        }
     }
 
     fn thickness(&self, vol: f64, pressure: f64) -> f64 {
@@ -129,7 +137,14 @@ impl Roller {
                 let sc = if i >= 13 { 100.0 } else { 1.0 };
                 comp[i] = (r[1 + i] as f64 * 1e-15 * sc / vol) as f32;
             }
-            blend(&mut self.cells[lane * NAP_SECTORS + k], vol, &comp);
+            for (dl, ds, w) in PICKUP_KERNEL {
+                let l = lane as i64 + dl;
+                if l < 0 || l >= NAP_LANES as i64 {
+                    continue;
+                }
+                let sec = (k as i64 + ds).rem_euclid(NAP_SECTORS as i64) as usize;
+                blend(&mut self.cells[l as usize * NAP_SECTORS + sec], vol * w, &comp);
+            }
             total += vol;
         }
         total
@@ -201,6 +216,9 @@ impl Roller {
         self.phase += roll / self.radius;
         self.pos = Some(p);
         if !pressing {
+            for t in &mut self.trail {
+                *t = [0.0; 16];
+            }
             return (Vec::new(), Vec::new());
         }
         let lane_w = self.width / NAP_LANES as f64;
@@ -254,11 +272,22 @@ impl Roller {
                 [n.x as f32, n.y as f32]
             };
             let (n0, n1) = (along(prev_axis), along(self.axis));
+            for (lane, cell) in laid.iter_mut().enumerate() {
+                if cell.vol <= 0.0 {
+                    continue;
+                }
+                let prior = self.trail[lane];
+                if prior.iter().any(|v| *v > 0.0) {
+                    let mut t = Cell { vol: 1.0 - ROLL_SMOOTH, comp: cell.comp };
+                    blend(&mut t, ROLL_SMOOTH, &prior);
+                    cell.comp = t.comp;
+                }
+                self.trail[lane] = cell.comp;
+            }
             for (lane, cell) in laid.iter().enumerate() {
                 if cell.vol <= 0.0 {
                     continue;
                 }
-                let pig = crate::color::PaintMix { frac: cell.comp }.normalized().packed();
                 let ws: Vec<f64> = (0..SUB_LANES).map(|j| self.weight(lane * SUB_LANES + j, fine, phase0, fill)).collect();
                 let wsum: f64 = ws.iter().sum::<f64>() / SUB_LANES as f64;
                 for (j, w) in ws.iter().enumerate() {
@@ -267,6 +296,14 @@ impl Roller {
                     let a = prev + prev_axis * off;
                     let b = p + self.axis * off;
                     let v = cell.vol / SUB_LANES as f64 * w / wsum;
+                    let side = if j < SUB_LANES / 2 { lane.checked_sub(1) } else { Some(lane + 1).filter(|&n| n < NAP_LANES) };
+                    let mut c = Cell { vol: cell.vol * (1.0 - EDGE_BLEND), comp: cell.comp };
+                    if let Some(n) = side {
+                        if laid[n].vol > 0.0 {
+                            blend(&mut c, cell.vol * EDGE_BLEND, &laid[n].comp);
+                        }
+                    }
+                    let pig = crate::color::PaintMix { frac: c.comp }.normalized().packed();
                     deposits.push(Deposit::ribbon([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], n0, n1, r_lane as f32, r_lane as f32, 0, v as f32, pig, dx).laid_by(Method::Roller));
                 }
             }

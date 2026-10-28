@@ -9,6 +9,8 @@ pub struct Pigment {
     pub name: String,
     pub reflectance: Vec<f32>,
     pub scatter: f32,
+    #[serde(default = "unit_tint")]
+    pub tint: f32,
     pub viscosity: f32,
     pub yield_stress: f32,
 }
@@ -16,6 +18,10 @@ pub struct Pigment {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PigmentSet {
     pub pigments: Vec<Pigment>,
+}
+
+fn unit_tint() -> f32 {
+    1.0
 }
 
 pub fn band_wavelengths() -> [f32; NBAND] {
@@ -111,6 +117,7 @@ pub fn default_pigments() -> PigmentSet {
         name: name.to_string(),
         reflectance: curve(pts),
         scatter: s,
+        tint: default_tint(name),
         viscosity: mu,
         yield_stress: ty,
     };
@@ -129,6 +136,15 @@ pub fn default_pigments() -> PigmentSet {
             mk("Viridian", 2.0e3, 30.0, 20.0, &[(400.0, 0.06), (460.0, 0.12), (500.0, 0.26), (530.0, 0.22), (580.0, 0.07), (700.0, 0.05)]),
             mk("Cadmium Orange", 2.0e4, 35.0, 35.0, &[(400.0, 0.05), (520.0, 0.06), (550.0, 0.15), (580.0, 0.50), (610.0, 0.80), (700.0, 0.85)]),
         ],
+    }
+}
+
+fn default_tint(name: &str) -> f32 {
+    match name {
+        "Phthalo Blue" | "Phthalo Green" => 25.0,
+        "Alizarin Crimson" => 4.0,
+        "Ultramarine Blue" | "Viridian" | "Ivory Black" => 1.5,
+        _ => 1.0,
     }
 }
 
@@ -161,6 +177,7 @@ pub fn pigment_table(set: &PigmentSet) -> Vec<f32> {
         }
         t[i * PIG_STRIDE + 32] = p.viscosity;
         t[i * PIG_STRIDE + 33] = p.yield_stress;
+        t[i * PIG_STRIDE + 34] = p.tint;
     }
     t
 }
@@ -205,8 +222,8 @@ fn mix_xyz(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> ([f32; 3], [f32; 3
             }
             let r = p.reflectance[b].clamp(0.01, 0.98);
             let ks = (1.0 - r) * (1.0 - r) / (2.0 * r);
-            k += c * ks * p.scatter;
-            sc += c * p.scatter;
+            k += c * p.tint * ks * p.scatter;
+            sc += c * p.tint * p.scatter;
         }
         let a = k / sc.max(1e-9);
         let r_inf = (1.0 + a - (a * a + 2.0 * a).sqrt()).clamp(0.0, 1.0);

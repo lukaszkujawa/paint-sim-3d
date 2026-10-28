@@ -246,11 +246,13 @@ pub struct KnifeParams {
     pub active: u32,
     pub pad0: u32,
     pub pad1: u32,
-    pub fill: f32,
+    pub bands: u32,
     pub pad2: u32,
     pub pad3: u32,
     pub pad4: u32,
-    pub pig: [u32; 8],
+    pub pig: [[u32; 8]; 8],
+    pub fill: [f32; 8],
+    pub smear: [f32; 8],
 }
 
 #[repr(C)]

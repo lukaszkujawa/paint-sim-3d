@@ -1,4 +1,4 @@
-use crate::{brush, color, pollock, session, App};
+use crate::{brush, color, evolve, pollock, session, App};
 use crate::tools::ToolKind;
 use egui::{Align, Color32, CornerRadius, FontId, Layout, RichText, Stroke, TextStyle, Vec2};
 use glam::Vec3;
@@ -326,6 +326,9 @@ impl App {
                     ui.label(RichText::new(format!("Painter: {}", p.status())).small().color(INFO));
                 }
             }
+            if let Some(ev) = self.evo.run.as_ref().filter(|_| self.evo.active) {
+                ui.label(RichText::new(format!("Evolving: {} strokes kept, {:.0}% closer", ev.kept, ev.progress() * 100.0)).small().color(INFO));
+            }
             if self.pen_seen {
                 let p = if self.pen_down { self.pen_raw.clamp(0.0, 1.0).powf(self.pen_curve) } else { 0.0 };
                 ui.label(RichText::new(format!("Pen {:.0} %", p * 100.0)).small().weak());
@@ -336,7 +339,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(small("Left: paint   Right: orbit   Middle: pan   Wheel: height   Ctrl+wheel: zoom".to_string()));
                 if !self.last_beauty.is_empty() {
-                    ui.label(RichText::new(format!("Saved {}", self.last_beauty)).small().color(OK));
+                    ui.label(RichText::new(self.last_beauty.clone()).small().color(OK));
                 }
             });
         });
@@ -348,6 +351,7 @@ impl App {
         self.tool_settings(ui);
         ui.separator();
         section(ui, "Paint", true, |ui| self.paint_settings(ui));
+        section(ui, "Paint from a photo", true, |ui| self.evolve_settings(ui));
         section(ui, "Pollock painter", true, |ui| self.painter_settings(ui));
         section(ui, "Canvas", false, |ui| {
             num(ui, "Tilt", &mut self.film.settings.tilt_deg, 0.0, 90.0, 1.0, "°", false);
@@ -634,6 +638,56 @@ impl App {
         });
     }
 
+    fn evolve_settings(&mut self, ui: &mut egui::Ui) {
+        let running = self.evolving();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!running, egui::Button::new("Load photo...")).on_hover_text("Choose a picture to paint. You can also drop an image file onto the window").clicked() {
+                self.pick_photo();
+            }
+            let name = self.evo.photo.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "No photo yet".to_string());
+            ui.add(egui::Label::new(RichText::new(name).small().weak()).truncate());
+        });
+        let ctx = ui.ctx().clone();
+        if let Some(photo) = self.evo.photo.as_mut() {
+            let tex = evolve::preview(photo, &ctx);
+            let w = ui.available_width() - 12.0;
+            let size = tex.size_vec2();
+            ui.add(egui::Image::new(&tex).fit_to_exact_size(Vec2::new(w, w * size.y / size.x.max(1.0))).corner_radius(4.0));
+        } else {
+            ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter places one stroke at a time with the selected tool and paint, trying many random colours and sizes and keeping only strokes that bring the canvas closer to the photo.").small().weak()).wrap());
+        }
+        ui.checkbox(&mut self.evo.dry_passes, "Let each pass dry before the next").on_hover_text("When strokes stop helping, the painter dries the canvas and moves to a smaller tool, like painting in layers");
+        prop(ui, "Tries per stroke", |ui| {
+            ui.add(egui::Slider::new(&mut self.evo.candidates, 4..=128).logarithmic(true).clamping(egui::SliderClamping::Edits));
+        });
+        num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
+        num(ui, "Longest stroke", &mut self.evo.longest, 0.01, 1.2, 100.0, " cm", true);
+        num(ui, "Speed", &mut self.painter_speed, 1.0, 8.0, 1.0, "×", false);
+        let has_photo = self.evo.photo.is_some();
+        let bw = ui.available_width();
+        if running {
+            if ui.add(egui::Button::new(RichText::new("Stop").strong()).min_size(Vec2::new(bw, 26.0))).on_hover_text("Esc").clicked() {
+                self.stop_evolve();
+            }
+        } else {
+            let paint = egui::Button::new(RichText::new("Paint").strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
+            if ui.add_enabled(has_photo && self.tool.kind != ToolKind::Knife, paint).on_hover_text("Paint the photo over whatever is on the canvas with the selected tool, paint and size until you stop it. Strokes vary in colour and between 40 and 100% of the tool size. Change the tool, size or paint and press Paint again to carry on; use File > New painting for a fresh canvas").clicked() {
+                self.start_evolve();
+            }
+        }
+        if let Some(ev) = &self.evo.run {
+            let mono = |s: String| RichText::new(s).small();
+            ui.add(egui::ProgressBar::new(ev.progress()).desired_height(14.0).text(RichText::new(format!("{:.0}% closer to the photo", ev.progress() * 100.0)).small()));
+            ui.label(mono(format!("{} kept of {} painted, {} tried", ev.kept, ev.painted, ev.tried)));
+            if running {
+                ui.label(mono(format!("Pass {}, tool size up to {:.1} mm", ev.passes + 1, ev.size_hi * 1e3)));
+            }
+            if !ev.status.is_empty() {
+                ui.add(egui::Label::new(RichText::new(ev.status.clone()).small().color(WARN)).wrap());
+            }
+        }
+    }
+
     fn painter_settings(&mut self, ui: &mut egui::Ui) {
         let running = self.painter.as_ref().map(|p| !p.done).unwrap_or(false);
         let (w, h) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
@@ -720,7 +774,7 @@ impl App {
         if let Some(p) = &self.painter {
             ui.add(egui::Label::new(RichText::new(p.status()).small()).wrap()).on_hover_text(format!("Seed {}", p.seed));
         }
-        num(ui, "Speed", &mut self.painter_speed, 1.0, 4.0, 1.0, "×", false);
+        num(ui, "Speed", &mut self.painter_speed, 1.0, 8.0, 1.0, "×", false);
     }
 
     pub(crate) fn sync_pal_picks(&mut self) {

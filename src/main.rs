@@ -1,5 +1,6 @@
 mod brush;
 mod color;
+mod evolve;
 mod pollock;
 mod film;
 mod gizmo;
@@ -37,6 +38,7 @@ const KNIFE_PENDING_DECAY: f64 = 0.5;
 const KNIFE_SMEAR: f64 = 0.35;
 const KNIFE_BAND_MIX_PER_M: f64 = 1.2;
 const PEN_STALE_S: f32 = 0.3;
+const MAX_STEP_SPEED: f32 = 2.0;
 const PEN_FLOW_MIN: f64 = 0.1;
 const PEN_FLOW_MAX: f64 = 1.5;
 const PEN_WIDTH_MIN: f32 = 0.35;
@@ -62,6 +64,7 @@ struct App {
     brush_released: f64,
     prev_kind: ToolKind,
     painter: Option<pollock::Painter>,
+    evo: evolve::EvolveState,
     beauty: Beauty,
     refine: Refine,
     last_beauty: String,
@@ -112,6 +115,7 @@ struct App {
     auto_quality: bool,
     frame_budget_ms: f32,
     brush_sink: f64,
+    brush_raise: f64,
     last_cpu_ms: f32,
     ctrl_down: bool,
     cam: Camera,
@@ -251,6 +255,7 @@ impl App {
             brush_released: 0.0,
             prev_kind: ToolKind::Stick,
             painter: None,
+            evo: evolve::EvolveState::new(),
             beauty,
             refine,
             last_beauty: String::new(),
@@ -298,6 +303,7 @@ impl App {
             auto_quality: true,
             frame_budget_ms: 14.0,
             brush_sink: 0.88,
+            brush_raise: 0.0,
             last_cpu_ms: 0.0,
             ctrl_down: false,
             cam,
@@ -318,6 +324,9 @@ impl App {
             stats: String::new(),
         };
         app.sync_pal_picks();
+        if let Some(path) = std::env::args().skip(1).filter(|_| app.auto.is_none()).find(|a| !a.starts_with("--") && std::path::Path::new(a).is_file() && ["jpg", "jpeg", "png", "webp", "bmp"].iter().any(|e| a.to_lowercase().ends_with(e))) {
+            app.load_photo(std::path::Path::new(&path));
+        }
         let snap = app.auto.as_ref().map(|a| a.snap_load.clone()).unwrap_or_default();
         if !snap.is_empty() {
             app.load_snapshot(&snap);
@@ -512,10 +521,61 @@ impl App {
     }
 
     fn scripted_tool(&mut self) -> bool {
+        if self.evolve_tick() {
+            return true;
+        }
         if self.apply_painter() {
             return true;
         }
         let Some(a) = &self.auto else { return false };
+        if a.script == "evolve" {
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).map(|p| p[1].clone());
+            if let Some(t) = arg("--tool") {
+                self.tool.kind = match t.as_str() {
+                    "stick" => ToolKind::Stick,
+                    "bottle" => ToolKind::Bottle,
+                    "bucket" => ToolKind::Bucket,
+                    "brush" => ToolKind::Brush,
+                    "roller" => ToolKind::Roller,
+                    "sponge" => ToolKind::Sponge,
+                    _ => ToolKind::Pour,
+                };
+            }
+            if self.tool.kind == ToolKind::Brush {
+                self.tool.height = self.brush.len * 0.75;
+                self.prev_kind = ToolKind::Brush;
+            }
+            if args.iter().any(|a| a == "--flat") {
+                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                self.rebuild_brush(brush::BrushShape::Flat, n, len, 0.03);
+            }
+            if let Some(mm) = arg("--size").and_then(|v| v.parse::<f64>().ok()) {
+                let kind = self.tool.kind;
+                self.set_tool_size(kind, mm * 1e-3);
+            }
+            if let Some(path) = arg("--target") {
+                self.load_photo(std::path::Path::new(&path));
+            }
+            if let Some(v) = arg("--longest").and_then(|v| v.parse::<f64>().ok()) {
+                self.evo.longest = v / 100.0;
+            }
+            if let Some(v) = arg("--speed").and_then(|v| v.parse().ok()) {
+                self.painter_speed = v;
+            }
+            if let Some(n) = arg("--candidates").and_then(|v| v.parse().ok()) {
+                self.evo.candidates = n;
+            }
+            self.paused = false;
+            self.start_evolve();
+            if let Some(ev) = self.evo.run.as_mut() {
+                log::warn!("evolving {}x{} eval grid from {}", ev.w, ev.h, self.evo.photo.as_ref().map(|p| p.name.clone()).unwrap_or_default());
+            }
+            if let Some(a) = self.auto.as_mut() {
+                a.script = "evolving".to_string();
+            }
+            return self.evolve_tick();
+        }
         if a.script == "groundbrush" || a.script == "groundbucket" {
             if self.painter.is_none() {
                 let (m, n) = if a.script == "groundbrush" { (pollock::GroundMethod::Brush, a.rounds.max(1) as usize) } else { (pollock::GroundMethod::Bucket, a.rounds.max(1) as usize) };
@@ -988,7 +1048,7 @@ impl App {
         let img = self.beauty.render(&self.gpu, &self.renderer, &self.cam, &self.film, ortho, w, h, 64, Some(&self.refine));
         let path = format!("beauty_{}_{}.png", if ortho { "top" } else { "view" }, self.frame_index);
         let _ = img.save(&path);
-        self.last_beauty = format!("{} ({}x{}, {:.1} s)", path, w, h, t0.elapsed().as_secs_f32());
+        self.last_beauty = format!("Saved {} ({}x{}, {:.1} s)", path, w, h, t0.elapsed().as_secs_f32());
         log::warn!("saved {}", self.last_beauty);
     }
 
@@ -1215,7 +1275,7 @@ impl App {
         );
         let _ = std::fs::write(format!("{}/canvas.json", dir), meta);
         let _ = std::fs::write(format!("{}/render.py", dir), include_str!("../blender/render.py"));
-        self.last_beauty = format!("exported {} ({}x{})", dir, w, h);
+        self.last_beauty = format!("Exported {} ({}x{})", dir, w, h);
         log::warn!("exported Blender set to {}", dir);
     }
 
@@ -1415,7 +1475,43 @@ impl App {
         [(self.cursor[0] - x) / w.max(1.0) * 2.0 - 1.0, 1.0 - (self.cursor[1] - y) / h.max(1.0) * 2.0]
     }
 
+    fn encode_sim(&mut self, enc: &mut wgpu::CommandEncoder, deposits: &[Deposit], knife: Option<KnifeParams>, frame_dt: f32) -> [Option<usize>; 3] {
+        let mut slots = [None; 3];
+        if self.paused {
+            return slots;
+        }
+        self.film.poll_stats(&self.gpu, &mut self.surface.data, &mut self.surface.sub);
+        self.film.upload_deposits(&self.gpu, deposits);
+        self.film.set_knife(&self.gpu, knife);
+        let substeps = self.film.choose_substeps(frame_dt);
+        self.film.update_params(&self.gpu, frame_dt, substeps);
+        self.film.flush_journal(&self.gpu);
+        self.film.encode_frame(enc, substeps);
+        slots[0] = self.film.request_stats(&self.gpu, enc);
+        slots[1] = self.film.request_scraps(enc);
+        if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) {
+            slots[2] = self.film.request_reservoir(enc);
+        }
+        self.sim_time += frame_dt;
+        slots
+    }
+
+    fn map_slots(&mut self, slots: [Option<usize>; 3]) {
+        if let Some(k) = slots[0] {
+            self.film.map_stats(k);
+        }
+        if let Some(k) = slots[1] {
+            self.film.map_scraps(k);
+        }
+        if let Some(k) = slots[2] {
+            self.film.map_reservoir(k);
+        }
+    }
+
     fn frame(&mut self) {
+        let driven = self.painter.as_ref().map(|p| !p.done).unwrap_or(false) || self.evolving();
+        let steps = if driven { (self.painter_speed / MAX_STEP_SPEED).ceil().max(1.0) as u32 } else { 1 };
+        let scale = if driven { self.painter_speed / steps as f32 } else { 1.0 };
         let size = self.window.inner_size();
         let surface_tex = match self.gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1424,7 +1520,16 @@ impl App {
                 return;
             }
         };
-        if self.auto.as_ref().map(|a| a.pace).unwrap_or(false) {
+        for _ in 1..steps {
+            self.step(scale, steps, None);
+        }
+        self.step(scale, steps, Some(surface_tex));
+    }
+
+    fn step(&mut self, scale: f32, steps: u32, surface_tex: Option<wgpu::SurfaceTexture>) {
+        let size = self.window.inner_size();
+        let present = surface_tex.is_some();
+        if present && self.auto.as_ref().map(|a| a.pace).unwrap_or(false) {
             let el = self.last.elapsed();
             if el < std::time::Duration::from_micros(16600) {
                 std::thread::sleep(std::time::Duration::from_micros(16600) - el);
@@ -1432,12 +1537,14 @@ impl App {
         }
         let now = Instant::now();
         let real_dt = (now - self.last).as_secs_f32().min(0.1);
-        self.last = now;
-        self.fps = 0.9 * self.fps + 0.1 / real_dt.max(1e-4);
-        let frame_dt = (1.0 / 60.0) * if self.painter.as_ref().map(|p| !p.done).unwrap_or(false) { self.painter_speed } else { 1.0 };
+        if present {
+            self.last = now;
+            self.fps = 0.9 * self.fps + 0.1 / real_dt.max(1e-4);
+        }
+        let frame_dt = (1.0 / 60.0) * scale;
         self.sim_dt = frame_dt as f64;
-        if self.auto_quality && !self.paused {
-            let ms = (real_dt * 1e3 - self.last_cpu_ms).max(0.0);
+        if present && self.auto_quality && !self.paused {
+            let ms = (real_dt * 1e3 / steps as f32 - self.last_cpu_ms).max(0.0);
             let s = &mut self.film.settings;
             if ms > self.frame_budget_ms * 1.15 {
                 s.max_substeps = (s.max_substeps as f32 * 0.85).floor().max(8.0) as u32;
@@ -1450,7 +1557,7 @@ impl App {
         if self.auto.as_ref().map(|a| a.script.is_empty()).unwrap_or(false) {
             self.scripted_deposits(&mut deposits);
         }
-        let want_pour = self.mouse_down[0] && !self.cursor_over_panel();
+        let want_pour = self.mouse_down[0] && !self.cursor_over_panel() && !self.evolving();
         if want_pour && !self.stroke_down {
             self.begin_stroke();
         }
@@ -1815,7 +1922,7 @@ impl App {
             self.film.poll_reservoir(&self.gpu, &mut res);
             self.brush_scraped += self.brush.absorb(&res);
             if !self.paused {
-                let lift = if self.tool.flowing { 0.0 } else { 0.04 };
+                let lift = if self.tool.flowing { self.brush_raise } else { 0.04 };
                 let h = match pen {
                     Some(p) => (self.brush.len * (1.0 - PEN_BRUSH_PRESS * p)).clamp(0.002, self.brush.len - 0.0005),
                     None => self.tool.height,
@@ -1904,8 +2011,8 @@ impl App {
             tv.extend(fv);
             ti.extend(fi.iter().map(|i| i + base));
         }
-        if self.auto.is_none() && (self.painter_active || !self.cursor_over_panel()) {
-            let ground = if self.painter_active { Some(DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0)) } else { self.cam.plane_hit(self.ndc(), 0.0).map(|g| DVec3::new(g.x as f64, g.y as f64, 0.0)) };
+        if self.auto.is_none() && (self.painter_active || self.evolving() || !self.cursor_over_panel()) {
+            let ground = if self.painter_active || self.evolving() { Some(DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0)) } else { self.cam.plane_hit(self.ndc(), 0.0).map(|g| DVec3::new(g.x as f64, g.y as f64, 0.0)) };
             let gx = gizmo::GizmoCtx {
                 ground,
                 knife_dir: glam::DVec2::new(self.knife_dir[0], self.knife_dir[1]),
@@ -1935,6 +2042,14 @@ impl App {
         let ms_mesh = t_mesh.elapsed().as_secs_f32() * 1e3;
         let nverts: usize = self.air.rods.iter().map(|r| r.n()).sum();
 
+        let Some(surface_tex) = surface_tex else {
+            let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("step") });
+            let slots = self.encode_sim(&mut enc, &deposits, knife, frame_dt);
+            self.gpu.queue.submit(std::iter::once(enc.finish()));
+            self.map_slots(slots);
+            self.frame_index += 1;
+            return;
+        };
         let raw = self.ui.state.take_egui_input(&self.window);
         self.ui.ctx.begin_pass(raw);
         if self.auto.is_none() {
@@ -1960,25 +2075,8 @@ impl App {
         let view = surface_tex.texture.create_view(&Default::default());
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
-        let mut stats_slot = None;
-        let mut scrap_slot = None;
-        let mut res_slot = None;
         let t_enc = Instant::now();
-        if !self.paused {
-            self.film.poll_stats(&self.gpu, &mut self.surface.data, &mut self.surface.sub);
-            self.film.upload_deposits(&self.gpu, &deposits);
-            self.film.set_knife(&self.gpu, knife);
-            let substeps = self.film.choose_substeps(frame_dt);
-            self.film.update_params(&self.gpu, frame_dt, substeps);
-            self.film.flush_journal(&self.gpu);
-            self.film.encode_frame(&mut enc, substeps);
-            stats_slot = self.film.request_stats(&self.gpu, &mut enc);
-            scrap_slot = self.film.request_scraps(&mut enc);
-            if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) {
-                res_slot = self.film.request_reservoir(&mut enc);
-            }
-            self.sim_time += frame_dt;
-        }
+        let slots = self.encode_sim(&mut enc, &deposits, knife, frame_dt);
         let ms_enc = t_enc.elapsed().as_secs_f32() * 1e3;
         self.prof = format!("air {:.1} ms {}  mesh {:.1} ms  encode {:.1} ms  frame {:.1} ms  rod verts {}  deposits {}", ms_air, air_detail, ms_mesh, ms_enc, real_dt * 1e3, nverts, deposits.len());
         self.last_cpu_ms = ms_air + ms_mesh + ms_enc;
@@ -2056,24 +2154,16 @@ impl App {
         }
         textures_delta.clear();
         self.gpu.queue.submit(cmds.into_iter().chain(std::iter::once(enc.finish())));
-        if let Some(k) = stats_slot {
-            self.film.map_stats(k);
-        }
-        if let Some(k) = scrap_slot {
-            self.film.map_scraps(k);
-        }
-        if let Some(k) = res_slot {
-            self.film.map_reservoir(k);
-        }
+        self.map_slots(slots);
         self.frame_index += 1;
         self.autosave_tick(false);
         let mut exit = false;
-        let export_dir = self.auto.as_ref().filter(|a| self.frame_index == a.frames).map(|a| a.export.clone()).unwrap_or_default();
+        let export_dir = self.auto.as_ref().filter(|a| self.frame_index >= a.frames).map(|a| a.export.clone()).unwrap_or_default();
         if !export_dir.is_empty() {
             self.export_blender(&export_dir);
         }
         if let Some(auto) = &self.auto {
-            if self.frame_index == auto.frames {
+            if self.frame_index >= auto.frames {
                 self.shot_request = Some(auto.shot.clone());
                 if !auto.snap_save.is_empty() {
                     let sp = auto.snap_save.clone();
@@ -2140,6 +2230,7 @@ impl ApplicationHandler for Pending {
                 app.autosave_tick(true);
                 event_loop.exit();
             }
+            WindowEvent::DroppedFile(path) => app.load_photo(&path),
             WindowEvent::Resized(s) => { app.gpu.resize(s.width, s.height); app.tubes.resize(&app.gpu); }
             WindowEvent::RedrawRequested => {
                 app.frame();
@@ -2240,6 +2331,7 @@ impl ApplicationHandler for Pending {
                 if event.state == ElementState::Pressed && !app.ui.ctx.egui_wants_keyboard_input() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Space) => app.paused = !app.paused,
+                        PhysicalKey::Code(KeyCode::Escape) => app.stop_evolve(),
                         PhysicalKey::Code(KeyCode::Tab) => app.show_inspector = !app.show_inspector,
                         PhysicalKey::Code(KeyCode::KeyT) => app.set_top_view(),
                         PhysicalKey::Code(KeyCode::KeyB) => app.beauty_render(true),

@@ -11,6 +11,8 @@ pub struct Bristle {
     pub load: f64,
     pub comp: [f32; 16],
     pub touch: Vec<bool>,
+    pub last: Vec<DVec3>,
+    pub was: Vec<bool>,
     pub thick: f64,
 }
 
@@ -67,7 +69,7 @@ impl Brush {
             let thick = 0.65 + 0.7 * hash01(k, 11);
             let clump = (hash01(k / 3, 23) - 0.5) * 0.22;
             let lean = DVec3::new(rest.x + clump * (hash01(k / 3, 29) - 0.5), rest.y + clump * (hash01(k / 3, 31) - 0.5), rest.z).normalize();
-            Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest: lean, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1], thick }
+            Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest: lean, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1], last: vec![DVec3::ZERO; segs + 1], was: vec![false; segs + 1], thick }
         };
         let (ferrule_r, width) = match shape {
             BrushShape::Round => {
@@ -237,6 +239,8 @@ impl Brush {
             }
             for i in 0..=segs {
                 let zs = floor(b.pts[i].x, b.pts[i].y) + radius;
+                b.last[i] = b.prev[i];
+                b.was[i] = b.touch[i];
                 b.touch[i] = i > 0 && b.pts[i].z <= zs + 0.5 * radius;
                 b.prev[i] = b.pts[i];
             }
@@ -264,7 +268,17 @@ impl Brush {
                 let zb = (b.pts[i].z.min(b.pts[i - 1].z) - radius) as f32;
                 contacts.push(Contact { p0, p1, r: rc, zb, bristle: bi as u32, pad: 0 });
                 if rel > 1e-15 {
-                    releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp });
+                    let tip = if b.pts[i].z <= b.pts[i - 1].z { i } else { i - 1 };
+                    let from = b.last[tip];
+                    let swept = (b.pts[tip] - from).truncate().length();
+                    if b.was[i] && swept > rc as f64 {
+                        let q0 = [from.x as f32, from.y as f32];
+                        let q1 = [b.pts[tip].x as f32, b.pts[tip].y as f32];
+                        releases.push(Release { p0, p1, r: rc, vol: 0.5 * rel, comp: b.comp });
+                        releases.push(Release { p0: q0, p1: q1, r: rc, vol: 0.5 * rel, comp: b.comp });
+                    } else {
+                        releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp });
+                    }
                 }
                 if over > 1e-15 {
                     let q0 = [(b.pts[i - 1].x + shift.x) as f32, (b.pts[i - 1].y + shift.y) as f32];

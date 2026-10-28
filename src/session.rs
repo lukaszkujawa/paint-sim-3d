@@ -143,7 +143,7 @@ impl App {
     }
 
     fn history_on(&self) -> bool {
-        self.auto.as_ref().map(|a| a.script.starts_with("undo")).unwrap_or(true)
+        self.auto.as_ref().map(|a| a.script.starts_with("undo") || a.script.starts_with("evolv")).unwrap_or(true)
     }
 
     pub(crate) fn begin_stroke(&mut self) {
@@ -171,33 +171,42 @@ impl App {
     }
 
     pub(crate) fn undo(&mut self) {
-        let Some(level) = self.history.levels.pop() else {
+        if self.history.levels.is_empty() {
             self.notice("Nothing to undo");
             return;
-        };
+        }
         if let Some(p) = self.painter.as_mut() {
             p.stop();
         }
+        self.stop_evolve();
+        match self.rollback() {
+            Ok(()) => self.notice("Undone"),
+            Err(msg) => self.notice(msg),
+        }
+    }
+
+    pub(crate) fn rollback(&mut self) -> Result<(), &'static str> {
+        let Some(level) = self.history.levels.pop() else {
+            return Err("Nothing to undo");
+        };
         match level.kind {
             LevelKind::Journal { start } => {
                 let head = self.film.journal.head(&self.gpu);
                 if head.wrapping_sub(start) > self.film.journal.cap {
                     self.history.levels.retain(|l| matches!(l.kind, LevelKind::Full(_)));
-                    self.notice("That stroke changed too much of the canvas to undo");
-                    return;
+                    return Err("That stroke changed too much of the canvas to undo");
                 }
                 self.film.restore_journal(&self.gpu, level.gen);
                 self.air = Airborne::new();
             }
             LevelKind::Full(blob) => {
                 if !self.apply(&blob) {
-                    self.notice("Undo failed");
-                    return;
+                    return Err("Undo failed");
                 }
             }
         }
         self.next_gen();
-        self.notice("Undone");
+        Ok(())
     }
 
     pub(crate) fn notice(&mut self, msg: &str) {

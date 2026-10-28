@@ -179,6 +179,7 @@ pub struct Tool {
     pub rho: f64,
     pub knife_width: f64,
     pub knife_height: f64,
+    pub flow_scale: f64,
 }
 
 impl Default for Tool {
@@ -203,6 +204,7 @@ impl Default for Tool {
             rho: 1000.0,
             knife_width: 0.04,
             knife_height: 0.0003,
+            flow_scale: 1.0,
         }
     }
 }
@@ -229,8 +231,8 @@ impl Tool {
         }
         let (flow, radius) = match self.kind {
             ToolKind::Stick => (self.stick_flow(), (self.stick_diameter * 0.15).max(5e-4)),
-            ToolKind::Bottle => (self.bottle_flow, self.bottle_radius),
-            ToolKind::Bucket => (self.bucket_flow, self.bucket_radius),
+            ToolKind::Bottle => (self.bottle_flow * self.flow_scale, self.bottle_radius),
+            ToolKind::Bucket => (self.bucket_flow * self.flow_scale, self.bucket_radius),
             ToolKind::Pour | ToolKind::Knife | ToolKind::Brush => return None,
         };
         if flow <= 0.0 {

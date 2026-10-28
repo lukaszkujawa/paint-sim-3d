@@ -267,6 +267,10 @@ impl App {
                     ui.label(RichText::new(format!("Painter: {}", p.status())).small().color(ACCENT));
                 }
             }
+            if self.pen_seen {
+                let p = if self.pen_down { self.pen_raw.clamp(0.0, 1.0).powf(self.pen_curve) } else { 0.0 };
+                ui.label(RichText::new(format!("Pen {:.0} %", p * 100.0)).small().weak());
+            }
             if self.tool.kind == ToolKind::Stick && self.tool.stick_load <= 1e-9 && !self.tool.infinite {
                 ui.label(RichText::new("Stick is empty, press R").small().color(Color32::from_rgb(235, 190, 70)));
             }
@@ -293,6 +297,15 @@ impl App {
             num(ui, "Wetting angle", &mut self.film.settings.contact_angle_deg, 0.0, 90.0, 1.0, "°", false);
             num(ui, "Hysteresis", &mut self.film.settings.hysteresis_deg, 0.0, 45.0, 1.0, "°", false);
             num(ui, "View light", &mut self.renderer.light_intensity, 0.0, 6.0, 1.0, "", false);
+        });
+        section(ui, "Pen tablet", false, |ui| {
+            ui.checkbox(&mut self.pen_pressure, "Pressure controls the tool");
+            num(ui, "Pressure curve", &mut self.pen_curve, 0.4, 2.5, 1.0, "", false);
+            prop(ui, "Pressure", |ui| {
+                let p = if self.pen_down { self.pen_raw.clamp(0.0, 1.0).powf(self.pen_curve) } else { 0.0 };
+                ui.add(egui::ProgressBar::new(p).desired_height(14.0).text(RichText::new(if self.pen_seen { format!("{:.0} %", p * 100.0) } else { "no pen seen yet".to_string() }).small()));
+            });
+            ui.add(egui::Label::new(RichText::new("Brush: press depth. Bottle and bucket: flow. Pour: amount and width. Knife: blade gap closes as you press. Stick: contact only. Needs Windows Ink enabled in the Wacom settings; with Windows Ink off the pen acts as a plain mouse.").small().weak()).wrap());
         });
         section(ui, "Simulation", false, |ui| {
             let s = &mut self.film.settings;

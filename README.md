@@ -45,6 +45,7 @@ The window is laid out like an editor: a menu bar (File, Canvas, View, Render, H
 | `--snap-save file` / `--snap-load file` | save the canvas at the end of a scripted run (relief, wet film, colour and detail textures) and load it into a paused session, so beauty renders can be repeated with other cameras or settings without simulating again |
 | dry canvas / D | cures every wet cell at once: yield stress and viscosity jump to their cured values and all strata are committed into the substrate relief and colour, so the next paint sits on dry paint instead of bleeding into it (the painter's drying pauses do the same more slowly); `--dry N` triggers it at frame N in a scripted run |
 | Left mouse | apply the tool (pour, squeeze, scrape) |
+| Pen tablet | with Windows Ink enabled (Wacom: Windows Ink on in the tablet properties) the pen paints like the left button and its pressure drives the tool: brush press depth (up to 40 % of the bristle length), bottle and bucket flow (0.1x to 1.5x), pour amount and width, knife blade gap (closes up to 90 %); the stick only uses contact. The Pen tablet section has an on/off switch, a pressure curve (exponent) and a live meter. With Windows Ink off the pen arrives as an ordinary mouse |
 | Mouse wheel | tool height above the canvas (right button held: zoom) |
 | + / - | zoom |
 | Right drag | orbit camera |

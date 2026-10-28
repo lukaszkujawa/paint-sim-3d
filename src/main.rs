@@ -16,10 +16,16 @@ use glam::DVec3;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+const PEN_FLOW_MIN: f64 = 0.1;
+const PEN_FLOW_MAX: f64 = 1.5;
+const PEN_WIDTH_MIN: f32 = 0.35;
+const PEN_KNIFE_CLOSE: f64 = 0.9;
+const PEN_BRUSH_PRESS: f64 = 0.4;
 
 struct Ui {
     ctx: egui::Context,
@@ -62,6 +68,11 @@ struct App {
     show_help: bool,
     view_fitted: bool,
     pollock_pal: pollock::Palette,
+    pen_down: bool,
+    pen_raw: f32,
+    pen_seen: bool,
+    pen_pressure: bool,
+    pen_curve: f32,
     pal_picks: [[f32; 3]; 6],
     prof: String,
     auto_quality: bool,
@@ -206,6 +217,11 @@ impl App {
             show_help: false,
             view_fitted: false,
             pollock_pal: pollock::Palette::random(rand::random::<u64>()),
+            pen_down: false,
+            pen_raw: 0.0,
+            pen_seen: false,
+            pen_pressure: true,
+            pen_curve: 1.0,
             pal_picks: [[0.5; 3]; 6],
             prof: String::new(),
             auto_quality: true,
@@ -1094,6 +1110,14 @@ impl App {
         self.block_rects.iter().any(|r| r.expand(4.0).contains(p))
     }
 
+    fn pen(&self) -> Option<f64> {
+        if self.pen_down && self.pen_pressure {
+            Some((self.pen_raw.clamp(0.0, 1.0) as f64).powf(self.pen_curve as f64))
+        } else {
+            None
+        }
+    }
+
     fn ndc(&self) -> [f32; 2] {
         let [x, y, w, h] = self.view_rect;
         [(self.cursor[0] - x) / w.max(1.0) * 2.0 - 1.0, 1.0 - (self.cursor[1] - y) / h.max(1.0) * 2.0]
@@ -1135,15 +1159,18 @@ impl App {
             self.scripted_deposits(&mut deposits);
         }
         let want_pour = self.mouse_down[0] && !self.cursor_over_panel();
+        let pen = self.pen();
+        self.tool.flow_scale = pen.map(|p| PEN_FLOW_MIN + (PEN_FLOW_MAX - PEN_FLOW_MIN) * p).unwrap_or(1.0);
         let mut scraps: Vec<Scrap> = Vec::new();
         self.film.poll_scraps(&self.gpu, &mut scraps);
         if self.tool.kind == ToolKind::Pour {
             if want_pour {
                 if let Some(p) = self.cam.plane_hit(self.ndc(), 0.0) {
                     let p0 = self.last_pour.unwrap_or(p);
-                    let vol = self.pour_rate * frame_dt;
+                    let vol = self.pour_rate * frame_dt * self.tool.flow_scale as f32;
+                    let radius = self.pour_radius * pen.map(|p| PEN_WIDTH_MIN + (1.0 - PEN_WIDTH_MIN) * p as f32).unwrap_or(1.0);
                     let pig = self.paint.normalized().packed();
-                    deposits.push(Deposit::stroke([p0.x, p0.y], [p.x, p.y], self.pour_radius, vol, pig, self.film.dx).laid_by(Method::Pour));
+                    deposits.push(Deposit::stroke([p0.x, p0.y], [p.x, p.y], radius, vol, pig, self.film.dx).laid_by(Method::Pour));
                     self.last_pour = Some(p);
                 }
             } else {
@@ -1291,7 +1318,7 @@ impl App {
                     b: [b.x as f32, b.y as f32],
                     dir: [d.x as f32, d.y as f32],
                     sweep: (speed * frame_dt as f64) as f32,
-                    height: self.tool.knife_height as f32,
+                    height: (self.tool.knife_height * pen.map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0)) as f32,
                     half_width: hw as f32,
                     active: 1,
                     pad0: 0,
@@ -1347,7 +1374,11 @@ impl App {
             self.brush_scraped += self.brush.absorb(&res);
             if !self.paused {
                 let lift = if self.tool.flowing { 0.0 } else { 0.04 };
-                let handle = DVec3::new(self.tool.pos.x, self.tool.pos.y, self.tool.height + lift);
+                let h = match pen {
+                    Some(p) => (self.brush.len * (1.0 - PEN_BRUSH_PRESS * p)).clamp(0.002, self.brush.len - 0.0005),
+                    None => self.tool.height,
+                };
+                let handle = DVec3::new(self.tool.pos.x, self.tool.pos.y, h + lift);
                 let surf = &self.surface;
                 let brush = &mut self.brush;
                 let sink = self.brush_sink;
@@ -1630,6 +1661,32 @@ impl ApplicationHandler for Pending {
                     let k = app.cam.dist * 0.0012;
                     app.cam.target -= right * dx * k;
                     app.cam.target += up * dy * k;
+                }
+            }
+            WindowEvent::Touch(t) => {
+                app.cursor = [t.location.x as f32, t.location.y as f32];
+                if let Some(f) = t.force {
+                    app.pen_raw = f.normalized() as f32;
+                    app.pen_seen = true;
+                }
+                match t.phase {
+                    TouchPhase::Started => {
+                        if t.force.is_none() {
+                            app.pen_raw = 1.0;
+                        }
+                        if !app.cursor_over_panel() {
+                            app.pen_down = true;
+                            app.mouse_down[0] = true;
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        if app.pen_down {
+                            app.mouse_down[0] = false;
+                        }
+                        app.pen_down = false;
+                        app.pen_raw = 0.0;
+                    }
+                    TouchPhase::Moved => {}
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {

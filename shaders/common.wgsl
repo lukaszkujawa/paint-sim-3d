@@ -41,6 +41,7 @@ const METHOD_DROP: u32 = 2u;
 const METHOD_POUR: u32 = 3u;
 const METHOD_BRUSH: u32 = 4u;
 const METHOD_KNIFE: u32 = 5u;
+const METHOD_ROLLER: u32 = 6u;
 
 const STRATA: u32 = 4u;
 const NPIG: u32 = 12u;

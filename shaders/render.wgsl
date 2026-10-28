@@ -26,6 +26,10 @@ const TAU: f32 = 6.2831853;
 const PI: f32 = 3.14159265;
 const METHOD_BRUSH: f32 = 4.0;
 const METHOD_KNIFE: f32 = 5.0;
+const METHOD_ROLLER: f32 = 6.0;
+const ROLLER_STIPPLE_DEPTH: f32 = 14e-6;
+const ROLLER_STIPPLE_SCALE: f32 = 0.7e-3;
+const ROLLER_STIPPLE_STRETCH: f32 = 1.6;
 const F0_PAINT: f32 = 0.04;
 const BRISTLE_SPACING: f32 = 0.35e-3;
 const BRISTLE_DEPTH: f32 = 25e-6;
@@ -404,6 +408,7 @@ struct Detail {
     dir: vec2<f32>,
     brush: f32,
     knife: f32,
+    roller: f32,
     cure: f32,
     yield_pa: f32,
     thickness: f32,
@@ -430,6 +435,7 @@ fn detail_params(p: vec2<f32>) -> Detail {
     var dir = vec2<f32>(0.0);
     d.brush = 0.0;
     d.knife = 0.0;
+    d.roller = 0.0;
     d.cure = 0.0;
     d.yield_pa = 0.0;
     d.thickness = 0.0;
@@ -441,6 +447,7 @@ fn detail_params(p: vec2<f32>) -> Detail {
         dir += wk * vec2<f32>(cos(ang), sin(ang));
         d.brush += wk * select(0.0, 1.0, abs(method - METHOD_BRUSH) < 0.5);
         d.knife += wk * select(0.0, 1.0, abs(method - METHOD_KNIFE) < 0.5);
+        d.roller += wk * select(0.0, 1.0, abs(method - METHOD_ROLLER) < 0.5);
         d.cure += wk * a.y;
         d.yield_pa += wk * a.z;
         d.thickness += wk * a.w;
@@ -493,6 +500,11 @@ fn micro(p: vec2<f32>, d: Detail) -> f32 {
     }
     if d.knife > 0.0 {
         z += d.knife * groove_depth(KNIFE_DEPTH, KNIFE_SPACING, d.yield_pa, footprint) * carry * groove_profile(across, along, KNIFE_SPACING);
+    }
+    if d.roller > 0.0 {
+        let resolved = 1.0 - smoothstep(0.2, 0.6, footprint / ROLLER_STIPPLE_SCALE);
+        let peel = fbm_filtered(vec2<f32>(across, along / ROLLER_STIPPLE_STRETCH), ROLLER_STIPPLE_SCALE, 3);
+        z += d.roller * ROLLER_STIPPLE_DEPTH * min(hp / 4e-5, 1.0) * resolved * peel;
     }
     let skin = d.cure * smoothstep(0.5e-3, 1.5e-3, hp) * (1.0 - smoothstep(0.2, 0.5, footprint / WRINKLE_WAVELENGTH));
     if skin > 0.0 {

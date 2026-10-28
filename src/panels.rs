@@ -8,13 +8,14 @@ const TOOLBAR_W: f32 = 74.0;
 const INSPECTOR_W: f32 = 320.0;
 const ACCENT: Color32 = Color32::from_rgb(222, 150, 72);
 
-const TOOLS: [(ToolKind, &str, &str, &str); 6] = [
+const TOOLS: [(ToolKind, &str, &str, &str); 7] = [
     (ToolKind::Stick, "Stick", "1", "Drip paint from a loaded stick"),
     (ToolKind::Bottle, "Bottle", "2", "Squeeze a thin steady thread"),
     (ToolKind::Bucket, "Bucket", "3", "Pour a heavy stream"),
     (ToolKind::Pour, "Pour", "4", "Lay paint straight onto the canvas"),
     (ToolKind::Knife, "Knife", "5", "Drag a palette knife through the paint"),
     (ToolKind::Brush, "Brush", "6", "Press a bristle brush onto the canvas"),
+    (ToolKind::Roller, "Roller", "7", "Roll an even coat; picks up wet paint as it goes"),
 ];
 
 pub fn apply_style(ctx: &egui::Context) {
@@ -122,10 +123,10 @@ impl App {
     }
 
     fn reload_tool(&mut self) {
-        if self.tool.kind == ToolKind::Brush {
-            self.brush.dip(&self.paint.frac);
-        } else {
-            self.tool.reload();
+        match self.tool.kind {
+            ToolKind::Brush => self.brush.dip(&self.paint.frac),
+            ToolKind::Roller => self.roller.dip(&self.paint.frac),
+            _ => self.tool.reload(),
         }
     }
 
@@ -337,6 +338,10 @@ impl App {
     }
 
     fn tool_settings(&mut self, ui: &mut egui::Ui) {
+        if self.tool.kind == ToolKind::Roller {
+            self.roller_settings(ui);
+            return;
+        }
         num(ui, "Height", &mut self.tool.height, 0.002, 1.0, 100.0, " cm", true);
         match self.tool.kind {
             ToolKind::Stick => {
@@ -371,7 +376,29 @@ impl App {
                 num(ui, "Blade gap", &mut self.tool.knife_height, 0.0, 0.003, 1e3, " mm", false);
             }
             ToolKind::Brush => self.brush_settings(ui),
+            ToolKind::Roller => {}
         }
+    }
+
+    fn roller_settings(&mut self, ui: &mut egui::Ui) {
+        let r = &mut self.roller;
+        num(ui, "Width", &mut r.width, 0.04, 0.25, 1e3, " mm", false);
+        num(ui, "Diameter", &mut r.radius, 0.01, 0.04, 2e3, " mm", false);
+        num(ui, "Pressure", &mut r.pressure, 0.0, 1.0, 100.0, " %", false);
+        num(ui, "Nap texture", &mut r.nap, 0.0, 1.0, 100.0, " %", false);
+        prop(ui, "Load", |ui| {
+            let frac = (r.load / r.capacity()).clamp(0.0, 1.0) as f32;
+            ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.1} mL  ·  film {:.0} µm", r.load * 1e6, r.film(r.pressure) * 1e6)).small()));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Load roller").on_hover_text("R").clicked() {
+                self.roller.dip(&self.paint.frac);
+            }
+            if ui.button("Clean roller").clicked() {
+                self.roller.clean();
+            }
+        });
+        ui.add(egui::Label::new(RichText::new("Hold the left button to roll. The frame swivels like a caster so the roller turns to face the way you move. It lays a film that thins as the nap empties, leaves ridges at its ends when full, and lifts wet paint thicker than its gap. The wheel sets the pressure.").small().weak()).wrap());
     }
 
     fn brush_settings(&mut self, ui: &mut egui::Ui) {
@@ -620,8 +647,8 @@ impl App {
                 ("Middle drag", "Pan"),
                 ("Wheel", "Tool height (brush: pressure)"),
                 ("Ctrl + wheel,  + / -", "Zoom"),
-                ("1 – 6", "Select tool"),
-                ("R", "Reload stick or dip brush"),
+                ("1 – 7", "Select tool"),
+                ("R", "Reload stick, dip brush or load roller"),
                 ("T", "Top view"),
                 ("B", "Beauty render, top"),
                 ("D", "Dry canvas"),

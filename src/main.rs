@@ -6,6 +6,7 @@ mod gpu;
 mod panels;
 mod render;
 mod rod;
+mod roller;
 mod tools;
 
 use film::{Deposit, Film, FilmSettings, KnifeParams, Method, Scrap};
@@ -40,6 +41,7 @@ struct App {
     renderer: Renderer,
     tubes: TubeRenderer,
     brush: brush::Brush,
+    roller: roller::Roller,
     brush_scraped: f64,
     brush_released: f64,
     prev_kind: ToolKind,
@@ -193,6 +195,7 @@ impl App {
             surface,
             brush: if std::env::var("PAINT_BRUSH_FLAT").is_ok() { brush::Brush::build(brush::BrushShape::Flat, 160, 0.035, 0.025, 0.00015) } else { brush::Brush::new(160, 0.035, 0.008, 0.00015) },
             brush_scraped: 0.0,
+            roller: roller::Roller::new(),
             brush_released: 0.0,
             prev_kind: ToolKind::Stick,
             painter: None,
@@ -1277,7 +1280,7 @@ impl App {
         }
         deposits.append(&mut self.pending_deposits);
         if !scripted {
-            let pick_z = if self.tool.kind == ToolKind::Brush { 0.0 } else { self.tool.height as f32 };
+            let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller) { 0.0 } else { self.tool.height as f32 };
             if let Some(p) = self.cam.plane_hit(self.ndc(), pick_z).or_else(|| self.cam.plane_hit(self.ndc(), 0.0)) {
                 let p = DVec3::new(p.x as f64, p.y as f64, self.tool.height);
                 let v = match self.prev_tool_pos {
@@ -1392,6 +1395,20 @@ impl App {
                 }
             }
         }
+        if self.tool.kind == ToolKind::Roller {
+            let mut res = Vec::new();
+            self.film.poll_reservoir(&self.gpu, &mut res);
+            self.roller.absorb(&res);
+            if !self.paused {
+                let pressure = pen.unwrap_or(self.roller.pressure);
+                let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);
+                let (c, d) = self.roller.update(at, self.tool.flowing, pressure, self.film.dx);
+                contacts = c;
+                deposits.extend(d);
+            }
+        } else {
+            self.roller.lift();
+        }
         self.film.upload_contacts(&self.gpu, &contacts);
         self.prev_kind = self.tool.kind;
         let t_air = Instant::now();
@@ -1425,7 +1442,7 @@ impl App {
             if w > 0.0 { [c[0] / w, c[1] / w, c[2] / w] } else { [0.5, 0.5, 0.5] }
         };
         let mut marker = self.air.drops.clone();
-        if self.tool.kind != ToolKind::Pour {
+        if !matches!(self.tool.kind, ToolKind::Pour | ToolKind::Roller) {
             let r = match self.tool.kind { ToolKind::Knife => 0.002, ToolKind::Brush => self.brush.ferrule_r, _ => 0.004 };
             let mpos = if self.tool.kind == ToolKind::Brush { self.brush.handle } else { self.tool.pos };
             marker.push(rod::Drop { x: mpos, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() });
@@ -1434,6 +1451,10 @@ impl App {
         if self.tool.kind == ToolKind::Brush {
             let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
             self.brush.mesh(&mut tv, &mut ti, &pc, (self.cam.dist as f64 * 0.0012).max(1.5e-4));
+        }
+        if self.tool.kind == ToolKind::Roller {
+            let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
+            self.roller.mesh(&mut tv, &mut ti, self.tool.pos, &pc);
         }
         self.tubes.upload(&self.gpu, &tv, &ti);
         let ms_mesh = t_mesh.elapsed().as_secs_f32() * 1e3;
@@ -1477,7 +1498,7 @@ impl App {
             self.film.encode_frame(&mut enc, substeps);
             stats_slot = self.film.request_stats(&self.gpu, &mut enc);
             scrap_slot = self.film.request_scraps(&mut enc);
-            if self.tool.kind == ToolKind::Brush {
+            if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller) {
                 res_slot = self.film.request_reservoir(&mut enc);
             }
             self.sim_time += frame_dt;
@@ -1645,6 +1666,9 @@ impl ApplicationHandler for Pending {
                 app.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if app.pen_down {
+                    return;
+                }
                 let prev = app.cursor;
                 app.cursor = [position.x as f32, position.y as f32];
                 let dx = app.cursor[0] - prev[0];
@@ -1715,6 +1739,8 @@ impl ApplicationHandler for Pending {
                 };
                 if app.mouse_down[1] || app.ctrl_down || app.tool.kind == ToolKind::Pour {
                     app.cam.dist = (app.cam.dist * (1.0 - d * 0.1)).clamp(0.05, 6.0);
+                } else if app.tool.kind == ToolKind::Roller {
+                    app.roller.pressure = (app.roller.pressure + d as f64 * 0.05).clamp(0.0, 1.0);
                 } else {
                     app.tool.height = (app.tool.height * (1.0 + d as f64 * 0.1)).clamp(0.002, 1.0);
                 }
@@ -1735,8 +1761,13 @@ impl ApplicationHandler for Pending {
                         PhysicalKey::Code(KeyCode::Digit4) => app.tool.kind = ToolKind::Pour,
                         PhysicalKey::Code(KeyCode::Digit5) => app.tool.kind = ToolKind::Knife,
                         PhysicalKey::Code(KeyCode::Digit6) => app.tool.kind = ToolKind::Brush,
+                        PhysicalKey::Code(KeyCode::Digit7) => app.tool.kind = ToolKind::Roller,
                         PhysicalKey::Code(KeyCode::KeyR) => {
-                            if app.tool.kind == ToolKind::Brush { app.brush.dip(&app.paint.frac); } else { app.tool.reload(); }
+                            match app.tool.kind {
+                                ToolKind::Brush => app.brush.dip(&app.paint.frac),
+                                ToolKind::Roller => app.roller.dip(&app.paint.frac),
+                                _ => app.tool.reload(),
+                            }
                         }
                         PhysicalKey::Code(KeyCode::KeyD) => app.film.dry_now(&app.gpu),
                         PhysicalKey::Code(KeyCode::Equal) => app.cam.dist = (app.cam.dist * 0.8).max(0.05),

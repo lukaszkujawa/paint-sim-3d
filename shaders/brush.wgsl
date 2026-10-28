@@ -14,6 +14,7 @@ struct Contact {
 
 const RES_UNIT: f32 = 1e15;
 const LEAVE_FILM: f32 = 8e-5;
+const CONTACT_ROLLER: u32 = 1u;
 
 fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let ab = b - a;
@@ -40,19 +41,29 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
     var cap = 1e9;
     var who = 0xffffffffu;
     var stroke = vec2<f32>(1.0, 0.0);
+    var method = METHOD_BRUSH;
     for (var q = 0u; q < n; q++) {
         let k = contacts[ctile_items[start + q]];
         if seg_dist(p, k.p0, k.p1) < k.r {
-            let cc = max(k.zb - m[c], LEAVE_FILM);
+            var cc = max(k.zb - m[c], LEAVE_FILM);
+            if k.pad == CONTACT_ROLLER {
+                cc = max(k.zb, LEAVE_FILM);
+            }
             if cc < cap {
                 cap = cc;
                 who = k.bristle;
-                stroke = k.p1 - k.p0;
+                if k.pad == CONTACT_ROLLER {
+                    method = METHOD_ROLLER;
+                    stroke = vec2<f32>(k.p1.y - k.p0.y, k.p0.x - k.p1.x);
+                } else {
+                    method = METHOD_BRUSH;
+                    stroke = k.p1 - k.p0;
+                }
             }
         }
     }
     if who == 0xffffffffu { return; }
-    lay[c] = lay_pack(METHOD_BRUSH, normalize(stroke + vec2<f32>(1e-9, 0.0)));
+    lay[c] = lay_pack(method, normalize(stroke + vec2<f32>(1e-9, 0.0)));
     if hv <= cap { return; }
     var s = stack_load(c);
     var excess = hv - cap;

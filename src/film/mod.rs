@@ -50,6 +50,7 @@ pub enum Method {
     Pour = 3,
     Brush = 4,
     Knife = 5,
+    Roller = 6,
 }
 
 fn segment_dir(p0: [f32; 2], p1: [f32; 2]) -> ([f32; 2], f32) {

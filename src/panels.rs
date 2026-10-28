@@ -513,7 +513,7 @@ impl App {
         let mut size = self.brush.size() * 1e3;
         let mut len = self.brush.len * 1e3;
         let mut n = self.brush.bristles.len();
-        let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 3.0, 150.0, 1.0, " mm", false);
+        let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 0.1, 150.0, 1.0, " mm", true);
         let c2 = num(ui, "Bristle length", &mut len, 10.0, 60.0, 1.0, " mm", false);
         let c3 = num(ui, "Bristles", &mut n, 16.0, 400.0, 1.0, "", false);
         if shape != self.brush.shape || c1 || c2 || c3 {
@@ -652,7 +652,42 @@ impl App {
             let tex = evolve::preview(photo, &ctx);
             let w = ui.available_width() - 12.0;
             let size = tex.size_vec2();
-            ui.add(egui::Image::new(&tex).fit_to_exact_size(Vec2::new(w, w * size.y / size.x.max(1.0))).corner_radius(4.0));
+            let focus = &mut self.evo.focus;
+            let sense = if focus.shape == evolve::FocusShape::Off { egui::Sense::hover() } else { egui::Sense::click_and_drag() };
+            let resp = ui.add(egui::Image::new(&tex).fit_to_exact_size(Vec2::new(w, w * size.y / size.x.max(1.0))).corner_radius(4.0).sense(sense));
+            let r = resp.rect;
+            let uv = |p: egui::Pos2| [((p.x - r.min.x) / r.width()).clamp(0.0, 1.0), ((p.y - r.min.y) / r.height()).clamp(0.0, 1.0)];
+            if let Some(p) = resp.interact_pointer_pos() {
+                if resp.drag_started() {
+                    focus.a = uv(p);
+                }
+                focus.b = uv(p);
+            }
+            let at = |q: [f32; 2]| egui::pos2(r.min.x + q[0] * r.width(), r.min.y + q[1] * r.height());
+            let painter = ui.painter_at(r);
+            let edge = Stroke::new(1.5, Color32::WHITE);
+            let ramp = Stroke::new(1.0, Color32::from_white_alpha(110));
+            match focus.shape {
+                evolve::FocusShape::Off => {}
+                evolve::FocusShape::Circle => {
+                    let c = at(focus.a);
+                    let rad = at(focus.b).distance(c);
+                    let f = 0.5 * focus.soft * rad;
+                    painter.circle_stroke(c, rad + f, ramp);
+                    painter.circle_stroke(c, (rad - f).max(0.0), ramp);
+                    painter.circle_stroke(c, rad, edge);
+                }
+                evolve::FocusShape::Rect => {
+                    let q = focus.rect();
+                    let rr = egui::Rect::from_min_max(at([q[0], q[1]]), at([q[2], q[3]]));
+                    let f = 0.25 * focus.soft * rr.width().min(rr.height());
+                    painter.rect_stroke(rr.expand(f), f, ramp, egui::StrokeKind::Middle);
+                    if rr.width() > 2.0 * f && rr.height() > 2.0 * f {
+                        painter.rect_stroke(rr.shrink(f), 0.0, ramp, egui::StrokeKind::Middle);
+                    }
+                    painter.rect_stroke(rr, 0.0, edge, egui::StrokeKind::Middle);
+                }
+            }
         } else {
             ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter places one stroke at a time with the selected tool and paint, trying many random colours and sizes and keeping only strokes that bring the canvas closer to the photo.").small().weak()).wrap());
         }
@@ -660,6 +695,34 @@ impl App {
         prop(ui, "Tries per stroke", |ui| {
             ui.add(egui::Slider::new(&mut self.evo.candidates, 4..=128).logarithmic(true).clamping(egui::SliderClamping::Edits));
         });
+        let mut shape = self.evo.focus.shape;
+        prop(ui, "Focus on", |ui| {
+            ui.selectable_value(&mut shape, evolve::FocusShape::Off, "Everything").on_hover_text("Paint the whole canvas");
+            ui.selectable_value(&mut shape, evolve::FocusShape::Circle, "Circle").on_hover_text("Drag on the photo from the centre outwards");
+            ui.selectable_value(&mut shape, evolve::FocusShape::Rect, "Rectangle").on_hover_text("Drag on the photo from one corner to the other");
+        });
+        if shape != self.evo.focus.shape {
+            let f = &mut self.evo.focus;
+            let q = f.rect();
+            if q[2] - q[0] < 0.02 && q[3] - q[1] < 0.02 {
+                (f.a, f.b) = match shape {
+                    evolve::FocusShape::Rect => ([0.3, 0.3], [0.7, 0.7]),
+                    _ => ([0.5, 0.5], [0.75, 0.5]),
+                };
+            } else if shape == evolve::FocusShape::Circle && f.shape == evolve::FocusShape::Rect {
+                (f.a, f.b) = ([0.5 * (q[0] + q[2]), 0.5 * (q[1] + q[3])], [q[2], 0.5 * (q[1] + q[3])]);
+            } else if shape == evolve::FocusShape::Rect && f.shape == evolve::FocusShape::Circle {
+                let aspect = self.film.settings.width_m / self.film.settings.height_m;
+                let rad = ((f.b[0] - f.a[0]).powi(2) + ((f.b[1] - f.a[1]) / aspect).powi(2)).sqrt();
+                (f.a, f.b) = ([f.a[0] - rad, f.a[1] - rad * aspect], [f.a[0] + rad, f.a[1] + rad * aspect]);
+            }
+            f.shape = shape;
+        }
+        if shape != evolve::FocusShape::Off {
+            num(ui, "Soft edge", &mut self.evo.focus.soft, 0.0, 2.0, 100.0, " %", false);
+            num(ui, "Outside", &mut self.evo.focus.outside, 0.0, 1.0, 100.0, " %", false);
+            ui.add(egui::Label::new(RichText::new("Drag on the photo to place the region. Strokes start inside it and are only credited for what they improve there, fading across the soft edge to the outside strength; damage anywhere still counts against them.").small().weak()).wrap());
+        }
         num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Longest stroke", &mut self.evo.longest, 0.01, 1.2, 100.0, " cm", true);
         num(ui, "Speed", &mut self.painter_speed, 1.0, 8.0, 1.0, "×", false);

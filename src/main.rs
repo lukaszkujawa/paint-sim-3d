@@ -557,6 +557,17 @@ impl App {
             if let Some(path) = arg("--target") {
                 self.load_photo(std::path::Path::new(&path));
             }
+            if let Some(spec) = arg("--focus") {
+                let (kind, nums) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
+                let v: Vec<f32> = nums.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() >= 4 {
+                    let f = &mut self.evo.focus;
+                    f.shape = if kind == "circle" { evolve::FocusShape::Circle } else { evolve::FocusShape::Rect };
+                    (f.a, f.b) = ([v[0], v[1]], [v[2], v[3]]);
+                    f.soft = v.get(4).copied().unwrap_or(f.soft);
+                    f.outside = v.get(5).copied().unwrap_or(f.outside);
+                }
+            }
             if let Some(v) = arg("--longest").and_then(|v| v.parse::<f64>().ok()) {
                 self.evo.longest = v / 100.0;
             }

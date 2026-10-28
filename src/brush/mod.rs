@@ -87,7 +87,7 @@ impl Brush {
             }
             BrushShape::Flat => {
                 let width = size;
-                let thick = (0.18 * width).clamp(1.5e-3, 6.0e-3);
+                let thick = (0.18 * width).clamp(1.5e-3, 6.0e-3).min(width);
                 let cols = ((n as f64 * width / thick).sqrt().ceil() as usize).max(2);
                 let rows = n.div_ceil(cols).max(1);
                 for k in 0..n {

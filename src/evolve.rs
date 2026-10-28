@@ -53,8 +53,52 @@ pub struct Photo {
     pub texture: Option<egui::TextureHandle>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FocusShape {
+    Off,
+    Circle,
+    Rect,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Focus {
+    pub shape: FocusShape,
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub soft: f32,
+    pub outside: f32,
+}
+
+impl Focus {
+    pub fn rect(&self) -> [f32; 4] {
+        [self.a[0].min(self.b[0]), self.a[1].min(self.b[1]), self.a[0].max(self.b[0]), self.a[1].max(self.b[1])]
+    }
+
+    fn weight(&self, x: f32, y: f32, aspect: f32) -> f32 {
+        let (sd, scale) = match self.shape {
+            FocusShape::Off => return 1.0,
+            FocusShape::Circle => {
+                let r = ((self.b[0] - self.a[0]).powi(2) + ((self.b[1] - self.a[1]) / aspect).powi(2)).sqrt().max(1e-4);
+                ((((x - self.a[0]).powi(2) + ((y - self.a[1]) / aspect).powi(2)).sqrt() - r), r)
+            }
+            FocusShape::Rect => {
+                let r = self.rect();
+                let (hx, hy) = (0.5 * (r[2] - r[0]), 0.5 * (r[3] - r[1]) / aspect);
+                let (dx, dy) = ((x - 0.5 * (r[0] + r[2])).abs() - hx, ((y - 0.5 * (r[1] + r[3])) / aspect).abs() - hy);
+                let out = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+                (out + dx.max(dy).min(0.0), hx.min(hy).max(1e-4))
+            }
+        };
+        let f = (self.soft * scale).max(1e-4);
+        let t = ((sd + 0.5 * f) / f).clamp(0.0, 1.0);
+        let s = t * t * (3.0 - 2.0 * t);
+        1.0 - s * (1.0 - self.outside)
+    }
+}
+
 pub struct EvolveState {
     pub photo: Option<Photo>,
+    pub focus: Focus,
     pub run: Option<Evolver>,
     pub candidates: usize,
     pub follow: f64,
@@ -69,7 +113,7 @@ pub struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, run: None, candidates: 32, follow: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, user_sizes: Vec::new() }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, user_sizes: Vec::new() }
     }
 }
 
@@ -87,8 +131,8 @@ fn tool_range(kind: ToolKind, shape: BrushShape) -> Option<ToolRange> {
     let r = |lo, hi, half_width, len, speed| Some(ToolRange { lo, hi, half_width, len, speed, long: kind != ToolKind::Sponge });
     match kind {
         ToolKind::Pour => r(0.0008, 0.02, 1.15, (2.0, 10.0), 0.5),
-        ToolKind::Brush if shape == BrushShape::Flat => r(0.004, 0.1, 0.5, (2.0, 8.0), 0.3),
-        ToolKind::Brush => r(0.002, 0.03, 0.55, (2.0, 8.0), 0.3),
+        ToolKind::Brush if shape == BrushShape::Flat => r(0.0001, 0.1, 0.5, (2.0, 8.0), 0.3),
+        ToolKind::Brush => r(0.0001, 0.03, 0.55, (2.0, 8.0), 0.3),
         ToolKind::Roller => r(0.04, 0.25, 0.5, (1.0, 4.0), 0.35),
         ToolKind::Sponge => r(0.02, 0.15, 0.4, (0.0, 1.2), 0.12),
         ToolKind::Stick => r(0.003, 0.03, 0.2, (6.0, 30.0), 0.4),
@@ -305,6 +349,8 @@ pub struct Evolver {
     target: Vec<[f32; 3]>,
     tangent: Vec<[f32; 3]>,
     weight: Vec<f32>,
+    mask: Vec<f32>,
+    focus: Option<Focus>,
     cdf: Vec<f64>,
     current: Vec<[f32; 3]>,
     err: Vec<f32>,
@@ -358,6 +404,8 @@ impl Evolver {
             target: vec![[0.0; 3]; w * h],
             tangent: vec![[0.0; 3]; w * h],
             weight: vec![1.0; w * h],
+            mask: vec![1.0; w * h],
+            focus: None,
             cdf: Vec::new(),
             current: vec![[0.0; 3]; w * h],
             err: vec![0.0; w * h],
@@ -469,14 +517,33 @@ impl Evolver {
         (1.0 - self.mean_err / self.start_err).clamp(0.0, 1.0)
     }
 
+    fn set_focus(&mut self, focus: Focus) {
+        if self.focus == Some(focus) {
+            return;
+        }
+        self.focus = Some(focus);
+        let (w, h) = (self.w, self.h);
+        let aspect = w as f32 / h as f32;
+        self.mask = (0..w * h).into_par_iter().map(|k| focus.weight(((k % w) as f32 + 0.5) / w as f32, 1.0 - ((k / w) as f32 + 0.5) / h as f32, aspect)).collect();
+    }
+
+    fn gain(&self, k: usize, delta: f32) -> f32 {
+        if delta < 0.0 {
+            delta * self.mask[k]
+        } else {
+            delta
+        }
+    }
+
     fn build_cdf(&mut self) {
         let mut acc = 0.0f64;
         self.cdf = self
             .err
             .iter()
             .zip(&self.weight)
-            .map(|(e, w)| {
-                acc += (*e as f64) * (*e as f64) * *w as f64;
+            .zip(&self.mask)
+            .map(|((e, w), m)| {
+                acc += (*e as f64) * (*e as f64) * *w as f64 * *m as f64;
                 acc
             })
             .collect();
@@ -484,6 +551,9 @@ impl Evolver {
 
     fn sample_point(&mut self) -> [f32; 2] {
         let total = self.cdf.last().copied().unwrap_or(0.0);
+        if total <= 0.0 {
+            return [self.rng.random::<f32>() * self.w as f32, self.rng.random::<f32>() * self.h as f32];
+        }
         let pick = self.rng.random::<f64>() * total;
         let k = self.cdf.partition_point(|c| *c < pick).min(self.err.len() - 1);
         [(k % self.w) as f32 + self.rng.random::<f32>(), (k / self.w) as f32 + self.rng.random::<f32>()]
@@ -561,7 +631,7 @@ impl Evolver {
             let a = a * o;
             let cur = self.current[k];
             let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
-            delta += self.weight[k] * (de(new, self.target[k]) - self.err[k]);
+            delta += self.gain(k, self.weight[k] * (de(new, self.target[k]) - self.err[k]));
         }
         delta
     }
@@ -715,8 +785,9 @@ impl Evolver {
         }
     }
 
-    pub fn plan(&mut self, candidates: usize, follow: f64, longest: f64, paint: &[f32; 16]) -> Option<Plan> {
+    pub fn plan(&mut self, candidates: usize, follow: f64, longest: f64, focus: Focus, paint: &[f32; 16]) -> Option<Plan> {
         let r = self.range?;
+        self.set_focus(focus);
         self.longest = (longest / self.cell) as f32;
         self.build_cdf();
         self.tried += 1;
@@ -762,7 +833,7 @@ impl Evolver {
                 covs[(j - region[1]) * rw + (i - region[0])] = c;
             }
         }
-        let (mut before_err, mut after_err) = (0.0f64, 0.0f64);
+        let mut delta = 0.0f64;
         let (mut pred, mut changed) = (0u32, 0u32);
         let (mut num, mut den) = (0.0f32, 0.0f32);
         for j in region[1]..region[3] {
@@ -770,9 +841,8 @@ impl Evolver {
                 let k = j * self.w + i;
                 let a = after[(j - region[1]) * rw + (i - region[0])];
                 let b = self.current[k];
-                let w = self.weight[k] as f64;
-                before_err += w * self.err[k] as f64;
-                after_err += w * de(a, self.target[k]) as f64;
+                let w = self.weight[k];
+                delta += self.gain(k, w * (de(a, self.target[k]) - self.err[k])) as f64;
                 let cov = covs[(j - region[1]) * rw + (i - region[0])];
                 let reach = de(plan.lab, b);
                 if reach > 2.0 * CHANGED_DE {
@@ -798,12 +868,12 @@ impl Evolver {
             let o = (num / den).clamp(0.15, 1.0);
             self.opacity = 0.85 * self.opacity + 0.15 * o;
         }
-        let ok = after_err < before_err;
+        let ok = delta < 0.0;
         if ok {
             self.store(region, after);
             self.kept += 1;
         }
-        log::debug!("stroke {} predicted {:.0} real {:.0} kept {} gain {:.2} opacity {:.2}", self.painted, plan.predicted, after_err - before_err, ok, self.width_gain, self.opacity);
+        log::debug!("stroke {} predicted {:.0} real {:.0} kept {} gain {:.2} opacity {:.2}", self.painted, plan.predicted, delta, ok, self.width_gain, self.opacity);
         self.record(ok);
         if self.painted % 50 == 0 {
             log::info!("painted {} kept {} tried {} pass {} size {:.1} mm closer {:.0}% gain {:.2} opacity {:.2}", self.painted, self.kept, self.tried, self.passes, self.size_hi * 1e3, self.progress() * 100.0, self.width_gain, self.opacity);
@@ -1052,7 +1122,7 @@ impl App {
                     return Phase::Observe;
                 }
                 let t0 = std::time::Instant::now();
-                let planned = ev.plan(self.evo.candidates, self.evo.follow, self.evo.longest, &self.paint.frac);
+                let planned = ev.plan(self.evo.candidates, self.evo.follow, self.evo.longest, self.evo.focus, &self.paint.frac);
                 log::debug!("plan {:.1} ms", t0.elapsed().as_secs_f32() * 1e3);
                 match planned {
                     None => Phase::Plan,

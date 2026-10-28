@@ -1,4 +1,7 @@
 const KNIFE_BANDS: u32 = 8u;
+const KNIFE_BLADE_LEN: f32 = 0.07;
+const KNIFE_SLOPE: f32 = 0.25;
+const KNIFE_FLAT: f32 = 0.01;
 
 struct KnifeParams {
     a: vec2<f32>,
@@ -68,16 +71,18 @@ fn knife(@builtin(global_invocation_id) id: vec3<u32>) {
     let t = (q.x * mv.y - q.y * mv.x) / det;
     let u = -(ab.x * q.y - ab.y * q.x) / det;
     if t < 0.0 || t > 1.0 { return; }
-    if u < -P.dx / max(K.sweep, 1e-9) || u > 1.0 { return; }
+    let behind = u * K.sweep;
+    if behind < -P.dx || behind > KNIFE_BLADE_LEN { return; }
+    let at_edge = u <= 1.0;
     let nb = max(min(K.bands, KNIFE_BANDS), 1u);
     let bi = min(u32(t * f32(nb)), nb - 1u);
-    let ratio = K.fill[bi / 4u][bi % 4u];
+    let ratio = select(0.0, K.fill[bi / 4u][bi % 4u], at_edge);
     let covered = cell_hash(id.x / 2u, id.y / 2u) < pow(ratio, 0.6);
     let level_b = select(0.0, K.height * min(1.0, 1.5 * ratio), covered);
-    let smear_b = K.smear[bi / 4u][bi % 4u];
+    let smear_b = select(0.0, K.smear[bi / 4u][bi % 4u], at_edge);
     let band_pig = unpack_pig(K.pig[2u * bi], K.pig[2u * bi + 1u]);
     let hv = h[c];
-    let cap = max(K.height - m[c], 0.0);
+    let cap = max(K.height + max(behind - KNIFE_FLAT, 0.0) * KNIFE_SLOPE - m[c], 0.0);
     let level = min(level_b, cap);
     let keep = min(hv, cap);
     let swap = keep * smear_b;

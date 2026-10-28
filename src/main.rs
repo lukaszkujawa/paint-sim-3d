@@ -769,6 +769,10 @@ impl App {
                 let t0 = f as f64 / 90.0;
                 let mut paint = color::PaintMix::pure(3);
                 paint.frac[12] = 0.2;
+                if a.yield_pa >= 0.0 {
+                    paint.frac[13] = a.yield_pa;
+                    paint.frac[12] = 0.0;
+                }
                 self.knife_test_deposit(t0, w, hgt, dt, paint);
                 self.tool.flowing = false;
                 return true;
@@ -1557,6 +1561,20 @@ impl App {
                         fill,
                         smear,
                     });
+                    let keep = hold / KNIFE_BANDS as f64;
+                    for i in 0..KNIFE_BANDS {
+                        let bow = (self.knife_bands[i].vol - self.knife_pending[i] - keep).max(0.0);
+                        if bow <= 0.0 {
+                            continue;
+                        }
+                        self.knife_bands[i].vol -= bow;
+                        let r = (0.75 * bow / band_w).sqrt().max(self.film.dx as f64);
+                        let q = p + mdir * (r + self.film.dx as f64);
+                        let a = q + blade_dir * (-hw + (i as f64 + 0.15) * band_w);
+                        let b = q + blade_dir * (-hw + (i as f64 + 0.85) * band_w);
+                        let pig = color::PaintMix { frac: self.knife_bands[i].comp }.normalized().packed();
+                        deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, bow as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                    }
                 }
                 if let Some(q) = self.knife_prev {
                     let dist = (p - q).length();

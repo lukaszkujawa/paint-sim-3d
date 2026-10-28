@@ -56,8 +56,9 @@ struct Paint {
 }
 
 #[derive(Clone)]
-struct Palette {
+pub struct Palette {
     name: String,
+    scheme: String,
     ground: Vec<Paint>,
     ground_dark: Option<Paint>,
     main: Paint,
@@ -130,17 +131,17 @@ pub struct Painter {
     pub ground: String,
     pub seed: u64,
     pub done: bool,
+    figured: bool,
 }
 
 const RHO: f64 = 1000.0;
 const G: f64 = 9.81;
 const COVER_W: usize = 16;
 const COVER_H: usize = 11;
-const CLASSIC_SHARE: f64 = 0.3;
-const LINE_CANDIDATES: usize = 60;
+const CLASSIC_SHARE: f64 = 0.2;
 const MIN_GROUND_CONTRAST: f64 = 45.0;
 const MIN_LINE_SPREAD: f64 = 26.0;
-const MAIN_PICK_JITTER: f64 = 60.0;
+const MIN_HUE_GAP: f64 = 28.0;
 const GROUND_MARGIN_BLEED: f64 = -0.03;
 const GROUND_MARGIN_BORDER: f64 = 0.05;
 const GROUND_MARGIN_FLOATING: f64 = 0.04;
@@ -315,11 +316,135 @@ fn named_paint(cm: &ColourModel, rng: &mut StdRng, m: [f32; 16], thinner: f32, y
     Paint { name: colour_name(cm.lab(&m)), mix: m, mu: lognormal(rng, mu, 0.2) }
 }
 
-fn generated_palette(rng: &mut StdRng, cm: &ColourModel) -> Palette {
+fn cm() -> &'static ColourModel {
+    static CM: std::sync::OnceLock<ColourModel> = std::sync::OnceLock::new();
+    CM.get_or_init(ColourModel::load)
+}
+
+fn lch(l: f64, c: f64, h_deg: f64) -> [f64; 3] {
+    let h = h_deg.to_radians();
+    [l, c * h.cos(), c * h.sin()]
+}
+
+fn hue_chroma(lab: [f64; 3]) -> (f64, f64) {
+    (lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0), (lab[1] * lab[1] + lab[2] * lab[2]).sqrt())
+}
+
+fn srgb_to_lab(rgb: [f32; 3]) -> [f64; 3] {
+    let lin = |c: f32| {
+        let c = c as f64;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let (r, g, b) = (lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
+    let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.9505;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.089;
+    let f = |t: f64| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn build_mix(i: usize, j: usize, r: f64, white: f64, black: f64) -> [f32; 16] {
+    let mut m = [0.0f32; 16];
+    m[i] += (1.0 - r) as f32;
+    m[j] += r as f32;
+    m[0] += white as f32;
+    m[1] += black as f32;
+    let s: f32 = m[..12].iter().sum::<f32>().max(1e-6);
+    for v in m[..12].iter_mut() {
+        *v /= s;
+    }
+    m
+}
+
+fn best_mix(target: [f64; 3], lab_of: &dyn Fn(&[f32; 16]) -> [f64; 3]) -> [f32; 16] {
+    let n = color::NPIG;
+    let mut best = (f64::MAX, 0usize, 0usize, 0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        for j in i..n {
+            let ratios: &[f64] = if i == j { &[0.0] } else { &[0.2, 0.4, 0.6, 0.8] };
+            for &r in ratios {
+                for &w in &[0.0, 0.15, 0.4, 1.0, 2.5] {
+                    for &b in &[0.0, 0.05, 0.15, 0.4] {
+                        let e = delta_e(lab_of(&build_mix(i, j, r, w, b)), target);
+                        if e < best.0 {
+                            best = (e, i, j, r, w, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (mut e, i, j, mut r, mut w, mut b) = best;
+    let mut step = 1.0;
+    for _ in 0..5 {
+        let mut improved = true;
+        while improved {
+            improved = false;
+            let tries = [
+                ((r + 0.1 * step).min(1.0), w, b),
+                ((r - 0.1 * step).max(0.0), w, b),
+                (r, w * (1.0 + 0.4 * step) + 0.05 * step, b),
+                (r, (w * (1.0 - 0.3 * step) - 0.03 * step).max(0.0), b),
+                (r, w, b * (1.0 + 0.4 * step) + 0.02 * step),
+                (r, w, (b * (1.0 - 0.3 * step) - 0.01 * step).max(0.0)),
+            ];
+            for (r2, w2, b2) in tries {
+                let e2 = delta_e(lab_of(&build_mix(i, j, r2, w2, b2)), target);
+                if e2 < e - 1e-3 {
+                    e = e2;
+                    r = r2;
+                    w = w2;
+                    b = b2;
+                    improved = true;
+                }
+            }
+        }
+        step *= 0.5;
+    }
+    build_mix(i, j, r, w, b)
+}
+
+pub fn match_rgb(rgb: [f32; 3]) -> [f32; 16] {
+    let c = cm();
+    best_mix(srgb_to_lab(rgb), &|m| srgb_to_lab(color::mix_rgb(&c.set, &c.cmf, m)))
+}
+
+fn tone_mix(cm: &ColourModel, base: &[f32; 16], target_l: f64) -> [f32; 16] {
+    let l0 = cm.lab(base)[0];
+    let toward = if target_l > l0 { 0 } else if target_l < 40.0 { 1 } else { 9 };
+    let total: f32 = base[..12].iter().sum::<f32>().max(1e-6);
+    let blend_at = |t: f32| {
+        let mut m = *base;
+        for i in 0..12 {
+            m[i] = base[i] / total * (1.0 - t);
+        }
+        m[toward] += t;
+        m
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..22 {
+        let mid = 0.5 * (lo + hi);
+        let l = cm.lab(&blend_at(mid))[0];
+        let reached = if toward == 0 { l >= target_l } else { l <= target_l };
+        if reached { hi = mid; } else { lo = mid; }
+    }
+    blend_at(hi)
+}
+
+const SCHEMES: [(&str, &[f64], f64); 5] = [
+    ("complementary", &[180.0, 0.0, 210.0, 150.0], 1.0),
+    ("split complementary", &[150.0, 210.0, 0.0, 180.0], 1.2),
+    ("triadic", &[120.0, 240.0, 0.0, 180.0], 1.0),
+    ("analogous", &[40.0, -40.0, 180.0, 75.0], 0.6),
+    ("tetradic", &[90.0, 180.0, 270.0, 0.0], 0.6),
+];
+
+fn harmonic_palette(rng: &mut StdRng, cm: &ColourModel) -> Palette {
     let key = *weighted(rng, &[("dark", 1.2), ("mid", 1.3), ("light", 0.6)]);
     let target_l = match key {
         "dark" => rng.random_range(28.0..38.0),
-        "mid" => rng.random_range(36.0..56.0),
+        "mid" => rng.random_range(38.0..56.0),
         _ => rng.random_range(64.0..80.0),
     };
     let darkener = if target_l < 42.0 || rng.random::<f64>() < 0.5 { 1 } else { 9 };
@@ -328,109 +453,191 @@ fn generated_palette(rng: &mut StdRng, cm: &ColourModel) -> Palette {
         _ => random_parts(rng),
     };
     let g0 = tone_to(cm, &ground_parts, target_l, darkener);
-    let g_light = tone_to(cm, &ground_parts, (target_l + rng.random_range(8.0..16.0)).min(95.0), darkener);
-    let g_dark = tone_to(cm, &ground_parts, (target_l - rng.random_range(10.0..20.0)).max(6.0), darkener);
-    let ground_lab = cm.lab(&g0);
-    let mut partner_parts = random_parts(rng);
-    if rng.random::<f64>() < 0.5 {
-        partner_parts = ground_parts.clone();
-        partner_parts.push((*pick(rng, &CHROMATIC), 0.35));
-    }
-    let g_partner = tone_to(cm, &partner_parts, target_l + rng.random_range(-8.0..8.0), darkener);
-    let ground = vec![
-        named_paint(cm, rng, g0, 0.45, 0.0, 4.0),
-        named_paint(cm, rng, g_partner, 0.45, 0.0, 4.0),
-        named_paint(cm, rng, g_light, 0.45, 0.0, 4.0),
-    ];
-    let ground_dark = Some(named_paint(cm, rng, g_dark, 0.45, 0.0, 4.0));
-    let mut candidates: Vec<[f32; 16]> = vec![mix(&[(0, 1.0)], 0.0, 0.0), mix(&[(1, 1.0)], 0.0, 0.0), mix(&[(0, 0.7), (1, 0.3)], 0.0, 0.0), mix(&[(9, 0.6), (1, 0.4)], 0.0, 0.0)];
-    for _ in 0..LINE_CANDIDATES {
-        let parts = random_parts(rng);
-        let lift = rng.random::<f64>();
-        let m = if lift < 0.45 {
-            mix(&parts, 0.0, 0.0)
-        } else if lift < 0.8 {
-            let target = rng.random_range(55.0..90.0);
-            tone_to(cm, &parts, target, darkener)
+    let gl = cm.lab(&g0);
+    let (h0, c0) = hue_chroma(gl);
+    let h0 = if c0 < 8.0 { rng.random_range(0.0..360.0) } else { h0 };
+    let lab_of = |m: &[f32; 16]| cm.lab(m);
+    let side = if rng.random::<f64>() < 0.5 { 1.0 } else { -1.0 };
+    let companion = if rng.random::<f64>() < 0.6 {
+        lch(gl[0] + rng.random_range(-6.0..8.0), (c0 * rng.random_range(0.8..1.2)).max(15.0), h0 + side * rng.random_range(25.0..50.0))
+    } else {
+        lch(gl[0] + rng.random_range(-10.0..10.0), c0 * rng.random_range(0.3..0.6), h0 + rng.random_range(-15.0..15.0))
+    };
+    let g1 = best_mix(companion, &lab_of);
+    let (scheme, offsets, _) = *weighted(rng, &SCHEMES.iter().map(|s| ((s.0, s.1, s.2), s.2)).collect::<Vec<_>>());
+    let wants_light = |k: usize, flip: bool| -> bool {
+        if gl[0] < 45.0 {
+            true
+        } else if gl[0] > 62.0 {
+            false
         } else {
-            let target = rng.random_range(12.0..35.0);
-            tone_to(cm, &parts, target, darkener)
-        };
-        candidates.push(m);
-    }
-    let labs: Vec<[f64; 3]> = candidates.iter().map(|m| cm.lab(m)).collect();
-    let ground_name = colour_name(ground_lab);
-    let contrast = |lab: [f64; 3]| (lab[0] - ground_lab[0]).abs() * 1.4 + delta_e(lab, ground_lab);
-    let mut chosen: Vec<usize> = Vec::new();
-    let want = rng.random_range(5..=7);
-    while chosen.len() < want {
-        let mut best = None;
-        let mut best_score = f64::MIN;
-        for (i, lab) in labs.iter().enumerate() {
-            if chosen.contains(&i) {
-                continue;
+            (k % 2 == 0) ^ flip
+        }
+    };
+    let flip = rng.random::<f64>() < 0.5;
+    let contrast = |lab: [f64; 3]| (lab[0] - gl[0]).abs() * 1.4 + delta_e(lab, gl);
+    let mut fg: Vec<[f32; 16]> = Vec::new();
+    let mut labs: Vec<[f64; 3]> = Vec::new();
+    let neutral_main = rng.random::<f64>() < 0.6;
+    let mut hue_slot = 0usize;
+    for k in 0..4 {
+        let light = wants_light(k, flip);
+        let mut best: Option<([f32; 16], f64)> = None;
+        for attempt in 0..10 {
+            let push = (attempt % 5) as f64 * 7.0;
+            if attempt == 5 && !(k == 0 && neutral_main) {
+                hue_slot += 1;
             }
-            let c = contrast(*lab);
-            if c < MIN_GROUND_CONTRAST && !chosen.is_empty() {
-                continue;
+            let m = if k == 0 && neutral_main {
+                let t = if light { lch((90.0 - push * 0.5).max(70.0), rng.random_range(2.0..8.0), h0) } else { lch(rng.random_range(16.0..24.0), rng.random_range(0.0..6.0), h0 + 180.0) };
+                best_mix(t, &lab_of)
+            } else {
+                let h = h0 + offsets[hue_slot % offsets.len()] + rng.random_range(-10.0..10.0);
+                let l = if light { rng.random_range(62.0..88.0) + push * 0.4 } else { rng.random_range(18.0..42.0) - push * 0.5 };
+                best_mix(lch(l.clamp(12.0, 94.0), rng.random_range(40.0..72.0), h), &lab_of)
+            };
+            let lab = cm.lab(&m);
+            let spread = labs.iter().map(|o| delta_e(lab, *o)).fold(200.0f64, f64::min);
+            let (hk, ck) = hue_chroma(lab);
+            let hue_gap = labs
+                .iter()
+                .filter(|o| ck > 15.0 && hue_chroma(**o).1 > 15.0)
+                .map(|o| {
+                    let d = (hue_chroma(*o).0 - hk).rem_euclid(360.0);
+                    d.min(360.0 - d)
+                })
+                .fold(180.0f64, f64::min);
+            let name = colour_name(lab);
+            let fresh = !labs.iter().any(|o| colour_name(*o) == name) && name != colour_name(gl);
+            let score = contrast(lab).min(MIN_GROUND_CONTRAST * 1.5) + spread.min(MIN_LINE_SPREAD * 1.5) + hue_gap.min(MIN_HUE_GAP) + if fresh { 30.0 } else { 0.0 };
+            if best.as_ref().map(|b| score > b.1).unwrap_or(true) {
+                best = Some((m, score));
             }
-            let nm = colour_name(*lab);
-            if nm == ground_name || chosen.iter().any(|&j| colour_name(labs[j]) == nm) {
-                continue;
-            }
-            let spread = chosen.iter().map(|&j| delta_e(*lab, labs[j])).fold(200.0f64, f64::min);
-            if spread < MIN_LINE_SPREAD {
-                continue;
-            }
-            let score = if chosen.is_empty() { c + MAIN_PICK_JITTER * rng.random::<f64>() } else { c * 0.6 + spread.min(70.0) + 25.0 * rng.random::<f64>() };
-            if score > best_score {
-                best_score = score;
-                best = Some(i);
+            if contrast(lab) >= MIN_GROUND_CONTRAST && spread >= MIN_LINE_SPREAD && hue_gap >= MIN_HUE_GAP && fresh {
+                break;
             }
         }
-        match best {
-            Some(i) => chosen.push(i),
-            None => break,
+        if !(k == 0 && neutral_main) {
+            hue_slot += 1;
+        }
+        let m = best.unwrap().0;
+        labs.push(cm.lab(&m));
+        fg.push(m);
+    }
+    let body = [(0.2, 0.0, 10.0), (0.15, 5.0, 10.0), (0.22, 0.0, 7.5), (0.22, 0.0, 7.5)];
+    let mut fgp: Vec<Paint> = fg.iter().zip(body.iter()).map(|(m, &(th, y, mu))| named_paint(cm, rng, *m, th, y, mu)).collect();
+    let accents = fgp.split_off(2);
+    let mut pal = Palette {
+        name: String::new(),
+        scheme: format!("{} on {}", scheme, key),
+        ground: vec![named_paint(cm, rng, g0, 0.45, 0.0, 4.0), named_paint(cm, rng, g1, 0.45, 0.0, 4.0)],
+        ground_dark: None,
+        main: fgp[0].clone(),
+        second: fgp[1].clone(),
+        accents,
+    };
+    pal.rebuild(cm);
+    pal
+}
+
+impl Palette {
+    pub const SLOTS: usize = 6;
+
+    pub fn random(seed: u64) -> Palette {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15);
+        palette(&mut rng)
+    }
+
+    fn slot(&self, s: usize) -> &Paint {
+        match s {
+            0 | 1 => &self.ground[s],
+            2 => &self.main,
+            3 => &self.second,
+            _ => &self.accents[s - 4],
         }
     }
-    let mut paints: Vec<Paint> = Vec::new();
-    for (k, &i) in chosen.iter().enumerate() {
-        let (thinner, yield_pa, mu) = match k {
-            0 => (0.2, 0.0, 10.0),
-            1 => (0.15, 5.0, 10.0),
-            _ => (0.22, 0.0, 7.5),
-        };
-        let mut p = named_paint(cm, rng, candidates[i], thinner, yield_pa, mu);
-        if paints.iter().any(|q| q.name == p.name) {
-            p.name = format!("{} {}", p.name, k + 1);
+
+    fn slot_mut(&mut self, s: usize) -> &mut Paint {
+        match s {
+            0 | 1 => &mut self.ground[s],
+            2 => &mut self.main,
+            3 => &mut self.second,
+            _ => &mut self.accents[s - 4],
         }
-        paints.push(p);
     }
-    while paints.len() < 3 {
-        paints.push(named_paint(cm, rng, mix(&[(0, 1.0)], 0.0, 0.0), 0.2, 0.0, 8.0));
+
+    pub fn slot_mix(&self, s: usize) -> [f32; 16] {
+        self.slot(s).mix
     }
-    if rng.random::<f64>() < 0.35 {
-        paints.push(paint(rng, "silver", &[(0, 0.75), (1, 0.25)], 0.35, 0.0, 1.5));
+
+    pub fn slot_name(&self, s: usize) -> &str {
+        &self.slot(s).name
     }
-    let main = paints[0].clone();
-    let second = paints[1].clone();
-    let accents = paints[2..].to_vec();
-    let used: Vec<String> = accents.iter().map(|p| p.name.clone()).collect();
-    let name = format!("{} {} ground: {}, {}, {}", key, ground[0].name, main.name, second.name, used.join(", "));
-    Palette { name, ground, ground_dark, main, second, accents }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn set_slot(&mut self, s: usize, pigments: &[f32; 16]) {
+        let total: f32 = pigments[..12].iter().sum::<f32>().max(1e-6);
+        let p = self.slot_mut(s);
+        for i in 0..12 {
+            p.mix[i] = pigments[i] / total;
+        }
+        self.scheme = "custom".to_string();
+        self.rebuild(cm());
+    }
+
+    fn rebuild(&mut self, cm: &ColourModel) {
+        while self.ground.len() < 2 {
+            let g = self.ground[0].clone();
+            self.ground.push(g);
+        }
+        while self.accents.len() < 2 {
+            let w = Paint { name: String::new(), mix: mix(&[(0, 1.0)], 0.22, 0.0), mu: 7.5 };
+            self.accents.push(w);
+        }
+        self.ground.truncate(2);
+        self.accents.truncate(2);
+        let l0 = cm.lab(&self.ground[0].mix)[0];
+        let mut light = self.ground[0].clone();
+        light.mix = tone_mix(cm, &self.ground[0].mix, (l0 + 12.0).min(95.0));
+        let mut dark = self.ground[0].clone();
+        dark.mix = tone_mix(cm, &self.ground[0].mix, (l0 - 15.0).max(8.0));
+        let mut seen: Vec<(String, f64)> = Vec::new();
+        for s in 0..Self::SLOTS {
+            let lab = cm.lab(&self.slot(s).mix);
+            let base = colour_name(lab);
+            let mut nm = base.clone();
+            if let Some((_, l_other)) = seen.iter().find(|(n, _)| *n == base) {
+                let stripped = base.trim_start_matches("pale ").trim_start_matches("deep ");
+                nm = if stripped == "white" { "off-white".to_string() } else { format!("{} {}", if lab[0] > *l_other { "light" } else { "dark" }, stripped) };
+            }
+            let mut k = 2;
+            let first = nm.clone();
+            while seen.iter().any(|(n, _)| *n == nm) {
+                nm = format!("{} {}", first, k);
+                k += 1;
+            }
+            seen.push((nm.clone(), lab[0]));
+            self.slot_mut(s).name = nm;
+        }
+        light.name = format!("light {}", self.ground[0].name);
+        dark.name = format!("dark {}", self.ground[0].name);
+        self.ground.push(light);
+        self.ground_dark = Some(dark);
+        let fg: Vec<&str> = (2..Self::SLOTS).map(|s| self.slot_name(s)).collect();
+        self.name = format!("{}: {} and {} ground, {}", self.scheme, self.ground[0].name, self.ground[1].name, fg.join(", "));
+    }
 }
 
 fn palette(rng: &mut StdRng) -> Palette {
     if rng.random::<f64>() >= CLASSIC_SHARE {
-        let cm = ColourModel::load();
-        return generated_palette(rng, &cm);
+        return harmonic_palette(rng, cm());
     }
     let mut pal = classic_palette(rng);
-    let darkest = pal.ground.iter().map(|p| p.mix).next().unwrap_or(mix(&[(9, 1.0)], 0.4, 0.0));
-    let mut dark = darkest;
-    dark[1] += 0.15;
-    dark[9] += 0.25;
-    pal.ground_dark = Some(Paint { name: format!("dark {}", pal.ground[0].name), mix: dark, mu: 4.0 });
+    pal.scheme = pal.name.clone();
+    pal.rebuild(cm());
     pal
 }
 
@@ -440,6 +647,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         0 => Palette {
             name: "autumn rhythm".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "umber", &[(9, 0.6), (8, 0.3), (1, 0.1)], 0.45, 0.0, 4.0),
                 paint(rng, "white", &[(0, 0.9), (8, 0.1)], 0.4, 0.0, 4.0),
@@ -457,6 +665,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         1 => Palette {
             name: "blue poles".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "teal", &[(10, 0.4), (6, 0.2), (0, 0.3), (9, 0.1)], 0.5, 0.0, 3.0),
                 paint(rng, "pale yellow", &[(2, 0.25), (0, 0.55), (8, 0.2)], 0.5, 0.0, 3.0),
@@ -474,6 +683,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         2 => Palette {
             name: "convergence".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "black", &[(1, 0.9), (9, 0.1)], 0.4, 0.0, 4.0),
                 paint(rng, "umber", &[(9, 0.8), (1, 0.2)], 0.4, 0.0, 4.0),
@@ -490,6 +700,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         3 => Palette {
             name: "earth".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "ochre", &[(8, 0.8), (0, 0.15), (9, 0.05)], 0.45, 0.0, 4.0),
                 paint(rng, "umber", &[(9, 0.7), (1, 0.1), (8, 0.2)], 0.45, 0.0, 4.0),
@@ -506,6 +717,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         4 => Palette {
             name: "monochrome".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "grey", &[(0, 0.7), (1, 0.3)], 0.45, 0.0, 4.0),
                 paint(rng, "white", &[(0, 1.0)], 0.4, 0.0, 4.0),
@@ -521,6 +733,7 @@ fn classic_palette(rng: &mut StdRng) -> Palette {
         _ => Palette {
             name: "lavender mist".to_string(),
             ground_dark: None,
+            scheme: String::new(),
             ground: vec![
                 paint(rng, "white", &[(0, 1.0)], 0.45, 0.0, 3.0),
                 paint(rng, "pink", &[(0, 0.85), (4, 0.15)], 0.5, 0.0, 3.0),
@@ -592,6 +805,12 @@ fn shades(rng: &mut StdRng, base: &Paint, partner: &Paint, pass: usize) -> Vec<[
 }
 
 fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
+    let (mut layers, ground) = ground_plan(rng, pal);
+    layers.extend(figure(rng, pal));
+    (layers, ground)
+}
+
+fn ground_plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     let mut layers: Vec<Layer> = Vec::new();
     let dry = |rng: &mut StdRng, layers: &mut Vec<Layer>, chance: f64| {
         if rng.random::<f64>() < chance {
@@ -601,9 +820,8 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     let grounds = [("brushed", 6.0), ("raw canvas", 0.5), ("floods", 1.0), ("washes", 1.0), ("scraped", 0.8), ("tilt run", 0.8)];
     let ground = *weighted(rng, &grounds);
     let mut gcols: Vec<Paint> = pal.ground.clone();
-    for i in (1..gcols.len()).rev() {
-        let j = rng.random_range(0..=i);
-        gcols.swap(i, j);
+    if gcols.len() > 1 && rng.random::<f64>() < 0.3 {
+        gcols.swap(0, 1);
     }
     let layout = *weighted(rng, &[("bleed", 0.55), ("border", 0.25), ("floating", 0.2)]);
     let margin = match layout {
@@ -698,7 +916,6 @@ fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
     if ground != "raw canvas" {
         dry(rng, &mut layers, 0.85);
     }
-    layers.extend(figure(rng, pal));
     (layers, format!("{} {}", ground, layout))
 }
 
@@ -903,16 +1120,37 @@ fn figure(rng: &mut StdRng, pal: &Palette) -> Vec<Layer> {
 
 impl Painter {
     pub fn new(seed: u64, w: f64, h: f64) -> Self {
+        Self::full(seed, w, h, Palette::random(seed))
+    }
+
+    pub fn full(seed: u64, w: f64, h: f64, pal: Palette) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let pal = palette(&mut rng);
         let (mut layers, ground) = plan(&mut rng, &pal);
         let rounds = rng.random_range(INITIAL_ROUNDS_MIN..=INITIAL_ROUNDS_MAX);
         for r in 1..=rounds {
             layers.extend(continuation(&mut rng, &pal, r));
         }
+        Self::assemble(rng, seed, w, h, pal, layers, ground, rounds, true)
+    }
+
+    pub fn background(seed: u64, w: f64, h: f64, pal: Palette) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (layers, ground) = ground_plan(&mut rng, &pal);
+        Self::assemble(rng, seed, w, h, pal, layers, ground, 0, false)
+    }
+
+    pub fn foreground(seed: u64, w: f64, h: f64, pal: Palette) -> Self {
+        let rng = StdRng::seed_from_u64(seed);
+        let mut p = Self::assemble(rng, seed, w, h, pal.clone(), Vec::new(), "existing canvas".to_string(), 0, false);
+        p.paint_foreground(pal);
+        p
+    }
+
+    fn assemble(mut rng: StdRng, seed: u64, w: f64, h: f64, pal: Palette, layers: Vec<Layer>, ground: String, rounds: usize, figured: bool) -> Self {
         let total: f64 = layers.iter().map(|l| l.duration).sum();
         let names: Vec<String> = layers.iter().map(|l| format!("{} {:.0}s", l.name, l.duration)).collect();
         log::warn!("pollock seed {} palette {} ground {} total {:.0} s: {}", seed, pal.name, ground, total, names.join(", "));
+        let layers_empty = layers.is_empty();
         let pos = DVec2::new(w * rng.random_range(0.2..0.8), h * rng.random_range(0.2..0.8));
         Self {
             rng,
@@ -941,17 +1179,34 @@ impl Painter {
             palette: pal.name.to_string(),
             ground,
             seed,
-            done: false,
+            done: layers_empty,
+            figured,
             pal,
         }
+    }
+
+    pub fn paint_foreground(&mut self, pal: Palette) {
+        self.palette = pal.name.clone();
+        self.pal = pal;
+        if self.figured {
+            self.continue_painting();
+            return;
+        }
+        self.figured = true;
+        let added = figure(&mut self.rng, &self.pal);
+        self.append(added);
     }
 
     pub fn continue_painting(&mut self) {
         self.round += 1;
         let added = continuation(&mut self.rng, &self.pal, self.round);
+        self.append(added);
+    }
+
+    fn append(&mut self, added: Vec<Layer>) {
         let total: f64 = added.iter().map(|l| l.duration).sum();
         let names: Vec<String> = added.iter().map(|l| format!("{} {:.0}s", l.name, l.duration)).collect();
-        log::warn!("pollock continue round {} palette {} total {:.0} s: {}", self.round + 1, self.pal.name, total, names.join(", "));
+        log::warn!("pollock adds {} layers, palette {} total {:.0} s: {}", added.len(), self.pal.name, total, names.join(", "));
         self.layer = self.layers.len();
         self.layers.extend(added);
         self.layer_t = 0.0;

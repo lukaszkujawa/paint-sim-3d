@@ -179,9 +179,9 @@ impl Renderer {
         }
     }
 
-    pub fn update(&self, gpu: &Gpu, cam: &Camera, film: &Film) {
+    pub fn update(&self, gpu: &Gpu, cam: &Camera, film: &Film, viewport_height: u32) {
         let mut u = self.uniform(cam, film);
-        u.jitter[3] = pixel_footprint(cam, gpu.config.height);
+        u.jitter[3] = pixel_footprint(cam, viewport_height);
         gpu.queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&u));
     }
 

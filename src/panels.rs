@@ -1,0 +1,625 @@
+use crate::{brush, color, pollock, App};
+use crate::tools::ToolKind;
+use egui::{Align, Color32, CornerRadius, FontId, Layout, RichText, Stroke, TextStyle, Vec2};
+use glam::Vec3;
+
+const LABEL_W: f32 = 104.0;
+const TOOLBAR_W: f32 = 74.0;
+const INSPECTOR_W: f32 = 320.0;
+const ACCENT: Color32 = Color32::from_rgb(222, 150, 72);
+
+const TOOLS: [(ToolKind, &str, &str, &str); 6] = [
+    (ToolKind::Stick, "Stick", "1", "Drip paint from a loaded stick"),
+    (ToolKind::Bottle, "Bottle", "2", "Squeeze a thin steady thread"),
+    (ToolKind::Bucket, "Bucket", "3", "Pour a heavy stream"),
+    (ToolKind::Pour, "Pour", "4", "Lay paint straight onto the canvas"),
+    (ToolKind::Knife, "Knife", "5", "Drag a palette knife through the paint"),
+    (ToolKind::Brush, "Brush", "6", "Press a bristle brush onto the canvas"),
+];
+
+pub fn apply_style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|s| {
+        s.text_styles = [
+            (TextStyle::Small, FontId::proportional(11.0)),
+            (TextStyle::Body, FontId::proportional(13.0)),
+            (TextStyle::Button, FontId::proportional(13.0)),
+            (TextStyle::Heading, FontId::proportional(15.0)),
+            (TextStyle::Monospace, FontId::monospace(12.0)),
+        ]
+        .into();
+        s.spacing.item_spacing = Vec2::new(6.0, 5.0);
+        s.spacing.button_padding = Vec2::new(8.0, 3.0);
+        s.spacing.interact_size.y = 20.0;
+        s.spacing.window_margin = egui::Margin::same(10);
+        s.spacing.menu_margin = egui::Margin::same(6);
+        let v = &mut s.visuals;
+        v.panel_fill = Color32::from_rgb(30, 31, 34);
+        v.window_fill = Color32::from_rgb(36, 37, 41);
+        v.extreme_bg_color = Color32::from_rgb(22, 23, 25);
+        v.faint_bg_color = Color32::from_rgb(38, 39, 43);
+        v.window_stroke = Stroke::new(1.0, Color32::from_rgb(52, 54, 58));
+        v.window_corner_radius = CornerRadius::same(6);
+        v.menu_corner_radius = CornerRadius::same(6);
+        v.selection.bg_fill = ACCENT.linear_multiply(0.55);
+        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.slider_trailing_fill = true;
+        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open, &mut v.widgets.noninteractive] {
+            w.corner_radius = CornerRadius::same(4);
+        }
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(48, 50, 54));
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 46, 50);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(44, 46, 50);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(56, 58, 63);
+        v.widgets.active.weak_bg_fill = Color32::from_rgb(64, 66, 72);
+    });
+}
+
+fn prop<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(LABEL_W, ui.spacing().interact_size.y), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_width(LABEL_W);
+            ui.add(egui::Label::new(RichText::new(label).color(Color32::from_gray(150))).truncate());
+        });
+        ui.spacing_mut().slider_width = (ui.available_width() - 84.0).max(40.0);
+        add(ui)
+    })
+    .inner
+}
+
+fn num<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, v: &mut N, lo: f64, hi: f64, scale: f64, suffix: &str, log: bool) -> bool {
+    prop(ui, label, |ui| {
+        let mut d = v.to_f64() * scale;
+        let r = ui.add(egui::Slider::new(&mut d, lo * scale..=hi * scale).logarithmic(log).suffix(suffix).max_decimals(if N::INTEGRAL { 0 } else if hi * scale >= 100.0 { 1 } else { 2 }));
+        if r.changed() {
+            *v = N::from_f64(d / scale);
+        }
+        r.changed()
+    })
+}
+
+fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().size(13.0)).default_open(open).show(ui, |ui| {
+        ui.add_space(2.0);
+        add(ui);
+        ui.add_space(4.0);
+    });
+}
+
+fn swatch_color(rgb: [f32; 3]) -> Color32 {
+    Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8)
+}
+
+impl App {
+    pub(crate) fn tool_name(&self) -> &'static str {
+        TOOLS.iter().find(|t| t.0 == self.tool.kind).map(|t| t.1).unwrap_or("")
+    }
+
+    pub(crate) fn set_top_view(&mut self) {
+        let (w, h) = (self.film.settings.width_m, self.film.settings.height_m);
+        let aspect = (self.view_rect[2] / self.view_rect[3].max(1.0)).max(0.1);
+        let span = h.max(w / aspect) * 1.08;
+        self.cam.yaw = -std::f32::consts::FRAC_PI_2;
+        self.cam.pitch = 1.52;
+        self.cam.dist = span / (2.0 * (0.5 * self.cam.fov).tan());
+        self.cam.target = Vec3::new(w * 0.5, h * 0.5, 0.0);
+    }
+
+    pub(crate) fn set_angled_view(&mut self) {
+        self.cam.yaw = -1.2;
+        self.cam.pitch = 0.9;
+        self.cam.dist = 1.3;
+        self.cam.target = Vec3::new(self.film.settings.width_m * 0.5, self.film.settings.height_m * 0.5, 0.0);
+    }
+
+    pub(crate) fn clear_canvas(&mut self) {
+        self.film.clear(&self.gpu);
+        self.air = crate::Airborne::new();
+        self.brush_scraped = 0.0;
+        self.brush_released = 0.0;
+        self.surface = crate::CoarseSurface::new(self.film.pool_dims[0], self.film.pool_dims[1], 4.0 * self.film.dx as f64);
+        self.sim_time = 0.0;
+    }
+
+    fn reload_tool(&mut self) {
+        if self.tool.kind == ToolKind::Brush {
+            self.brush.dip(&self.paint.frac);
+        } else {
+            self.tool.reload();
+        }
+    }
+
+    pub(crate) fn ui_panel(&mut self) {
+        let ctx = self.ui.ctx.clone();
+        self.menu_open = false;
+        self.block_rects.clear();
+        let central = ctx.root_ui(|ui| {
+            egui::Panel::top("menubar").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 27)).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.menu_bar(ui));
+            egui::Panel::bottom("status").frame(egui::Frame::new().fill(Color32::from_rgb(24, 25, 27)).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| self.status_bar(ui));
+            egui::Panel::left("tools").exact_size(TOOLBAR_W).resizable(false).frame(egui::Frame::new().fill(Color32::from_rgb(27, 28, 31)).inner_margin(egui::Margin::symmetric(6, 8))).show(ui, |ui| self.tool_strip(ui));
+            let mut open = self.show_inspector;
+            egui::Panel::right("inspector").exact_size(INSPECTOR_W).resizable(false).frame(egui::Frame::new().fill(Color32::from_rgb(30, 31, 34)).inner_margin(egui::Margin::symmetric(10, 8))).show_collapsible(ui, &mut open, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.inspector(ui));
+            });
+            self.show_inspector = open;
+            ui.available_rect_before_wrap()
+        });
+        if self.show_help {
+            let mut open = true;
+            if let Some(r) = egui::Window::new("Controls").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| Self::help(ui)) {
+                self.block_rects.push(r.response.rect);
+            }
+            self.show_help = open;
+        }
+        let ppp = ctx.pixels_per_point();
+        self.view_rect = [central.min.x * ppp, central.min.y * ppp, central.width() * ppp, central.height() * ppp];
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.label(RichText::new("Paint Sim").strong().color(ACCENT));
+            ui.add_space(8.0);
+            let file = ui.menu_button("File", |ui| {
+                if ui.add(egui::Button::new("Save screenshot").shortcut_text("F12")).clicked() {
+                    self.shot_request = Some(format!("shot_{}.png", self.frame_index));
+                }
+                if ui.button("Export for Blender").clicked() {
+                    let dir = format!("blender_export_{}", self.frame_index);
+                    self.export_blender(&dir);
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    std::process::exit(0);
+                }
+            });
+            let canvas = ui.menu_button("Canvas", |ui| {
+                if ui.button("Clear canvas").clicked() {
+                    self.clear_canvas();
+                }
+                if ui.add(egui::Button::new("Dry canvas now").shortcut_text("D")).clicked() {
+                    self.film.dry_now(&self.gpu);
+                }
+                ui.separator();
+                ui.checkbox(&mut self.film.settings.raw_canvas, "Raw canvas on clear");
+                ui.checkbox(&mut self.paused, "Pause simulation   Space");
+            });
+            let view = ui.menu_button("View", |ui| {
+                if ui.add(egui::Button::new("Top view").shortcut_text("T")).clicked() {
+                    self.set_top_view();
+                }
+                if ui.button("Angled view").clicked() {
+                    self.set_angled_view();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_inspector, "Inspector   Tab");
+            });
+            let render = ui.menu_button("Render", |ui| {
+                if ui.add(egui::Button::new("Beauty render, top").shortcut_text("B")).on_hover_text("Photographic straight-down render at twice the simulation resolution").clicked() {
+                    self.beauty_render(true);
+                }
+                if ui.button("Beauty render, current view").on_hover_text("6144 x 4096 render from the current camera").clicked() {
+                    self.beauty_render(false);
+                }
+                ui.separator();
+                ui.label(RichText::new("Settings").small().weak());
+                ui.set_min_width(320.0);
+                ui.set_max_width(320.0);
+                self.render_settings(ui);
+            });
+            let help = ui.menu_button("Help", |ui| {
+                if ui.button("Controls").clicked() {
+                    self.show_help = true;
+                }
+            });
+            self.menu_open = [file.inner, canvas.inner, view.inner, render.inner, help.inner].iter().any(|o| o.is_some());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, tip) = if self.paused { ("Resume", "Resume the simulation (Space)") } else { ("Pause", "Pause the simulation (Space)") };
+                if ui.add(egui::Button::new(label).min_size(Vec2::new(84.0, 0.0))).on_hover_text(tip).clicked() {
+                    self.paused = !self.paused;
+                }
+                let inspector = if self.show_inspector { "Hide panel" } else { "Show panel" };
+                if ui.button(inspector).on_hover_text("Toggle the inspector (Tab)").clicked() {
+                    self.show_inspector = !self.show_inspector;
+                }
+            });
+        });
+    }
+
+    fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered_justified(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (kind, name, key, tip) in TOOLS {
+                let sel = self.tool.kind == kind;
+                let text = RichText::new(name).size(12.0).color(if sel { Color32::WHITE } else { ui.visuals().text_color() });
+                let b = egui::Button::selectable(sel, text).min_size(Vec2::new(TOOLBAR_W - 12.0, 34.0));
+                if ui.add(b).on_hover_text(format!("{}   ({})", tip, key)).clicked() {
+                    self.tool.kind = kind;
+                }
+            }
+            ui.add_space(10.0);
+            let rgb = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac);
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(TOOLBAR_W - 12.0, 30.0), egui::Sense::click());
+            ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
+            ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
+            if resp.on_hover_text("Current paint. Click to reload the tool (R)").clicked() {
+                self.reload_tool();
+            }
+        });
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let (dot, state) = if self.paused { (Color32::from_rgb(220, 170, 60), "Paused") } else { (Color32::from_rgb(90, 190, 110), "Running") };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.5, dot);
+                ui.label(RichText::new(state).color(dot).small());
+            });
+            let small = |s: String| RichText::new(s).small().weak();
+            ui.label(small(format!("t {:.1} s", self.sim_time)));
+            ui.label(small(format!("{:.0} fps", self.fps)));
+            ui.label(small(format!("{} substeps", self.film.substeps_last)));
+            ui.label(small(format!("{:.2} mL on canvas", self.film.total_deposited * 1e6)));
+            if let Some(p) = &self.painter {
+                if !p.done {
+                    ui.label(RichText::new(format!("Painter: {}", p.status())).small().color(ACCENT));
+                }
+            }
+            if self.tool.kind == ToolKind::Stick && self.tool.stick_load <= 1e-9 && !self.tool.infinite {
+                ui.label(RichText::new("Stick is empty, press R").small().color(Color32::from_rgb(235, 190, 70)));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(small("Left: paint   Right: orbit   Middle: pan   Wheel: height   Ctrl+wheel: zoom".to_string()));
+                if !self.last_beauty.is_empty() {
+                    ui.label(RichText::new(format!("Saved {}", self.last_beauty)).small().color(Color32::from_rgb(150, 200, 150)));
+                }
+            });
+        });
+    }
+
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(self.tool_name()).heading().strong());
+        ui.add_space(2.0);
+        self.tool_settings(ui);
+        ui.separator();
+        section(ui, "Paint", true, |ui| self.paint_settings(ui));
+        section(ui, "Pollock painter", true, |ui| self.painter_settings(ui));
+        section(ui, "Canvas", false, |ui| {
+            num(ui, "Tilt", &mut self.film.settings.tilt_deg, 0.0, 90.0, 1.0, "°", false);
+            num(ui, "Tilt direction", &mut self.film.settings.tilt_dir_deg, -180.0, 180.0, 1.0, "°", false);
+            num(ui, "Drying rate", &mut self.film.settings.cure_rate, 0.0, 1.0, 1.0, " /s", true);
+            num(ui, "Wetting angle", &mut self.film.settings.contact_angle_deg, 0.0, 90.0, 1.0, "°", false);
+            num(ui, "Hysteresis", &mut self.film.settings.hysteresis_deg, 0.0, 45.0, 1.0, "°", false);
+            num(ui, "View light", &mut self.renderer.light_intensity, 0.0, 6.0, 1.0, "", false);
+        });
+        section(ui, "Simulation", false, |ui| {
+            let s = &mut self.film.settings;
+            ui.checkbox(&mut self.auto_quality, "Adapt substeps to frame budget");
+            num(ui, "Frame budget", &mut self.frame_budget_ms, 5.0, 40.0, 1.0, " ms", false);
+            num(ui, "Min substeps", &mut s.min_substeps, 1.0, 32.0, 1.0, "", false);
+            num(ui, "Max substeps", &mut s.max_substeps, 1.0, 128.0, 1.0, "", false);
+            ui.checkbox(&mut s.capillary, "Explicit capillary levelling");
+            num(ui, "Capillary cap", &mut s.m_cap, 1e-11, 1e-7, 1.0, "", true);
+            num(ui, "Hydrostatic cap", &mut s.m_cap_hydro, 1e-10, 1e-6, 1.0, "", true);
+            num(ui, "Min film", &mut s.h_min, 0.0, 5e-5, 1e6, " µm", false);
+            num(ui, "Debug view", &mut s.debug_view, 0.0, 1.0, 1.0, "", false);
+        });
+        section(ui, "Diagnostics", false, |ui| {
+            let cr = self.film.cg_report;
+            let mono = |s: String| RichText::new(s).monospace().size(11.0);
+            ui.label(mono(format!("max height {:.2} mm   mu min {:.2}", self.film.h_max * 1e3, self.film.mu_min)));
+            ui.label(mono(format!("implicit {} steps  res {:.1e}", self.film.implicit_steps, if cr[0] > 0.0 { (cr[3] / cr[0]).sqrt() } else { 0.0 })));
+            ui.label(mono(format!("airborne {:.3} mL  landed {:.3} mL", self.air.airborne_volume() * 1e6, self.air.landed_volume * 1e6)));
+            ui.label(mono(format!("rods {}  drops {}", self.air.rods.len(), self.air.drops.len())));
+            ui.add(egui::Label::new(mono(self.prof.clone())).wrap());
+            if !self.stats.is_empty() {
+                ui.add(egui::Label::new(mono(self.stats.clone())).wrap());
+            }
+            if ui.button("Compute stats").clicked() {
+                self.compute_stats();
+            }
+        });
+    }
+
+    fn tool_settings(&mut self, ui: &mut egui::Ui) {
+        num(ui, "Height", &mut self.tool.height, 0.002, 1.0, 100.0, " cm", true);
+        match self.tool.kind {
+            ToolKind::Stick => {
+                num(ui, "Stick diameter", &mut self.tool.stick_diameter, 0.003, 0.03, 1e3, " mm", false);
+                prop(ui, "Load", |ui| {
+                    let frac = (self.tool.stick_load / self.tool.stick_capacity.max(1e-12)).clamp(0.0, 1.0) as f32;
+                    ui.add(egui::ProgressBar::new(if self.tool.infinite { 1.0 } else { frac }).desired_height(14.0).text(RichText::new(format!("{:.2} mL", self.tool.stick_load * 1e6)).small()));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Dip stick").on_hover_text("R").clicked() {
+                        self.tool.reload();
+                    }
+                    if ui.checkbox(&mut self.tool.infinite, "Never runs dry").changed() && self.tool.infinite {
+                        self.tool.reload();
+                    }
+                });
+            }
+            ToolKind::Bottle => {
+                num(ui, "Flow", &mut self.tool.bottle_flow, 1e-7, 2e-5, 1e6, " mL/s", true);
+                num(ui, "Nozzle radius", &mut self.tool.bottle_radius, 0.0005, 0.006, 1e3, " mm", true);
+            }
+            ToolKind::Bucket => {
+                num(ui, "Flow", &mut self.tool.bucket_flow, 5e-6, 3e-4, 1e6, " mL/s", true);
+                num(ui, "Stream radius", &mut self.tool.bucket_radius, 0.003, 0.03, 1e3, " mm", true);
+            }
+            ToolKind::Pour => {
+                num(ui, "Rate", &mut self.pour_rate, 1e-7, 5e-5, 1e6, " mL/s", true);
+                num(ui, "Radius", &mut self.pour_radius, 0.0005, 0.03, 1e3, " mm", true);
+            }
+            ToolKind::Knife => {
+                num(ui, "Blade width", &mut self.tool.knife_width, 0.005, 0.15, 1e3, " mm", false);
+                num(ui, "Blade gap", &mut self.tool.knife_height, 0.0, 0.003, 1e3, " mm", false);
+            }
+            ToolKind::Brush => self.brush_settings(ui),
+        }
+    }
+
+    fn brush_settings(&mut self, ui: &mut egui::Ui) {
+        let mut shape = self.brush.shape;
+        prop(ui, "Shape", |ui| {
+            ui.selectable_value(&mut shape, brush::BrushShape::Round, "Round");
+            ui.selectable_value(&mut shape, brush::BrushShape::Flat, "Flat");
+        });
+        let mut size = self.brush.size() * 1e3;
+        let mut len = self.brush.len * 1e3;
+        let mut n = self.brush.bristles.len();
+        let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 3.0, 60.0, 1.0, " mm", false);
+        let c2 = num(ui, "Bristle length", &mut len, 10.0, 60.0, 1.0, " mm", false);
+        let c3 = num(ui, "Bristles", &mut n, 16.0, 400.0, 1.0, "", false);
+        if shape != self.brush.shape || c1 || c2 || c3 {
+            self.rebuild_brush(shape, n, len * 1e-3, size * 1e-3);
+        }
+        num(ui, "Stiffness", &mut self.brush.stiffness, 0.05, 0.9, 1.0, "", false);
+        num(ui, "Friction", &mut self.brush.friction, 0.0, 0.95, 1.0, "", false);
+        num(ui, "Paint release", &mut self.brush.release, 0.1, 10.0, 1.0, " /s", true);
+        num(ui, "Sink into paint", &mut self.brush_sink, 0.0, 1.0, 100.0, " %", false);
+        prop(ui, "Load", |ui| {
+            let frac = (self.brush.total_load() / self.brush.total_capacity().max(1e-12)).clamp(0.0, 1.0) as f32;
+            ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.3} mL  ·  {} touching", self.brush.total_load() * 1e6, self.brush.touching)).small()));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Dip brush").on_hover_text("R").clicked() {
+                self.brush.dip(&self.paint.frac);
+            }
+            if ui.button("Clean brush").clicked() {
+                self.brush.clean();
+            }
+        });
+    }
+
+    fn paint_settings(&mut self, ui: &mut egui::Ui) {
+        let rgb = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac);
+        let names: Vec<String> = self.film.pigments.pigments.iter().map(|p| p.name.clone()).collect();
+        let total: f32 = self.paint.frac[..color::NPIG].iter().sum::<f32>().max(1e-6);
+        let mut parts: Vec<(f32, &str)> = (0..color::NPIG).filter(|&i| self.paint.frac[i] > 0.0).map(|i| (self.paint.frac[i] / total, names[i].as_str())).collect();
+        parts.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let desc = parts.iter().take(3).map(|(f, n)| format!("{:.0}% {}", f * 100.0, n)).collect::<Vec<_>>().join(", ");
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
+            ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
+            ui.add(egui::Label::new(RichText::new(if desc.is_empty() { "No pigment".to_string() } else { desc }).small()).wrap());
+        });
+        ui.add_space(4.0);
+        let cols = 6;
+        let gap = 4.0;
+        let cell = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+        egui::Grid::new("swatches").spacing([gap, gap]).show(ui, |ui| {
+            for i in 0..color::NPIG.min(names.len()) {
+                let c = swatch_color(color::masstone_rgb(&self.film.pigments, &self.film.cmf_table, i));
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(cell, 22.0), egui::Sense::click());
+                ui.painter().rect_filled(rect, 3.0, c);
+                let used = self.paint.frac[i] > 0.0;
+                let stroke = if used { Stroke::new(2.0, ACCENT) } else if resp.hovered() { Stroke::new(1.0, Color32::from_gray(200)) } else { Stroke::new(1.0, Color32::from_gray(70)) };
+                ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                let resp = resp.on_hover_text(format!("{}\nClick: use pure   Shift+click: add to mix", names[i]));
+                if resp.clicked() {
+                    if ui.input(|inp| inp.modifiers.shift) {
+                        self.paint.frac[i] += 0.25 * total;
+                    } else {
+                        for k in 0..color::NPIG {
+                            self.paint.frac[k] = 0.0;
+                        }
+                        self.paint.frac[i] = 1.0;
+                    }
+                }
+                if (i + 1) % cols == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(4.0);
+        prop(ui, "Preset", |ui| {
+            if ui.button("Enamel").on_hover_text("Fluid house paint, Pollock's choice").clicked() {
+                self.paint.frac[12] = 0.3;
+                self.paint.frac[13] = 0.0;
+                self.tool.mu = 4.0;
+            }
+            if ui.button("Thin").on_hover_text("Thinned enamel").clicked() {
+                self.paint.frac[12] = 0.7;
+                self.paint.frac[13] = 0.0;
+                self.tool.mu = 2.0;
+            }
+            if ui.button("Tube oil").on_hover_text("Stiff impasto oil").clicked() {
+                self.paint.frac[12] = 0.0;
+                self.paint.frac[13] = 250.0;
+                self.tool.mu = 40.0;
+            }
+        });
+        num(ui, "Viscosity", &mut self.tool.mu, 0.05, 100.0, 1.0, " Pa·s", true);
+        num(ui, "Thinner", &mut self.paint.frac[12], 0.0, 0.9, 100.0, " %", false);
+        num(ui, "Yield stress", &mut self.paint.frac[13], 0.0, 600.0, 1.0, " Pa", false);
+        num(ui, "Surface tension", &mut self.tool.sigma, 0.02, 0.07, 1e3, " mN/m", false);
+        egui::CollapsingHeader::new(RichText::new("Pigment amounts").small()).id_salt("mix_sliders").show(ui, |ui| {
+            for (i, name) in names.iter().enumerate().take(color::NPIG) {
+                num(ui, name, &mut self.paint.frac[i], 0.0, 1.0, 1.0, "", false);
+            }
+        });
+    }
+
+    fn painter_settings(&mut self, ui: &mut egui::Ui) {
+        let running = self.painter.as_ref().map(|p| !p.done).unwrap_or(false);
+        let (w, h) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Palette").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Randomise").on_hover_text("New palette built on a colour harmony: complementary, split complementary, triadic, analogous or tetradic around the ground hue, with line colours that contrast with the ground").clicked() {
+                    self.pollock_pal = pollock::Palette::random(rand::random::<u64>());
+                    self.sync_pal_picks();
+                }
+            });
+        });
+        ui.add(egui::Label::new(RichText::new(self.pollock_pal.name()).small().weak()).wrap());
+        ui.add_space(2.0);
+        let rows: [(&str, std::ops::Range<usize>); 2] = [("Background", 0..2), ("Foreground", 2..6)];
+        for (title, slots) in rows {
+            prop(ui, title, |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for s in slots {
+                    self.palette_swatch(ui, s);
+                }
+            });
+        }
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                let bw = ((ui.available_width() - 6.0) * 0.5).max(60.0);
+                if ui.add(egui::Button::new("Paint background").min_size(Vec2::new(bw, 26.0))).on_hover_text("Lay the ground in the two background colours, then let it dry").clicked() {
+                    let seed = rand::random::<u64>() % 100000;
+                    self.painter = Some(pollock::Painter::background(seed, w, h, self.pollock_pal.clone()));
+                }
+                if ui.add(egui::Button::new("Paint foreground").min_size(Vec2::new(bw, 26.0))).on_hover_text("Pour, drip and fling the four foreground colours on top of what is there. Press again for another round").clicked() {
+                    match self.painter.as_mut() {
+                        Some(p) => p.paint_foreground(self.pollock_pal.clone()),
+                        None => {
+                            let seed = rand::random::<u64>() % 100000;
+                            self.painter = Some(pollock::Painter::foreground(seed, w, h, self.pollock_pal.clone()));
+                        }
+                    }
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let bw = ((ui.available_width() - 6.0) * 0.5).max(60.0);
+            if running {
+                if ui.add(egui::Button::new(RichText::new("Stop").strong()).min_size(Vec2::new(bw, 26.0))).clicked() {
+                    if let Some(p) = self.painter.as_mut() {
+                        p.stop();
+                    }
+                }
+            } else {
+                let full = egui::Button::new(RichText::new("Full painting").strong().color(Color32::from_rgb(25, 20, 15))).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
+                if ui.add(full).on_hover_text("Background, foreground and two or three more rounds of lines with this palette").clicked() {
+                    let seed = rand::random::<u64>() % 100000;
+                    self.painter = Some(pollock::Painter::full(seed, w, h, self.pollock_pal.clone()));
+                }
+            }
+        });
+        if let Some(p) = &self.painter {
+            ui.add(egui::Label::new(RichText::new(p.status()).small()).wrap()).on_hover_text(format!("Seed {}", p.seed));
+        }
+        num(ui, "Speed", &mut self.painter_speed, 1.0, 4.0, 1.0, "×", false);
+    }
+
+    pub(crate) fn sync_pal_picks(&mut self) {
+        for s in 0..pollock::Palette::SLOTS {
+            self.pal_picks[s] = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.pollock_pal.slot_mix(s));
+        }
+    }
+
+    fn palette_swatch(&mut self, ui: &mut egui::Ui, s: usize) {
+        let m = self.pollock_pal.slot_mix(s);
+        let rgb = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &m);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 26.0), egui::Sense::click());
+        ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
+        let stroke = if resp.hovered() { Stroke::new(1.5, Color32::from_gray(220)) } else { Stroke::new(1.0, Color32::from_gray(80)) };
+        ui.painter().rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+        let resp = resp.on_hover_text(format!("{}\nClick to change", self.pollock_pal.slot_name(s)));
+        let popup = egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_width(240.0);
+            let role = if s < 2 { format!("Background {}", s + 1) } else { format!("Foreground {}", s - 1) };
+            ui.label(RichText::new(format!("{}: {}", role, self.pollock_pal.slot_name(s))).strong());
+            ui.spacing_mut().slider_width = 210.0;
+            let mut c = swatch_color(self.pal_picks[s]);
+            if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+                self.pal_picks[s] = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+                let mix = pollock::match_rgb(self.pal_picks[s]);
+                self.pollock_pal.set_slot(s, &mix);
+            }
+            let names: Vec<&str> = self.film.pigments.pigments.iter().map(|p| p.name.as_str()).collect();
+            let mut parts: Vec<(f32, &str)> = (0..color::NPIG).filter(|&i| m[i] > 0.005).map(|i| (m[i], names[i])).collect();
+            parts.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let desc = parts.iter().take(4).map(|(f, n)| format!("{:.0}% {}", f * 100.0, n)).collect::<Vec<_>>().join(", ");
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 3.0, swatch_color(rgb));
+                ui.add(egui::Label::new(RichText::new(desc).small()).wrap());
+            });
+            ui.label(RichText::new("The picked colour is matched with the closest mix of the twelve pigments.").small().weak());
+            ui.separator();
+            if ui.button("Use current paint mix").clicked() {
+                let frac = self.paint.frac;
+                self.pollock_pal.set_slot(s, &frac);
+                self.pal_picks[s] = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.pollock_pal.slot_mix(s));
+            }
+            if ui.button("Load into paint mix").on_hover_text("Copy this colour to the hand tools, keeping the paint body").clicked() {
+                for i in 0..color::NPIG {
+                    self.paint.frac[i] = m[i];
+                }
+            }
+        });
+        if let Some(p) = popup {
+            self.block_rects.push(p.response.rect);
+            self.menu_open = true;
+        }
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        let r = &mut self.renderer;
+        num(ui, "Exposure", &mut r.exposure, -2.0, 2.0, 1.0, " EV", false);
+        num(ui, "Light elevation", &mut r.key_elevation_deg, 5.0, 90.0, 1.0, "°", false);
+        num(ui, "Light direction", &mut r.key_azimuth_deg, -180.0, 180.0, 1.0, "°", false);
+        num(ui, "Light power", &mut r.key_power, 0.0, 10.0, 1.0, "", false);
+        num(ui, "Ambient fill", &mut r.fill, 0.0, 1.5, 1.0, "", false);
+        num(ui, "Bloom", &mut r.bloom, 0.0, 1.0, 1.0, "", false);
+        num(ui, "Vignette", &mut r.vignette, 0.0, 0.6, 1.0, "", false);
+        num(ui, "Grain", &mut r.grain, 0.0, 0.05, 1.0, "", false);
+        num(ui, "Sharpen", &mut r.sharpen, 0.0, 1.5, 1.0, "", false);
+        num(ui, "Aperture", &mut r.aperture_mm, 0.0, 8.0, 1.0, " mm", false);
+        prop(ui, "Tone mapping", |ui| {
+            ui.selectable_value(&mut r.agx, false, "ACES");
+            ui.selectable_value(&mut r.agx, true, "AgX");
+        });
+    }
+
+    fn help(ui: &mut egui::Ui) {
+        egui::Grid::new("controls").num_columns(2).spacing([24.0, 6.0]).striped(true).show(ui, |ui| {
+            for (k, v) in [
+                ("Left mouse", "Apply the tool"),
+                ("Right drag", "Orbit the camera"),
+                ("Middle drag", "Pan"),
+                ("Wheel", "Tool height (brush: pressure)"),
+                ("Ctrl + wheel,  + / -", "Zoom"),
+                ("1 – 6", "Select tool"),
+                ("R", "Reload stick or dip brush"),
+                ("T", "Top view"),
+                ("B", "Beauty render, top"),
+                ("D", "Dry canvas"),
+                ("Space", "Pause / resume"),
+                ("Tab", "Show / hide inspector"),
+                ("F12", "Save screenshot"),
+            ] {
+                ui.label(RichText::new(k).strong());
+                ui.label(v);
+                ui.end_row();
+            }
+        });
+    }
+}

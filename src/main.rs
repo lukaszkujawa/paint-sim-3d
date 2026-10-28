@@ -3,6 +3,7 @@ mod color;
 mod pollock;
 mod film;
 mod gpu;
+mod panels;
 mod render;
 mod rod;
 mod tools;
@@ -54,7 +55,14 @@ struct App {
     knife_dir: [f64; 2],
     pending_deposits: Vec<Deposit>,
     scrap_total: f64,
-    ui_rect: Option<egui::Rect>,
+    view_rect: [f32; 4],
+    block_rects: Vec<egui::Rect>,
+    menu_open: bool,
+    show_inspector: bool,
+    show_help: bool,
+    view_fitted: bool,
+    pollock_pal: pollock::Palette,
+    pal_picks: [[f32; 3]; 6],
     prof: String,
     auto_quality: bool,
     frame_budget_ms: f32,
@@ -158,6 +166,7 @@ impl App {
             }
         }
         let ctx = egui::Context::default();
+        panels::apply_style(&ctx);
         let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, &window, Some(window.scale_factor() as f32), None, None);
         let eg_renderer = egui_wgpu::Renderer::new(&gpu.device, gpu.config.format, egui_wgpu::RendererOptions::default());
         let mut paint = color::PaintMix::pure(1);
@@ -190,7 +199,14 @@ impl App {
             knife_dir: [1.0, 0.0],
             pending_deposits: Vec::new(),
             scrap_total: 0.0,
-            ui_rect: None,
+            view_rect: [0.0, 0.0, size.width as f32, size.height.max(1) as f32],
+            block_rects: Vec::new(),
+            menu_open: false,
+            show_inspector: true,
+            show_help: false,
+            view_fitted: false,
+            pollock_pal: pollock::Palette::random(rand::random::<u64>()),
+            pal_picks: [[0.5; 3]; 6],
             prof: String::new(),
             auto_quality: true,
             frame_budget_ms: 14.0,
@@ -214,6 +230,7 @@ impl App {
             shot_request: None,
             stats: String::new(),
         };
+        app.sync_pal_picks();
         let snap = app.auto.as_ref().map(|a| a.snap_load.clone()).unwrap_or_default();
         if !snap.is_empty() {
             app.load_snapshot(&snap);
@@ -724,6 +741,8 @@ impl App {
         }
         drop(data);
         buf.unmap();
+        let [vx, vy, vw, vh] = self.view_rect.map(|v| v.max(0.0) as u32);
+        let img = if vw > 0 && vh > 0 && (vw < w || vh < h) { image::imageops::crop_imm(&img, vx, vy, vw.min(w - vx.min(w)), vh.min(h - vy.min(h))).to_image() } else { img };
         let _ = img.save(path);
         log::warn!("saved {}", path);
     }
@@ -1065,15 +1084,19 @@ impl App {
     }
 
     fn cursor_over_panel(&self) -> bool {
-        let Some(rect) = self.ui_rect else { return false };
+        let [x, y, w, h] = self.view_rect;
+        let (cx, cy) = (self.cursor[0], self.cursor[1]);
+        if cx < x || cy < y || cx >= x + w || cy >= y + h || self.menu_open {
+            return true;
+        }
         let ppp = self.ui.ctx.pixels_per_point().max(0.01);
-        let p = egui::pos2(self.cursor[0] / ppp, self.cursor[1] / ppp);
-        rect.expand(4.0).contains(p)
+        let p = egui::pos2(cx / ppp, cy / ppp);
+        self.block_rects.iter().any(|r| r.expand(4.0).contains(p))
     }
 
     fn ndc(&self) -> [f32; 2] {
-        let s = self.window.inner_size();
-        [self.cursor[0] / s.width as f32 * 2.0 - 1.0, 1.0 - self.cursor[1] / s.height as f32 * 2.0]
+        let [x, y, w, h] = self.view_rect;
+        [(self.cursor[0] - x) / w.max(1.0) * 2.0 - 1.0, 1.0 - (self.cursor[1] - y) / h.max(1.0) * 2.0]
     }
 
     fn frame(&mut self) {
@@ -1387,14 +1410,25 @@ impl App {
 
         let raw = self.ui.state.take_egui_input(&self.window);
         self.ui.ctx.begin_pass(raw);
-        self.ui_panel();
+        if self.auto.is_none() {
+            self.ui_panel();
+            if !self.view_fitted && self.view_rect[2] > 1.0 {
+                self.view_fitted = true;
+                self.set_top_view();
+            }
+        } else {
+            self.view_rect = [0.0, 0.0, size.width as f32, size.height.max(1) as f32];
+        }
         let mut out = self.ui.ctx.end_pass();
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         self.ui.state.handle_platform_output(&self.window, std::mem::take(&mut out.platform_output));
         let prims = self.ui.ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
 
-        self.cam.aspect = size.width as f32 / size.height.max(1) as f32;
-        self.renderer.update(&self.gpu, &self.cam, &self.film);
+        let vr = self.view_rect;
+        let vr = [vr[0].clamp(0.0, size.width as f32 - 1.0), vr[1].clamp(0.0, size.height as f32 - 1.0), vr[2].max(1.0), vr[3].max(1.0)];
+        let vr = [vr[0], vr[1], vr[2].min(size.width as f32 - vr[0]), vr[3].min(size.height as f32 - vr[1])];
+        self.cam.aspect = vr[2] / vr[3];
+        self.renderer.update(&self.gpu, &self.cam, &self.film, vr[3] as u32);
 
         let view = surface_tex.texture.create_view(&Default::default());
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
@@ -1448,8 +1482,8 @@ impl App {
                 multiview_mask: None,
             });
             let mut pass = pass.forget_lifetime();
+            pass.set_viewport(vr[0], vr[1], vr[2], vr[3], 0.0, 1.0);
             self.renderer.draw(&mut pass);
-            self.ui.renderer.render(&mut pass, &prims, &screen);
         }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1469,7 +1503,25 @@ impl App {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_viewport(vr[0], vr[1], vr[2], vr[3], 0.0, 1.0);
             self.tubes.draw(&mut pass);
+        }
+        {
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            self.ui.renderer.render(&mut pass, &prims, &screen);
         }
         for id in &textures_delta.free {
             self.ui.renderer.free_texture(id);
@@ -1537,225 +1589,6 @@ impl App {
         if exit {
             std::process::exit(0);
         }
-    }
-
-    fn ui_panel(&mut self) {
-        let ctx = self.ui.ctx.clone();
-        let resp = egui::Window::new("Paint").default_width(300.0).show(&ctx, |ui| {
-            ui.label(format!("{:.0} fps   substeps {}   t={:.1}s   hmax {:.2} mm   mu_min {:.2}", self.fps, self.film.substeps_last, self.sim_time, self.film.h_max * 1e3, self.film.mu_min));
-            ui.label(format!("deposited {:.3} mL", self.film.total_deposited * 1e6));
-            let cr = self.film.cg_report;
-            ui.label(format!("implicit: {} steps, residual {:.2e}, drift {:.2e} of {:.3e}", self.film.implicit_steps, if cr[0] > 0.0 { (cr[3] / cr[0]).sqrt() } else { 0.0 }, cr[1], cr[2]));
-            if !self.stats.is_empty() { ui.label(&self.stats); }
-            if !self.last_beauty.is_empty() { ui.label(format!("beauty: {}", self.last_beauty)); }
-            ui.label(&self.prof);
-            if ui.button("stats").clicked() { self.compute_stats(); }
-            ui.horizontal(|ui| {
-                if ui.button("top view").clicked() {
-                    self.cam.yaw = -std::f32::consts::FRAC_PI_2;
-                    self.cam.pitch = 1.52;
-                    self.cam.dist = 1.05;
-                    self.cam.target = Vec3::new(self.film.settings.width_m * 0.5, self.film.settings.height_m * 0.5, 0.0);
-                }
-                if ui.button("angled view").clicked() {
-                    self.cam.yaw = -1.2;
-                    self.cam.pitch = 0.9;
-                    self.cam.dist = 1.3;
-                    self.cam.target = Vec3::new(self.film.settings.width_m * 0.5, self.film.settings.height_m * 0.5, 0.0);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.paused, "pause");
-                ui.checkbox(&mut self.film.settings.raw_canvas, "raw canvas (on clear)");
-                if ui.button("dry canvas").clicked() {
-                    self.film.dry_now(&self.gpu);
-                }
-                if ui.button("clear canvas").clicked() {
-                    self.film.clear(&self.gpu);
-                    self.air = Airborne::new();
-                    self.brush_scraped = 0.0;
-                    self.brush_released = 0.0;
-                    self.surface = CoarseSurface::new(self.film.pool_dims[0], self.film.pool_dims[1], 4.0 * self.film.dx as f64);
-                    self.sim_time = 0.0;
-                }
-                if ui.button("beauty render (top)").clicked() {
-                    self.beauty_render(true);
-                }
-                ui.menu_button("beauty settings", |ui| {
-                    ui.add(egui::Slider::new(&mut self.renderer.aperture_mm, 0.0..=8.0).text("aperture mm (view only)"));
-                    ui.add(egui::Slider::new(&mut self.renderer.exposure, -2.0..=2.0).text("exposure stops"));
-                    ui.add(egui::Slider::new(&mut self.renderer.key_elevation_deg, 5.0..=90.0).text("key light elevation deg"));
-                    ui.add(egui::Slider::new(&mut self.renderer.key_azimuth_deg, -180.0..=180.0).text("key light azimuth deg"));
-                    ui.add(egui::Slider::new(&mut self.renderer.key_power, 0.0..=10.0).text("key light power"));
-                    ui.add(egui::Slider::new(&mut self.renderer.fill, 0.0..=1.5).text("ambient fill"));
-                    ui.add(egui::Slider::new(&mut self.renderer.bloom, 0.0..=1.0).text("bloom"));
-                    ui.add(egui::Slider::new(&mut self.renderer.vignette, 0.0..=0.6).text("vignette"));
-                    ui.add(egui::Slider::new(&mut self.renderer.grain, 0.0..=0.05).text("grain"));
-                    ui.add(egui::Slider::new(&mut self.renderer.sharpen, 0.0..=1.5).text("sharpen"));
-                    ui.checkbox(&mut self.renderer.agx, "AgX tone mapping (off: ACES)");
-                });
-                if ui.button("export for Blender").clicked() {
-                    let dir = format!("blender_export_{}", self.frame_index);
-                    self.export_blender(&dir);
-                }
-                if ui.button("beauty render (view)").clicked() {
-                    self.beauty_render(false);
-                }
-                if ui.button("screenshot (F12)").clicked() {
-                    self.shot_request = Some(format!("shot_{}.png", self.frame_index));
-                }
-            });
-            ui.label(format!("airborne {:.3} mL  landed {:.3} mL  emitted {:.3} mL  rods {}  drops {}", self.air.airborne_volume() * 1e6, self.air.landed_volume * 1e6, self.air.emitted_volume * 1e6, self.air.rods.len(), self.air.drops.len()));
-            if self.tool.kind == ToolKind::Stick && self.tool.stick_load <= 1e-9 && !self.tool.infinite {
-                ui.colored_label(egui::Color32::YELLOW, "stick is empty: press R or click dip stick");
-            }
-            ui.label("Hold the left mouse button over the canvas to pour. The sphere is the tool tip; wheel changes its height.");
-            ui.separator();
-            ui.horizontal(|ui| {
-                let running = self.painter.as_ref().map(|p| !p.done).unwrap_or(false);
-                if !running {
-                    if ui.button("Pollock: new painting").clicked() {
-                        let seed = rand::random::<u64>() % 100000;
-                        self.painter = Some(pollock::Painter::new(seed, self.film.settings.width_m as f64, self.film.settings.height_m as f64));
-                    }
-                    if let Some(p) = self.painter.as_mut() {
-                        if ui.button("Pollock: continue (same palette)").on_hover_text("adds another round of lines, pours, lassos and drops in this painting's palette on top of what is there").clicked() {
-                            p.continue_painting();
-                        }
-                    }
-                } else if ui.button("Pollock: stop").clicked() {
-                    if let Some(p) = self.painter.as_mut() {
-                        p.stop();
-                    }
-                }
-                if let Some(p) = &self.painter {
-                    ui.label(format!("seed {}  {}", p.seed, p.status()));
-                }
-            });
-            ui.add(egui::Slider::new(&mut self.painter_speed, 1.0..=4.0).text("painter time scale (x real time)"));
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Stick, "1 stick");
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Bottle, "2 bottle");
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Bucket, "3 bucket");
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Pour, "4 pour");
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Knife, "5 knife");
-                ui.selectable_value(&mut self.tool.kind, ToolKind::Brush, "6 brush");
-            });
-            ui.add(egui::Slider::new(&mut self.tool.height, 0.002..=1.0).logarithmic(true).text("height m (wheel)"));
-            ui.add(egui::Slider::new(&mut self.tool.mu, 0.05..=100.0).logarithmic(true).text("paint viscosity Pa s"));
-            ui.add(egui::Slider::new(&mut self.tool.sigma, 0.02..=0.07).text("paint surface tension"));
-            match self.tool.kind {
-                ToolKind::Stick => {
-                    ui.label(format!("stick load {:.2} mL  flow {:.3} mL/s  (R to dip)", self.tool.stick_load * 1e6, self.tool.stick_flow() * 1e6));
-                    ui.add(egui::Slider::new(&mut self.tool.stick_diameter, 0.003..=0.03).text("stick diameter m"));
-                    ui.horizontal(|ui| {
-                        if ui.button("dip stick").clicked() { self.tool.reload(); }
-                        if ui.checkbox(&mut self.tool.infinite, "infinite paint").changed() && self.tool.infinite { self.tool.reload(); }
-                    });
-                }
-                ToolKind::Bottle => {
-                    ui.add(egui::Slider::new(&mut self.tool.bottle_flow, 1e-7..=2e-5).logarithmic(true).text("bottle flow m3/s"));
-                    ui.add(egui::Slider::new(&mut self.tool.bottle_radius, 0.0005..=0.006).logarithmic(true).text("nozzle radius m"));
-                }
-                ToolKind::Bucket => {
-                    ui.add(egui::Slider::new(&mut self.tool.bucket_flow, 5e-6..=3e-4).logarithmic(true).text("bucket flow m3/s"));
-                    ui.add(egui::Slider::new(&mut self.tool.bucket_radius, 0.003..=0.03).logarithmic(true).text("stream radius m"));
-                }
-                ToolKind::Pour => {}
-                ToolKind::Knife => {
-                    ui.add(egui::Slider::new(&mut self.tool.knife_width, 0.005..=0.15).text("blade width m"));
-                    ui.add(egui::Slider::new(&mut self.tool.knife_height, 0.0..=0.003).text("blade gap m"));
-                }
-                ToolKind::Brush => {
-                    let press = ((self.brush.len - self.tool.height) * 1e3).max(0.0);
-                    ui.label(format!("brush load {:.3} / {:.3} mL   bristles touching {}   press {:.1} mm (wheel)", self.brush.total_load() * 1e6, self.brush.total_capacity() * 1e6, self.brush.touching, press));
-                    ui.label("Hold the left button to press the brush onto the canvas; release to lift it. R dips it in the current mix.");
-                    ui.horizontal(|ui| {
-                        if ui.button("dip brush").clicked() { self.brush.dip(&self.paint.frac); }
-                        if ui.button("clean brush").clicked() { self.brush.clean(); }
-                    });
-                    ui.add(egui::Slider::new(&mut self.brush.stiffness, 0.05..=0.9).text("bristle stiffness"));
-                    ui.add(egui::Slider::new(&mut self.brush.friction, 0.0..=0.95).text("bristle friction"));
-                    ui.add(egui::Slider::new(&mut self.brush.release, 0.1..=10.0).logarithmic(true).text("paint release 1/s"));
-                    ui.add(egui::Slider::new(&mut self.brush_sink, 0.0..=1.0).text("sink into wet paint"));
-                    let mut shape = self.brush.shape;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut shape, brush::BrushShape::Round, "round");
-                        ui.selectable_value(&mut shape, brush::BrushShape::Flat, "flat");
-                    });
-                    let mut size = self.brush.size() * 1e3;
-                    let mut len = self.brush.len * 1e3;
-                    let mut n = self.brush.bristles.len();
-                    let size_label = if shape == brush::BrushShape::Flat { "brush width mm" } else { "brush diameter mm" };
-                    let c1 = ui.add(egui::Slider::new(&mut size, 3.0..=60.0).text(size_label)).changed();
-                    let c2 = ui.add(egui::Slider::new(&mut len, 10.0..=60.0).text("bristle length mm")).changed();
-                    let c3 = ui.add(egui::Slider::new(&mut n, 16..=400).text("bristle count")).changed();
-                    if shape != self.brush.shape || c1 || c2 || c3 {
-                        self.rebuild_brush(shape, n, len * 1e-3, size * 1e-3);
-                    }
-                }
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("enamel (Pollock)").clicked() {
-                    self.paint.frac[12] = 0.3;
-                    self.paint.frac[13] = 0.0;
-                    self.tool.mu = 4.0;
-                }
-                if ui.button("thin enamel").clicked() {
-                    self.paint.frac[12] = 0.7;
-                    self.paint.frac[13] = 0.0;
-                    self.tool.mu = 2.0;
-                }
-                if ui.button("tube oil").clicked() {
-                    self.paint.frac[12] = 0.0;
-                    self.paint.frac[13] = 250.0;
-                    self.tool.mu = 40.0;
-                }
-            });
-            egui::CollapsingHeader::new("Paint mix").default_open(true).show(ui, |ui| {
-                let names: Vec<String> = self.film.pigments.pigments.iter().map(|p| p.name.clone()).collect();
-                for (i, name) in names.iter().enumerate() {
-                    let rgb = color::masstone_rgb(&self.film.pigments, &self.film.cmf_table, i);
-                    ui.horizontal(|ui| {
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8));
-                        if resp.clicked() {
-                            for k in 0..12 { self.paint.frac[k] = 0.0; }
-                            self.paint.frac[i] = 1.0;
-                        }
-                        ui.add(egui::Slider::new(&mut self.paint.frac[i], 0.0..=1.0).text(name));
-                    });
-                }
-                ui.add(egui::Slider::new(&mut self.paint.frac[12], 0.0..=0.9).text("thinner"));
-                ui.add(egui::Slider::new(&mut self.paint.frac[13], 0.0..=600.0).text("yield stress Pa (impasto body)"));
-                ui.add(egui::Slider::new(&mut self.film.settings.contact_angle_deg, 0.0..=90.0).text("wetting angle deg"));
-                ui.add(egui::Slider::new(&mut self.film.settings.hysteresis_deg, 0.0..=45.0).text("contact angle hysteresis deg"));
-                ui.add(egui::Slider::new(&mut self.pour_rate, 1e-7..=5e-5).logarithmic(true).text("pour rate m3/s"));
-                ui.add(egui::Slider::new(&mut self.pour_radius, 0.0005..=0.03).logarithmic(true).text("pour radius m"));
-            });
-            egui::CollapsingHeader::new("Canvas").default_open(true).show(ui, |ui| {
-                let s = &mut self.film.settings;
-                ui.add(egui::Slider::new(&mut s.tilt_deg, 0.0..=90.0).text("tilt deg"));
-                ui.add(egui::Slider::new(&mut s.tilt_dir_deg, -180.0..=180.0).text("tilt dir"));
-                ui.add(egui::Slider::new(&mut s.cure_rate, 0.0..=1.0).logarithmic(true).text("cure rate 1/s"));
-                ui.add(egui::Slider::new(&mut self.renderer.light_intensity, 0.0..=6.0).text("light"));
-            });
-            egui::CollapsingHeader::new("Physics / quality").show(ui, |ui| {
-                let s = &mut self.film.settings;
-                ui.checkbox(&mut s.capillary, "explicit capillary levelling (experimental)");
-                ui.add(egui::Slider::new(&mut s.m_cap, 1e-11..=1e-7).logarithmic(true).text("capillary mobility cap"));
-                ui.add(egui::Slider::new(&mut s.m_cap_hydro, 1e-10..=1e-6).logarithmic(true).text("hydrostatic mobility cap"));
-                ui.add(egui::Slider::new(&mut s.h_min, 0.0..=5e-5).text("min film m"));
-                ui.add(egui::Slider::new(&mut s.min_substeps, 1..=32).text("min substeps"));
-                ui.add(egui::Slider::new(&mut s.max_substeps, 1..=128).text("max substeps"));
-                ui.checkbox(&mut self.auto_quality, "auto quality (adapt substeps to frame budget)");
-                ui.add(egui::Slider::new(&mut self.frame_budget_ms, 5.0..=40.0).text("frame budget ms"));
-                ui.add(egui::Slider::new(&mut s.debug_view, 0..=1).text("debug view"));
-            });
-            ui.label("LMB: apply tool   RMB drag: orbit   MMB drag: pan   wheel: tool height   Ctrl+wheel or +/-: zoom   R: dip stick   1-5: tools");
-        });
-        self.ui_rect = resp.map(|r| r.response.rect);
     }
 }
 
@@ -1833,9 +1666,12 @@ impl ApplicationHandler for Pending {
                 if matches!(event.physical_key, PhysicalKey::Code(KeyCode::ControlLeft) | PhysicalKey::Code(KeyCode::ControlRight)) {
                     app.ctrl_down = event.state == ElementState::Pressed;
                 }
-                if event.state == ElementState::Pressed {
+                if event.state == ElementState::Pressed && !app.ui.ctx.egui_wants_keyboard_input() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Space) => app.paused = !app.paused,
+                        PhysicalKey::Code(KeyCode::Tab) => app.show_inspector = !app.show_inspector,
+                        PhysicalKey::Code(KeyCode::KeyT) => app.set_top_view(),
+                        PhysicalKey::Code(KeyCode::KeyB) => app.beauty_render(true),
                         PhysicalKey::Code(KeyCode::Digit1) => app.tool.kind = ToolKind::Stick,
                         PhysicalKey::Code(KeyCode::Digit2) => app.tool.kind = ToolKind::Bottle,
                         PhysicalKey::Code(KeyCode::Digit3) => app.tool.kind = ToolKind::Bucket,
@@ -1848,7 +1684,6 @@ impl ApplicationHandler for Pending {
                         PhysicalKey::Code(KeyCode::KeyD) => app.film.dry_now(&app.gpu),
                         PhysicalKey::Code(KeyCode::Equal) => app.cam.dist = (app.cam.dist * 0.8).max(0.05),
                         PhysicalKey::Code(KeyCode::Minus) => app.cam.dist = (app.cam.dist * 1.25).min(6.0),
-                        PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                         PhysicalKey::Code(KeyCode::F12) => app.shot_request = Some(format!("shot_{}.png", app.frame_index)),
                         _ => {}
                     }

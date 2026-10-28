@@ -32,6 +32,8 @@ cargo run --release -- --auto 400 --tilt 60 --shot tilt.png
 
 ## Controls
 
+The window is laid out like an editor: a menu bar (File, Canvas, View, Render, Help) with pause and panel toggles on the right, a tool strip on the left with the current paint swatch (click it to reload), an inspector on the right (settings of the active tool, paint swatches and presets, the Pollock painter, then collapsed Canvas, Simulation and Diagnostics sections) and a status bar with time, frame rate, deposited volume and painter progress. The 3D view only uses the space between them; Tab hides the inspector, Help > Controls lists the shortcuts. Beauty render settings live in the Render menu. Click a pigment swatch to use it pure, Shift+click to add it to the mix. The Pollock painter section shows the palette as two background and four foreground swatches: click one for a colour picker (the picked colour is matched with the closest mix of the twelve pigments by Kubelka-Munk), take the current paint mix, or load the colour into the hand tools. Randomise builds a palette on a colour harmony around the ground hue (complementary, split complementary, triadic, analogous or tetradic; one in five is a classic Pollock family), keeping the foreground colours in contrast with the ground, apart from each other in hue and named distinctly. Paint background lays only the ground and lets it dry; Paint foreground pours and drips the four foreground colours over whatever is on the canvas (the first press lays the main figure, later presses add rounds); Full painting does both plus extra rounds. Paint body (thinner, viscosity, yield) per gesture comes from the painter as before; the palette only sets colour.
+
 | Input | Action |
 | --- | --- |
 | 1 / 2 / 3 / 4 / 5 / 6 | stick, squeeze bottle, bucket, direct pour, palette knife, bristle brush |
@@ -48,8 +50,11 @@ cargo run --release -- --auto 400 --tilt 60 --shot tilt.png
 | Right drag | orbit camera |
 | Middle drag | pan |
 | R | dip the stick (reload) |
+| T | top view, fitted to the view area |
+| B | beauty render, top |
+| Tab | show / hide the inspector |
 | Space | pause |
-| F12 | screenshot |
+| F12 | screenshot of the 3D view |
 
 The hand speed is read from the cursor: slow passes coil, fast passes draw straight lines and eventually break the thread into dashes; a sharp flick throws paint ahead of the tool. Paint mix sliders set the pigment volume fractions, thinner lowers viscosity, body scales the yield stress (0 = enamel, 1 = tube oil). Tilt the canvas to make thick paint run.
 

@@ -177,7 +177,21 @@ pub fn masstone_rgb(set: &PigmentSet, cmf: &[f32], i: usize) -> [f32; 3] {
     xyz_to_srgb(xyz)
 }
 
+pub fn mix_rgb(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> [f32; 3] {
+    let (xyz, _) = mix_xyz(set, cmf, mix);
+    xyz_to_srgb(xyz)
+}
+
 pub fn mix_lab(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> [f32; 3] {
+    let (xyz, white) = mix_xyz(set, cmf, mix);
+    let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+    let fx = f(xyz[0] / white[0]);
+    let fy = f(xyz[1] / white[1]);
+    let fz = f(xyz[2] / white[2]);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn mix_xyz(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> ([f32; 3], [f32; 3]) {
     let total: f32 = mix[..NPIG].iter().sum::<f32>().max(1e-6);
     let mut xyz = [0.0f32; 3];
     let mut white = [0.0f32; 3];
@@ -201,11 +215,7 @@ pub fn mix_lab(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> [f32; 3] {
             white[c] += cmf[b * 3 + c];
         }
     }
-    let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
-    let fx = f(xyz[0] / white[0]);
-    let fy = f(xyz[1] / white[1]);
-    let fz = f(xyz[2] / white[2]);
-    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+    (xyz, white)
 }
 
 pub fn xyz_to_srgb(xyz: [f32; 3]) -> [f32; 3] {

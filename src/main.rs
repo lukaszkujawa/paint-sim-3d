@@ -7,6 +7,8 @@ mod gpu;
 mod panels;
 mod render;
 mod rod;
+mod sponge;
+mod session;
 mod roller;
 mod tools;
 
@@ -55,6 +57,7 @@ struct App {
     tubes: TubeRenderer,
     brush: brush::Brush,
     roller: roller::Roller,
+    sponge: sponge::Sponge,
     brush_scraped: f64,
     brush_released: f64,
     prev_kind: ToolKind,
@@ -88,6 +91,14 @@ struct App {
     show_help: bool,
     view_fitted: bool,
     pollock_pal: pollock::Palette,
+    ground_method: pollock::GroundMethod,
+    ground_strokes: [usize; 2],
+    history: session::History,
+    stroke_down: bool,
+    show_gallery: bool,
+    save_dialog: Option<String>,
+    save_focus: bool,
+    gallery: Vec<(session::Painting, Option<egui::TextureHandle>)>,
     pen_down: bool,
     pen_last: Instant,
     pen_raw: f32,
@@ -95,6 +106,8 @@ struct App {
     pen_pressure: bool,
     pen_curve: f32,
     pal_picks: [[f32; 3]; 6],
+    paint_pick: [f32; 3],
+    custom_mixes: Vec<[f32; 16]>,
     prof: String,
     auto_quality: bool,
     frame_budget_ms: f32,
@@ -234,6 +247,7 @@ impl App {
             brush: if std::env::var("PAINT_BRUSH_FLAT").is_ok() { brush::Brush::build(brush::BrushShape::Flat, 160, 0.035, 0.025, 0.00015) } else { brush::Brush::new(160, 0.035, 0.008, 0.00015) },
             brush_scraped: 0.0,
             roller: roller::Roller::new(),
+            sponge: sponge::Sponge::new(),
             brush_released: 0.0,
             prev_kind: ToolKind::Stick,
             painter: None,
@@ -263,6 +277,14 @@ impl App {
             show_help: false,
             view_fitted: false,
             pollock_pal: pollock::Palette::random(rand::random::<u64>()),
+            ground_method: pollock::GroundMethod::Auto,
+            ground_strokes: [40, 12],
+            history: session::History::new(),
+            stroke_down: false,
+            show_gallery: false,
+            save_dialog: None,
+            save_focus: false,
+            gallery: Vec::new(),
             pen_down: false,
             pen_last: Instant::now(),
             pen_raw: 0.0,
@@ -270,6 +292,8 @@ impl App {
             pen_pressure: true,
             pen_curve: 1.0,
             pal_picks: [[0.5; 3]; 6],
+            paint_pick: [0.5; 3],
+            custom_mixes: Vec::new(),
             prof: String::new(),
             auto_quality: true,
             frame_budget_ms: 14.0,
@@ -367,6 +391,7 @@ impl App {
         let press = (old.len - self.tool.height).max(0.0);
         let mut b = brush::Brush::build(shape, n, len, size, radius);
         b.stiffness = st;
+        b.angle = old.angle;
         b.friction = fr;
         b.release = rl;
         if load > 0.0 && cap > 0.0 {
@@ -491,6 +516,13 @@ impl App {
             return true;
         }
         let Some(a) = &self.auto else { return false };
+        if a.script == "groundbrush" || a.script == "groundbucket" {
+            if self.painter.is_none() {
+                let (m, n) = if a.script == "groundbrush" { (pollock::GroundMethod::Brush, a.rounds.max(1) as usize) } else { (pollock::GroundMethod::Bucket, a.rounds.max(1) as usize) };
+                self.painter = Some(pollock::Painter::background(a.seed, self.film.settings.width_m as f64, self.film.settings.height_m as f64, self.pollock_pal.clone(), m, n));
+            }
+            return self.apply_painter();
+        }
         if a.script == "pollock" {
             if self.painter.is_none() {
                 let mut p = pollock::Painter::new(a.seed, self.film.settings.width_m as f64, self.film.settings.height_m as f64);
@@ -640,6 +672,69 @@ impl App {
                 paint.frac[12] = 0.2;
                 let d = Deposit::stroke(line(t0), line(t1), 0.003, (1.5e-6 * dt) as f32, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour);
                 self.pending_deposits.push(d);
+            }
+            return true;
+        }
+        if a.script == "sponge" {
+            let f = self.frame_index;
+            self.tool.kind = ToolKind::Sponge;
+            if f == 1 {
+                let mut blue = color::PaintMix::pure(5);
+                blue.frac[12] = 0.2;
+                blue.frac[14] = (4f32).ln() + 10.0;
+                for k in 0..12 {
+                    let y = 0.18 + 0.012 * k as f32;
+                    self.pending_deposits.push(Deposit::stroke([0.82, y], [1.08, y], 0.008, 2.4e-6, blue.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+                }
+                let mut yellow = color::PaintMix::pure(2);
+                yellow.frac[12] = 0.2;
+                yellow.frac[14] = (6f32).ln() + 10.0;
+                self.sponge.dip(&yellow.frac);
+            }
+            self.tool.flowing = false;
+            let press = |at: (f64, f64), k0: u64, len: u64, pos: &mut DVec3, flowing: &mut bool| {
+                if (k0..k0 + len + 12).contains(&f) {
+                    *pos = DVec3::new(at.0, at.1, 0.0);
+                    *flowing = (k0 + 6..k0 + 6 + len).contains(&f);
+                }
+            };
+            let dabs = [(0.15, 0.6), (0.24, 0.62), (0.2, 0.52), (0.31, 0.55), (0.12, 0.45)];
+            for (k, at) in dabs.iter().enumerate() {
+                press(*at, 10 + k as u64 * 26, 12, &mut self.tool.pos, &mut self.tool.flowing);
+            }
+            press((0.33, 0.43), 140, 60, &mut self.tool.pos, &mut self.tool.flowing);
+            if f == 215 {
+                let mut red = color::PaintMix::pure(3);
+                red.frac[12] = 0.2;
+                red.frac[14] = (6f32).ln() + 10.0;
+                self.sponge.dab_colour(&red.frac);
+            }
+            let dabs2 = [(0.45, 0.62), (0.53, 0.58), (0.48, 0.5), (0.57, 0.48)];
+            for (k, at) in dabs2.iter().enumerate() {
+                press(*at, 220 + k as u64 * 26, 12, &mut self.tool.pos, &mut self.tool.flowing);
+            }
+            if f == 325 {
+                let mut yellow = color::PaintMix::pure(2);
+                yellow.frac[12] = 0.2;
+                yellow.frac[14] = (6f32).ln() + 10.0;
+                self.sponge.dip(&yellow.frac);
+            }
+            if (330..430).contains(&f) {
+                let t = (f - 330) as f64 / 100.0;
+                self.tool.pos = DVec3::new(0.12 + 0.25 * t, 0.3 + 0.03 * (t * 6.0).sin(), 0.0);
+                self.tool.flowing = f > 332;
+            }
+            if (440..480).contains(&f) {
+                let t = (f - 440) as f64 / 40.0;
+                self.tool.pos = DVec3::new(0.45 + 0.35 * t, 0.3 - 0.04 * t, 0.0);
+                self.tool.flowing = f > 442;
+            }
+            if f == 485 {
+                self.sponge.clean();
+            }
+            let blots = [(0.88, 0.25), (0.97, 0.27), (1.04, 0.22)];
+            for (k, at) in blots.iter().enumerate() {
+                press(*at, 490 + k as u64 * 26, 12, &mut self.tool.pos, &mut self.tool.flowing);
             }
             return true;
         }
@@ -1356,6 +1451,10 @@ impl App {
             self.scripted_deposits(&mut deposits);
         }
         let want_pour = self.mouse_down[0] && !self.cursor_over_panel();
+        if want_pour && !self.stroke_down {
+            self.begin_stroke();
+        }
+        self.stroke_down = want_pour;
         let pen = self.pen();
         self.tool.flow_scale = pen.map(|p| PEN_FLOW_MIN + (PEN_FLOW_MAX - PEN_FLOW_MIN) * p).unwrap_or(1.0);
         let mut scraps: Vec<Scrap> = Vec::new();
@@ -1375,6 +1474,52 @@ impl App {
             }
         } else {
             self.last_pour = None;
+        }
+        if let Some(script) = self.auto.as_ref().map(|a| a.script.clone()).filter(|s| s.starts_with("undo")) {
+            let size = self.window.inner_size();
+            let f = self.frame_index;
+            self.tool.kind = ToolKind::Pour;
+            self.pour_radius = 0.01;
+            self.pour_rate = 2.0e-5;
+            let t = |a: u64, b: u64| (f.saturating_sub(a)) as f32 / (b - a) as f32;
+            if (10..60).contains(&f) {
+                self.paint = color::PaintMix::pure(3);
+                self.cursor = [size.width as f32 * (0.35 + 0.1 * t(10, 60)), size.height as f32 * 0.45];
+            } else if (100..150).contains(&f) {
+                self.paint = color::PaintMix::pure(5);
+                self.cursor = [size.width as f32 * (0.3 + 0.4 * t(100, 150)), size.height as f32 * (0.38 + 0.14 * t(100, 150))];
+            }
+            self.mouse_down[0] = (10..60).contains(&f) || (100..150).contains(&f);
+            if script == "undosave" {
+                if f == 199 {
+                    self.paused = true;
+                    let t0 = Instant::now();
+                    self.save_painting("roundtrip");
+                    log::warn!("save took {:.2} s: {}", t0.elapsed().as_secs_f32(), self.last_beauty);
+                }
+                if f == 210 {
+                    self.clear_canvas();
+                }
+                if f == 220 {
+                    let t0 = Instant::now();
+                    self.open_painting(&session::painting_path("roundtrip"));
+                    self.paused = true;
+                    log::warn!("open took {:.2} s: {}", t0.elapsed().as_secs_f32(), self.last_beauty);
+                }
+                if f == 225 {
+                    self.save_painting("roundtrip2");
+                }
+            }
+            if script == "undoclear" && f == 200 {
+                self.begin_full();
+                self.clear_canvas();
+            }
+            if f == 260 && script != "undosave" {
+                self.undo();
+            }
+            if script == "undotest2" && f == 300 {
+                self.undo();
+            }
         }
         if let Some(a) = &self.auto {
             if a.script == "hold" {
@@ -1474,7 +1619,7 @@ impl App {
         }
         deposits.append(&mut self.pending_deposits);
         if !scripted {
-            let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller) { 0.0 } else { self.tool.height as f32 };
+            let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) { 0.0 } else { self.tool.height as f32 };
             if let Some(p) = self.cam.plane_hit(self.ndc(), pick_z).or_else(|| self.cam.plane_hit(self.ndc(), 0.0)) {
                 let p = DVec3::new(p.x as f64, p.y as f64, self.tool.height);
                 let v = match self.prev_tool_pos {
@@ -1703,6 +1848,20 @@ impl App {
         } else {
             self.roller.lift();
         }
+        if self.tool.kind == ToolKind::Sponge {
+            let mut res = Vec::new();
+            self.film.poll_reservoir(&self.gpu, &mut res);
+            self.sponge.absorb(&res);
+            if !self.paused {
+                let pressure = pen.unwrap_or(self.sponge.pressure);
+                let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);
+                let (c, d) = self.sponge.update(at, self.tool.flowing, pressure, frame_dt as f64, self.film.dx);
+                contacts = c;
+                deposits.extend(d);
+            }
+        } else {
+            self.sponge.lift();
+        }
         self.film.upload_contacts(&self.gpu, &contacts);
         self.prev_kind = self.tool.kind;
         let t_air = Instant::now();
@@ -1754,6 +1913,7 @@ impl App {
                 px: self.cam.dist as f64 * 0.0012,
                 knife_fill: (self.knife_load() / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32,
                 knife_paint: color_of(&color::PaintMix { frac: self.knife_mix() }.normalized().packed()),
+                sponge_radius: 0.5 * self.sponge.size,
                 knife_gap: self.tool.knife_height * self.pen().map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0),
                 pour_radius: self.pour_radius as f64 * self.pen().map(|p| PEN_WIDTH_MIN as f64 + (1.0 - PEN_WIDTH_MIN as f64) * p).unwrap_or(1.0),
             };
@@ -1766,6 +1926,10 @@ impl App {
         if self.tool.kind == ToolKind::Roller {
             let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
             self.roller.mesh(&mut tv, &mut ti, self.tool.pos, &pc);
+        }
+        if self.tool.kind == ToolKind::Sponge {
+            let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
+            self.sponge.mesh(&mut tv, &mut ti, self.tool.pos, &pc);
         }
         self.tubes.upload(&self.gpu, &tv, &ti, solid);
         let ms_mesh = t_mesh.elapsed().as_secs_f32() * 1e3;
@@ -1806,10 +1970,11 @@ impl App {
             self.film.set_knife(&self.gpu, knife);
             let substeps = self.film.choose_substeps(frame_dt);
             self.film.update_params(&self.gpu, frame_dt, substeps);
+            self.film.flush_journal(&self.gpu);
             self.film.encode_frame(&mut enc, substeps);
             stats_slot = self.film.request_stats(&self.gpu, &mut enc);
             scrap_slot = self.film.request_scraps(&mut enc);
-            if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller) {
+            if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) {
                 res_slot = self.film.request_reservoir(&mut enc);
             }
             self.sim_time += frame_dt;
@@ -1901,6 +2066,7 @@ impl App {
             self.film.map_reservoir(k);
         }
         self.frame_index += 1;
+        self.autosave_tick(false);
         let mut exit = false;
         let export_dir = self.auto.as_ref().filter(|a| self.frame_index == a.frames).map(|a| a.export.clone()).unwrap_or_default();
         if !export_dir.is_empty() {
@@ -1970,7 +2136,10 @@ impl ApplicationHandler for Pending {
         let Some(app) = self.app.as_mut() else { return };
         let _resp = app.ui.state.on_window_event(&app.window, &event);
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                app.autosave_tick(true);
+                event_loop.exit();
+            }
             WindowEvent::Resized(s) => { app.gpu.resize(s.width, s.height); app.tubes.resize(&app.gpu); }
             WindowEvent::RedrawRequested => {
                 app.frame();
@@ -2058,6 +2227,8 @@ impl ApplicationHandler for Pending {
                     app.cam.dist = (app.cam.dist * (1.0 - d * 0.1)).clamp(0.05, 6.0);
                 } else if app.tool.kind == ToolKind::Roller {
                     app.roller.pressure = (app.roller.pressure + d as f64 * 0.05).clamp(0.0, 1.0);
+                } else if app.tool.kind == ToolKind::Sponge {
+                    app.sponge.pressure = (app.sponge.pressure + d as f64 * 0.05).clamp(0.0, 1.0);
                 } else {
                     app.tool.height = (app.tool.height * (1.0 + d as f64 * 0.1)).clamp(0.002, 1.0);
                 }
@@ -2079,15 +2250,22 @@ impl ApplicationHandler for Pending {
                         PhysicalKey::Code(KeyCode::Digit5) => app.tool.kind = ToolKind::Knife,
                         PhysicalKey::Code(KeyCode::Digit6) => app.tool.kind = ToolKind::Brush,
                         PhysicalKey::Code(KeyCode::Digit7) => app.tool.kind = ToolKind::Roller,
+                        PhysicalKey::Code(KeyCode::Digit8) => app.tool.kind = ToolKind::Sponge,
                         PhysicalKey::Code(KeyCode::KeyR) => {
                             match app.tool.kind {
                                 ToolKind::Brush => app.brush.dip(&app.paint.frac),
                                 ToolKind::Roller => app.roller.dip(&app.paint.frac),
+                                ToolKind::Sponge => app.sponge.dip(&app.paint.frac),
                                 ToolKind::Knife => app.load_knife(),
                                 _ => app.tool.reload(),
                             }
                         }
-                        PhysicalKey::Code(KeyCode::KeyD) => app.film.dry_now(&app.gpu),
+                        PhysicalKey::Code(KeyCode::KeyD) => {
+                            app.begin_full();
+                            app.film.dry_now(&app.gpu);
+                        }
+                        PhysicalKey::Code(KeyCode::KeyZ) if app.ctrl_down => app.undo(),
+                        PhysicalKey::Code(KeyCode::KeyS) if app.ctrl_down => app.save_current(),
                         PhysicalKey::Code(KeyCode::Equal) => app.cam.dist = (app.cam.dist * 0.8).max(0.05),
                         PhysicalKey::Code(KeyCode::Minus) => app.cam.dist = (app.cam.dist * 1.25).min(6.0),
                         PhysicalKey::Code(KeyCode::F12) => app.shot_request = Some(format!("shot_{}.png", app.frame_index)),

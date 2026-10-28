@@ -15,6 +15,7 @@ pub enum ToolKind {
     Knife,
     Brush,
     Roller,
+    Sponge,
 }
 
 #[derive(Clone, Copy)]
@@ -234,7 +235,7 @@ impl Tool {
             ToolKind::Stick => (self.stick_flow(), (self.stick_diameter * 0.15).max(5e-4)),
             ToolKind::Bottle => (self.bottle_flow * self.flow_scale, self.bottle_radius),
             ToolKind::Bucket => (self.bucket_flow * self.flow_scale, self.bucket_radius),
-            ToolKind::Pour | ToolKind::Knife | ToolKind::Brush | ToolKind::Roller => return None,
+            ToolKind::Pour | ToolKind::Knife | ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge => return None,
         };
         if flow <= 0.0 {
             return None;

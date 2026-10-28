@@ -1,4 +1,4 @@
-use crate::{brush, color, pollock, App};
+use crate::{brush, color, pollock, session, App};
 use crate::tools::ToolKind;
 use egui::{Align, Color32, CornerRadius, FontId, Layout, RichText, Stroke, TextStyle, Vec2};
 use glam::Vec3;
@@ -21,7 +21,7 @@ const OK: Color32 = Color32::from_rgb(104, 178, 128);
 const WARN: Color32 = Color32::from_rgb(214, 172, 92);
 const INFO: Color32 = Color32::from_rgb(150, 178, 214);
 
-const TOOLS: [(ToolKind, &str, &str, &str); 7] = [
+const TOOLS: [(ToolKind, &str, &str, &str); 8] = [
     (ToolKind::Stick, "Stick", "1", "Drip paint from a loaded stick"),
     (ToolKind::Bottle, "Bottle", "2", "Squeeze a thin steady thread"),
     (ToolKind::Bucket, "Bucket", "3", "Pour a heavy stream"),
@@ -29,6 +29,7 @@ const TOOLS: [(ToolKind, &str, &str, &str); 7] = [
     (ToolKind::Knife, "Knife", "5", "Drag a palette knife through the paint"),
     (ToolKind::Brush, "Brush", "6", "Press a bristle brush onto the canvas"),
     (ToolKind::Roller, "Roller", "7", "Roll an even coat; picks up wet paint as it goes"),
+    (ToolKind::Sponge, "Sponge", "8", "Dab or drag porous texture; a clean sponge lifts wet paint"),
 ];
 
 pub fn apply_style(ctx: &egui::Context) {
@@ -101,7 +102,7 @@ fn prop<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R)
 fn num<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, v: &mut N, lo: f64, hi: f64, scale: f64, suffix: &str, log: bool) -> bool {
     prop(ui, label, |ui| {
         let mut d = v.to_f64() * scale;
-        let r = ui.add(egui::Slider::new(&mut d, lo * scale..=hi * scale).logarithmic(log).suffix(suffix).max_decimals(if N::INTEGRAL { 0 } else if hi * scale >= 100.0 { 1 } else { 2 }));
+        let r = ui.add(egui::Slider::new(&mut d, lo * scale..=hi * scale).clamping(egui::SliderClamping::Edits).logarithmic(log).suffix(suffix).max_decimals(if N::INTEGRAL { 0 } else if hi * scale >= 100.0 { 1 } else { 2 }));
         if r.changed() {
             *v = N::from_f64(d / scale);
         }
@@ -156,6 +157,7 @@ impl App {
         match self.tool.kind {
             ToolKind::Brush => self.brush.dip(&self.paint.frac),
             ToolKind::Roller => self.roller.dip(&self.paint.frac),
+            ToolKind::Sponge => self.sponge.dip(&self.paint.frac),
             ToolKind::Knife => self.load_knife(),
             _ => self.tool.reload(),
         }
@@ -176,6 +178,7 @@ impl App {
             self.show_inspector = open;
             ui.available_rect_before_wrap()
         });
+        self.file_windows(&ctx);
         if self.show_help {
             let mut open = true;
             if let Some(r) = egui::Window::new("Controls").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| Self::help(ui)) {
@@ -192,6 +195,21 @@ impl App {
             ui.label(RichText::new("Paint Sim").strong().color(Color32::WHITE));
             ui.add_space(8.0);
             let file = ui.menu_button("File", |ui| {
+                if ui.button("New painting").on_hover_text("Clear the canvas (undoable)").clicked() {
+                    self.begin_full();
+                    self.clear_canvas();
+                    self.history.name.clear();
+                }
+                if ui.button("Open...").clicked() {
+                    self.open_gallery();
+                }
+                if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
+                    self.save_current();
+                }
+                if ui.button("Save as...").clicked() {
+                    self.save_dialog = Some(self.history.name.clone());
+                }
+                ui.separator();
                 if ui.add(egui::Button::new("Save screenshot").shortcut_text("F12")).clicked() {
                     self.shot_request = Some(format!("shot_{}.png", self.frame_index));
                 }
@@ -201,14 +219,23 @@ impl App {
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
+                    self.autosave_tick(true);
                     std::process::exit(0);
                 }
             });
+            let edit = ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.can_undo(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                    self.undo();
+                }
+                ui.label(RichText::new(format!("{} steps can be undone", self.history.levels.len())).small().weak());
+            });
             let canvas = ui.menu_button("Canvas", |ui| {
                 if ui.button("Clear canvas").clicked() {
+                    self.begin_full();
                     self.clear_canvas();
                 }
                 if ui.add(egui::Button::new("Dry canvas now").shortcut_text("D")).clicked() {
+                    self.begin_full();
                     self.film.dry_now(&self.gpu);
                 }
                 ui.separator();
@@ -243,7 +270,7 @@ impl App {
                     self.show_help = true;
                 }
             });
-            self.menu_open = [file.inner, canvas.inner, view.inner, render.inner, help.inner].iter().any(|o| o.is_some());
+            self.menu_open = [file.inner, edit.inner, canvas.inner, view.inner, render.inner, help.inner].iter().any(|o| o.is_some());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (label, tip) = if self.paused { ("Resume", "Resume the simulation (Space)") } else { ("Pause", "Pause the simulation (Space)") };
                 if ui.add(egui::Button::new(label).min_size(Vec2::new(84.0, 0.0))).on_hover_text(tip).clicked() {
@@ -373,6 +400,10 @@ impl App {
             self.roller_settings(ui);
             return;
         }
+        if self.tool.kind == ToolKind::Sponge {
+            self.sponge_settings(ui);
+            return;
+        }
         num(ui, "Height", &mut self.tool.height, 0.002, 1.0, 100.0, " cm", true);
         match self.tool.kind {
             ToolKind::Stick => {
@@ -420,8 +451,32 @@ impl App {
                 ui.add(egui::Label::new(RichText::new("Drag to level the paint under the blade to the gap. Excess is carried on the blade and spread into thin or bare spots further on; surplus squeezes out as ridges along both ends, and lifting the knife leaves an end ridge.").small().weak()).wrap());
             }
             ToolKind::Brush => self.brush_settings(ui),
-            ToolKind::Roller => {}
+            ToolKind::Roller | ToolKind::Sponge => {}
         }
+    }
+
+    fn sponge_settings(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.sponge;
+        num(ui, "Size", &mut s.size, 0.02, 0.15, 1e3, " mm", false);
+        num(ui, "Density", &mut s.density, 0.15, 1.0, 100.0, " %", false);
+        num(ui, "Pressure", &mut s.pressure, 0.0, 1.0, 100.0, " %", false);
+        num(ui, "Flow", &mut s.transfer, 0.2, 3.0, 100.0, " %", false);
+        prop(ui, "Load", |ui| {
+            let frac = (s.load() / s.capacity()).clamp(0.0, 1.0) as f32;
+            ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.2} mL", s.load() * 1e6)).small()));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Load sponge").on_hover_text("R: soak it in the current mix").clicked() {
+                self.sponge.dip(&self.paint.frac);
+            }
+            if ui.button("Add colour").on_hover_text("Dab the current mix into patches of the sponge for mottled multi-colour prints").clicked() {
+                self.sponge.dab_colour(&self.paint.frac);
+            }
+            if ui.button("Clean").clicked() {
+                self.sponge.clean();
+            }
+        });
+        ui.add(egui::Label::new(RichText::new("Press to dab: the sponge squashes and gives more paint the longer and harder you press. Drag for streaky broken colour. Each new dab lands at a new angle. A dry sponge soaks up wet paint, a saturated one gives it. The wheel or pen sets the pressure.").small().weak()).wrap());
     }
 
     fn roller_settings(&mut self, ui: &mut egui::Ui) {
@@ -454,7 +509,7 @@ impl App {
         let mut size = self.brush.size() * 1e3;
         let mut len = self.brush.len * 1e3;
         let mut n = self.brush.bristles.len();
-        let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 3.0, 60.0, 1.0, " mm", false);
+        let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 3.0, 150.0, 1.0, " mm", false);
         let c2 = num(ui, "Bristle length", &mut len, 10.0, 60.0, 1.0, " mm", false);
         let c3 = num(ui, "Bristles", &mut n, 16.0, 400.0, 1.0, "", false);
         if shape != self.brush.shape || c1 || c2 || c3 {
@@ -486,9 +541,15 @@ impl App {
         parts.sort_by(|a, b| b.0.total_cmp(&a.0));
         let desc = parts.iter().take(3).map(|(f, n)| format!("{:.0}% {}", f * 100.0, n)).collect::<Vec<_>>().join(", ");
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), egui::Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), egui::Sense::click());
             ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
-            ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
+            let stroke = if resp.hovered() { Stroke::new(1.5, Color32::from_gray(220)) } else { Stroke::new(1.0, Color32::from_gray(90)) };
+            ui.painter().rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+            let resp = resp.on_hover_text("Click to pick any colour");
+            if resp.clicked() {
+                self.paint_pick = rgb;
+            }
+            self.paint_picker(ui, &resp, rgb);
             ui.add(egui::Label::new(RichText::new(if desc.is_empty() { "No pigment".to_string() } else { desc }).small()).wrap());
         });
         ui.add_space(4.0);
@@ -519,6 +580,31 @@ impl App {
                 }
             }
         });
+        if !self.custom_mixes.is_empty() {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.label(RichText::new("Custom").small().weak());
+                let mut pick = None;
+                for (k, m) in self.custom_mixes.iter().enumerate() {
+                    let c = swatch_color(color::mix_rgb(&self.film.pigments, &self.film.cmf_table, m));
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 3.0, c);
+                    let same = (0..color::NPIG).all(|i| (m[i] - self.paint.frac[i] / total).abs() < 1e-4);
+                    let stroke = if same { Stroke::new(2.0, ACCENT) } else if resp.hovered() { Stroke::new(1.0, Color32::from_gray(200)) } else { Stroke::new(1.0, Color32::from_gray(70)) };
+                    ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                    if resp.on_hover_text("Click: use this colour").clicked() {
+                        pick = Some(k);
+                    }
+                }
+                if let Some(k) = pick {
+                    let m = self.custom_mixes[k];
+                    for i in 0..color::NPIG {
+                        self.paint.frac[i] = m[i];
+                    }
+                }
+            });
+        }
         ui.add_space(4.0);
         prop(ui, "Preset", |ui| {
             if ui.button("Enamel").on_hover_text("Fluid house paint, Pollock's choice").clicked() {
@@ -571,15 +657,39 @@ impl App {
                 }
             });
         }
+        prop(ui, "Background with", |ui| {
+            for (m, label, tip) in [
+                (pollock::GroundMethod::Auto, "Auto", "Let the painter choose: brushed, poured, washed, scraped or tilted"),
+                (pollock::GroundMethod::Brush, "Brush", "Scrub the ground on with a wide flat brush"),
+                (pollock::GroundMethod::Bucket, "Bucket", "Pour pools from a bucket that flow into each other"),
+            ] {
+                if ui.selectable_label(self.ground_method == m, label).on_hover_text(tip).clicked() {
+                    self.ground_method = m;
+                }
+            }
+        });
+        if self.ground_method != pollock::GroundMethod::Auto {
+            let (k, label, hi) = if self.ground_method == pollock::GroundMethod::Brush { (0, "Brush strokes", 200) } else { (1, "Bucket pours", 60) };
+            prop(ui, label, |ui| {
+                ui.add(egui::Slider::new(&mut self.ground_strokes[k], 1..=hi).clamping(egui::SliderClamping::Edits));
+            });
+        }
         ui.add_space(4.0);
         ui.add_enabled_ui(!running, |ui| {
             ui.horizontal(|ui| {
                 let bw = ((ui.available_width() - 6.0) * 0.5).max(60.0);
                 if ui.add(egui::Button::new("Paint background").min_size(Vec2::new(bw, 26.0))).on_hover_text("Lay the ground in the two background colours, then let it dry").clicked() {
                     let seed = rand::random::<u64>() % 100000;
-                    self.painter = Some(pollock::Painter::background(seed, w, h, self.pollock_pal.clone()));
+                    self.begin_full();
+                    let strokes = match self.ground_method {
+                        pollock::GroundMethod::Auto => 0,
+                        pollock::GroundMethod::Brush => self.ground_strokes[0],
+                        pollock::GroundMethod::Bucket => self.ground_strokes[1],
+                    };
+                    self.painter = Some(pollock::Painter::background(seed, w, h, self.pollock_pal.clone(), self.ground_method, strokes));
                 }
                 if ui.add(egui::Button::new("Paint foreground").min_size(Vec2::new(bw, 26.0))).on_hover_text("Pour, drip and fling the four foreground colours on top of what is there. Press again for another round").clicked() {
+                    self.begin_full();
                     match self.painter.as_mut() {
                         Some(p) => p.paint_foreground(self.pollock_pal.clone()),
                         None => {
@@ -602,6 +712,7 @@ impl App {
                 let full = egui::Button::new(RichText::new("Full painting").strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
                 if ui.add(full).on_hover_text("Background, foreground and two or three more rounds of lines with this palette").clicked() {
                     let seed = rand::random::<u64>() % 100000;
+                    self.begin_full();
                     self.painter = Some(pollock::Painter::full(seed, w, h, self.pollock_pal.clone()));
                 }
             }
@@ -615,6 +726,46 @@ impl App {
     pub(crate) fn sync_pal_picks(&mut self) {
         for s in 0..pollock::Palette::SLOTS {
             self.pal_picks[s] = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.pollock_pal.slot_mix(s));
+        }
+    }
+
+    fn paint_picker(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rgb: [f32; 3]) {
+        let popup = egui::Popup::from_toggle_button_response(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_width(240.0);
+            ui.label(RichText::new("Pick a colour").strong());
+            ui.spacing_mut().slider_width = 210.0;
+            let mut c = swatch_color(self.paint_pick);
+            if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+                self.paint_pick = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+                let mix = pollock::match_rgb(self.paint_pick);
+                for i in 0..color::NPIG {
+                    self.paint.frac[i] = mix[i];
+                }
+            }
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 3.0, swatch_color(self.paint_pick));
+                ui.label(RichText::new("picked").small().weak());
+                let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 3.0, swatch_color(rgb));
+                ui.label(RichText::new("paint").small().weak());
+            });
+            ui.label(RichText::new("The colour is mixed from the twelve pigments, so very saturated colours come out as the closest real paint. Thinner and yield stress are kept.").small().weak());
+            ui.separator();
+            if ui.button("Save to custom colours").clicked() {
+                let total: f32 = self.paint.frac[..color::NPIG].iter().sum::<f32>().max(1e-6);
+                let mut m = [0.0f32; 16];
+                for i in 0..color::NPIG {
+                    m[i] = self.paint.frac[i] / total;
+                }
+                self.custom_mixes.retain(|o| (0..color::NPIG).any(|i| (o[i] - m[i]).abs() > 1e-4));
+                self.custom_mixes.insert(0, m);
+                self.custom_mixes.truncate(12);
+            }
+        });
+        if let Some(p) = popup {
+            self.block_rects.push(p.response.rect);
+            self.menu_open = true;
         }
     }
 
@@ -683,6 +834,105 @@ impl App {
         });
     }
 
+    pub(crate) fn save_current(&mut self) {
+        if self.history.name.is_empty() {
+            self.save_dialog = Some(String::new());
+        } else {
+            let name = self.history.name.clone();
+            self.save_painting(&name);
+        }
+    }
+
+    fn open_gallery(&mut self) {
+        let ctx = self.ui.ctx.clone();
+        self.gallery = session::list_paintings()
+            .into_iter()
+            .map(|p| {
+                let tex = image::open(session::thumb_path(&p.path)).ok().map(|img| {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    ctx.load_texture(p.name.clone(), egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR)
+                });
+                (p, tex)
+            })
+            .collect();
+        self.show_gallery = true;
+    }
+
+    fn file_windows(&mut self, ctx: &egui::Context) {
+        if let Some(mut name) = self.save_dialog.take() {
+            let mut keep = true;
+            let mut save = false;
+            if let Some(r) = egui::Window::new("Save painting").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label("Name");
+                let edit = ui.add(egui::TextEdit::singleline(&mut name).desired_width(260.0).hint_text("my painting"));
+                if !self.save_focus {
+                    edit.request_focus();
+                    self.save_focus = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            }) {
+                self.block_rects.push(r.response.rect);
+            }
+            let clean: String = name.trim().chars().filter(|c| c.is_alphanumeric() || " -_".contains(*c)).collect();
+            if save && !clean.is_empty() && clean != session::AUTOSAVE_NAME {
+                self.save_painting(&clean);
+                keep = false;
+            }
+            if keep {
+                self.save_dialog = Some(name);
+            } else {
+                self.save_focus = false;
+            }
+        }
+        if self.show_gallery {
+            let mut open = true;
+            let mut chosen = None;
+            if let Some(r) = egui::Window::new("Open painting").open(&mut open).collapsible(false).default_size([820.0, 560.0]).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                if self.gallery.is_empty() {
+                    ui.label(RichText::new(format!("No saved paintings yet. Save with Ctrl+S; they go to the {} folder.", session::PAINTINGS_DIR)).weak());
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(12.0, 12.0);
+                        for (k, (p, tex)) in self.gallery.iter().enumerate() {
+                            ui.vertical(|ui| {
+                                let resp = match tex {
+                                    Some(t) => ui.add(egui::Button::image(egui::Image::new(t).fit_to_exact_size(Vec2::new(240.0, 160.0)))),
+                                    None => ui.add(egui::Button::new("no preview").min_size(Vec2::new(240.0, 160.0))),
+                                };
+                                let label = if p.name == session::AUTOSAVE_NAME { "Last session (autosave)".to_string() } else { p.name.clone() };
+                                ui.label(RichText::new(label).small());
+                                if resp.clicked() {
+                                    chosen = Some(k);
+                                }
+                            });
+                        }
+                    });
+                });
+            }) {
+                self.block_rects.push(r.response.rect);
+            }
+            if let Some(k) = chosen {
+                let path = self.gallery[k].0.path.clone();
+                self.show_gallery = false;
+                self.open_painting(&path);
+            } else {
+                self.show_gallery = open;
+            }
+        }
+    }
+
     fn help(ui: &mut egui::Ui) {
         egui::Grid::new("controls").num_columns(2).spacing([24.0, 6.0]).striped(true).show(ui, |ui| {
             for (k, v) in [
@@ -691,7 +941,7 @@ impl App {
                 ("Middle drag", "Pan"),
                 ("Wheel", "Tool height (brush: pressure)"),
                 ("Ctrl + wheel,  + / -", "Zoom"),
-                ("1 – 7", "Select tool"),
+                ("1 – 8", "Select tool"),
                 ("R", "Reload stick, dip brush or load roller"),
                 ("T", "Top view"),
                 ("B", "Beauty render, top"),
@@ -699,6 +949,8 @@ impl App {
                 ("Space", "Pause / resume"),
                 ("Tab", "Show / hide inspector"),
                 ("F12", "Save screenshot"),
+                ("Ctrl+Z", "Undo"),
+                ("Ctrl+S", "Save painting"),
             ] {
                 ui.label(RichText::new(k).strong());
                 ui.label(v);

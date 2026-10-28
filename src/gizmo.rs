@@ -30,6 +30,7 @@ pub struct GizmoCtx {
     pub paint: [f32; 3],
     pub px: f64,
     pub knife_gap: f64,
+    pub sponge_radius: f64,
     pub knife_fill: f32,
     pub knife_paint: [f32; 3],
     pub pour_radius: f64,
@@ -221,6 +222,11 @@ pub fn tool_gizmo(verts: &mut Vec<TubeVertex>, idx: &mut Vec<u32>, tool: &Tool, 
                 let foot_l = DVec3::new(tip_l.x, tip_l.y, SURFACE_LIFT);
                 let foot_r = DVec3::new(tip_r.x, tip_r.y, SURFACE_LIFT);
                 push_mark(verts, idx, &[foot_l, foot_r], line * 0.7, ACCENT);
+            }
+        }
+        ToolKind::Sponge => {
+            if let (Some(g), false) = (cx.ground, tool.flowing) {
+                push_ring(verts, idx, DVec3::new(g.x, g.y, SURFACE_LIFT), cx.sponge_radius, line * 0.7, ACCENT);
             }
         }
         ToolKind::Brush | ToolKind::Roller => {}

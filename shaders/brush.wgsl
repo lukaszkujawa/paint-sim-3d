@@ -15,6 +15,8 @@ struct Contact {
 const RES_UNIT: f32 = 1e15;
 const LEAVE_FILM: f32 = 8e-5;
 const CONTACT_ROLLER: u32 = 1u;
+const CONTACT_SPONGE: u32 = 2u;
+const SPONGE_FILM: f32 = 1e-5;
 
 fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let ab = b - a;
@@ -35,7 +37,7 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
     if n == 0u { return; }
     let c = idx(id.x, id.y);
     let hv = h[c];
-    if hv <= LEAVE_FILM { return; }
+    if hv <= SPONGE_FILM { return; }
     let start = range.x;
     let p = (vec2<f32>(id.xy) + vec2<f32>(0.5)) * P.dx;
     var cap = 1e9;
@@ -49,10 +51,13 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
             if k.pad == CONTACT_ROLLER {
                 cc = max(k.zb, LEAVE_FILM);
             }
+            if k.pad == CONTACT_SPONGE {
+                cc = max(k.zb, SPONGE_FILM);
+            }
             if cc < cap {
                 cap = cc;
                 who = k.bristle;
-                if k.pad == CONTACT_ROLLER {
+                if k.pad == CONTACT_ROLLER || k.pad == CONTACT_SPONGE {
                     method = METHOD_ROLLER;
                     stroke = vec2<f32>(k.p1.y - k.p0.y, k.p0.x - k.p1.x);
                 } else {

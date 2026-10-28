@@ -1,3 +1,5 @@
+const OIL_SHRINK: f32 = 0.04;
+
 fn composition_rheo(s: Stack) -> vec2<f32> {
     var total = 0.0;
     var lnmu = 0.0;
@@ -70,7 +72,7 @@ fn cure_step(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         store_refl(c, r);
         committed += s.th[0];
-        m[c] = m[c] + s.th[0];
+        m[c] = m[c] + s.th[0] * (1.0 - OIL_SHRINK) * (1.0 - clamp(s.pg[0][12], 0.0, 0.95));
         s.th[0] = 0.0;
         s.cu[0] = 0.0;
         stack_compact(&s);

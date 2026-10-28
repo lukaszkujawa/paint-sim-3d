@@ -336,6 +336,97 @@ impl Default for FilmSettings {
 
 const FULL_SHADE_EVERY: u32 = 1;
 
+pub const KNIFE_JOURNAL_REACH: f32 = 0.08;
+pub const JOURNAL_CELL_BYTES: u64 = 212;
+
+pub struct Journal {
+    pub gen: u32,
+    pub cap: u32,
+    pub touch: Vec<u32>,
+    pub touched: bool,
+    params: wgpu::Buffer,
+    jhead: wgpu::Buffer,
+    touch_buf: wgpu::Buffer,
+    best: wgpu::Buffer,
+    pub bg: wgpu::BindGroup,
+    pub p_journal: wgpu::ComputePipeline,
+    p_scan: wgpu::ComputePipeline,
+    p_apply: wgpu::ComputePipeline,
+    head_read: wgpu::Buffer,
+}
+
+impl Journal {
+    fn new(gpu: &Gpu, common: &str, layouts: [&wgpu::BindGroupLayout; 3], ntiles: u32) -> Self {
+        let tile_bytes = JOURNAL_CELL_BYTES * 256;
+        let limit = (gpu.device.limits().max_storage_buffer_binding_size as u64).min(gpu.device.limits().max_buffer_size);
+        let budget: u64 = std::env::var("PAINT_UNDO_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(384) * 1024 * 1024;
+        let cap = (budget.min(limit) / tile_bytes).max(64) as u32;
+        let params = gpu.uniform("journal_params", 16);
+        let jmeta = gpu.storage("jmeta", cap as u64 * 16);
+        let jdata = gpu.storage("jdata", cap as u64 * tile_bytes);
+        let jhead = gpu.storage("jhead", 16);
+        let touch_buf = gpu.storage("touch", ntiles as u64 * 4);
+        let jmark = gpu.storage("jmark", ntiles as u64 * 4);
+        let best = gpu.storage("best", ntiles as u64 * 4);
+        let (lj, bg) = BindBuilder::new(wgpu::ShaderStages::COMPUTE)
+            .uniform(&params)
+            .storage(&jmeta, false)
+            .storage(&jdata, false)
+            .storage(&jhead, false)
+            .storage(&touch_buf, true)
+            .storage(&jmark, false)
+            .storage(&best, false)
+            .build(&gpu.device, "journal");
+        let src = format!("{}\n{}", common, include_str!("../../shaders/journal.wgsl"));
+        let sm = gpu.shader("journal", &src);
+        let l: [&wgpu::BindGroupLayout; 4] = [layouts[0], layouts[1], &lj, layouts[2]];
+        let p_journal = compute_pipeline(&gpu.device, "journal", &sm, "journal", &l);
+        let p_scan = compute_pipeline(&gpu.device, "restore_scan", &sm, "restore_scan", &l);
+        let p_apply = compute_pipeline(&gpu.device, "restore_apply", &sm, "restore_apply", &l);
+        let head_read = gpu.readback("jhead_r", 16);
+        Self { gen: 0, cap, touch: vec![0; ntiles as usize], touched: false, params, jhead, touch_buf, best, bg, p_journal, p_scan, p_apply, head_read }
+    }
+
+    fn write_params(&self, gpu: &Gpu, target: u32) {
+        gpu.queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[self.gen, self.cap, target, 0u32]));
+    }
+
+    fn flush(&mut self, gpu: &Gpu) {
+        self.write_params(gpu, 0);
+        gpu.queue.write_buffer(&self.touch_buf, 0, bytemuck::cast_slice(&self.touch));
+        if self.touched {
+            self.touch.iter_mut().for_each(|t| *t = 0);
+            self.touched = false;
+        }
+    }
+
+    pub fn head(&self, gpu: &Gpu) -> u32 {
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("jhead") });
+        enc.copy_buffer_to_buffer(&self.jhead, 0, &self.head_read, 0, 16);
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        self.head_read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let v: u32 = bytemuck::cast_slice::<u8, u32>(&self.head_read.slice(..).get_mapped_range().expect("map"))[0];
+        self.head_read.unmap();
+        v
+    }
+
+    fn restore(&self, gpu: &Gpu, groups: [&wgpu::BindGroup; 3], target: u32) {
+        self.write_params(gpu, target);
+        let nt = self.touch.len();
+        gpu.queue.write_buffer(&self.best, 0, bytemuck::cast_slice(&vec![u32::MAX; nt]));
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("restore") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("restore"), timestamp_writes: None });
+            let g = [groups[0], groups[1], &self.bg, groups[2]];
+            dispatch(&mut pass, &self.p_scan, &g, (self.cap + 63) / 64, 1, 1);
+            dispatch(&mut pass, &self.p_apply, &g, self.cap.min(65535), (self.cap + 65534) / 65535, 1);
+        }
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        self.write_params(gpu, 0);
+    }
+}
+
 pub struct Film {
     pub w: u32,
     pub h: u32,
@@ -452,6 +543,8 @@ pub struct Film {
     p_cure: wgpu::ComputePipeline,
     p_shade: wgpu::ComputePipeline,
     pub max_deposits: usize,
+    pub journal: Journal,
+    pub tile_moved: wgpu::Buffer,
     pub h_max: f32,
     pub s_max: f32,
     pub mu_min: f32,
@@ -667,6 +760,7 @@ impl Film {
         let sm_cure = gpu.shader("cure", &cure_src);
         let sm_shade = gpu.shader("shade", &shade_src);
         let d = &gpu.device;
+        let journal = Journal::new(gpu, &common, [&l0, &l1, &l_tiles], tiles16[0] * tiles16[1]);
         let lf: [&wgpu::BindGroupLayout; 4] = [&l0, &l1, &l_fac, &l_tiles];
         let ls: [&wgpu::BindGroupLayout; 4] = [&l0, &l1, &l_fac, &l_tiles];
         let p_lap = compute_pipeline(d, "laplacian", &sm_film, "laplacian", &lf);
@@ -729,7 +823,7 @@ impl Film {
         let mut f = Self {
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
-            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
+            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, detail_tex, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_plug, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
@@ -840,6 +934,7 @@ impl Film {
                     let data: &[f32] = bytemuck::cast_slice(&view);
                     let np = coarse.len().min(data.len() / 2);
                     coarse[..np].copy_from_slice(&data[..np]);
+                    self.s_max = data[..np].iter().fold(0.0f32, |a, &v| if v.is_finite() { a.max(v) } else { a });
                     let ns = sub.len().min(np);
                     sub[..ns].copy_from_slice(&data[np..np + ns]);
                 }
@@ -911,6 +1006,14 @@ impl Film {
     pub fn set_knife(&mut self, gpu: &Gpu, k: Option<KnifeParams>) {
         let p = k.unwrap_or_default();
         self.knife_active = p.active != 0;
+        if self.knife_active {
+            let reach = KNIFE_JOURNAL_REACH + p.sweep;
+            let minx = p.a[0].min(p.b[0]) - reach;
+            let maxx = p.a[0].max(p.b[0]) + reach;
+            let miny = p.a[1].min(p.b[1]) - reach;
+            let maxy = p.a[1].max(p.b[1]) + reach;
+            self.touch_rect(minx, miny, maxx, maxy);
+        }
         gpu.queue.write_buffer(&self.knife_buf, 0, bytemuck::bytes_of(&p));
     }
 
@@ -928,6 +1031,7 @@ impl Film {
             let maxx = c.p0[0].max(c.p1[0]) + c.r;
             let miny = c.p0[1].min(c.p1[1]) - c.r;
             let maxy = c.p0[1].max(c.p1[1]) + c.r;
+            self.touch_rect(minx, miny, maxx, maxy);
             if maxx < 0.0 || maxy < 0.0 || minx > self.settings.width_m || miny > self.settings.height_m || !(minx.is_finite() && miny.is_finite()) {
                 continue;
             }
@@ -1051,6 +1155,7 @@ impl Film {
         for (di, d) in deps.iter().enumerate().take(count) {
             self.h_max_pending = self.h_max_pending.max(d.max_height() + self.h_max);
             let rb = d.max_radius();
+            self.touch_rect(d.p0[0].min(d.p1[0]) - rb, d.p0[1].min(d.p1[1]) - rb, d.p0[0].max(d.p1[0]) + rb, d.p0[1].max(d.p1[1]) + rb);
             let inside = d.p0[0].max(d.p1[0]) + rb > 0.0 && d.p0[1].max(d.p1[1]) + rb > 0.0 && d.p0[0].min(d.p1[0]) - rb < self.settings.width_m && d.p0[1].min(d.p1[1]) - rb < self.settings.height_m;
             if !inside { continue; }
             if d.kind & DEPOSIT_RECYCLED == 0 {
@@ -1113,6 +1218,82 @@ impl Film {
         self.needs_full_shade = true;
     }
 
+    pub fn touch_rect(&mut self, minx: f32, miny: f32, maxx: f32, maxy: f32) {
+        if self.journal.gen == 0 || !(minx.is_finite() && miny.is_finite() && maxx.is_finite() && maxy.is_finite()) {
+            return;
+        }
+        let tile_m = 16.0 * self.dx;
+        let tw = self.tiles16[0] as i64;
+        let th = self.tiles16[1] as i64;
+        let x0 = ((minx / tile_m).floor() as i64).clamp(0, tw - 1);
+        let x1 = ((maxx / tile_m).floor() as i64).clamp(0, tw - 1);
+        let y0 = ((miny / tile_m).floor() as i64).clamp(0, th - 1);
+        let y1 = ((maxy / tile_m).floor() as i64).clamp(0, th - 1);
+        if maxx < 0.0 || maxy < 0.0 {
+            return;
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.journal.touch[(y * tw + x) as usize] = 1;
+            }
+        }
+        self.journal.touched = true;
+    }
+
+    pub fn flush_journal(&mut self, gpu: &Gpu) {
+        self.journal.flush(gpu);
+    }
+
+    pub fn restore_journal(&mut self, gpu: &Gpu, target: u32) {
+        self.journal.restore(gpu, [&self.bg0, &self.bg1, &self.bg_tiles], target);
+        self.needs_full_shade = true;
+    }
+
+    fn state_buffers(&self) -> [&wgpu::Buffer; 8] {
+        [&self.h_buf, &self.m_buf, &self.rheo, &self.strata_h, &self.strata_pig, &self.strata_cure, &self.sub_refl, &self.lay]
+    }
+
+    pub fn read_state(&self, gpu: &Gpu) -> Vec<Vec<u8>> {
+        let bufs = self.state_buffers();
+        let reads: Vec<wgpu::Buffer> = bufs.iter().map(|b| gpu.readback("state_r", b.size())).collect();
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("state") });
+        for (b, r) in bufs.iter().zip(&reads) {
+            enc.copy_buffer_to_buffer(b, 0, r, 0, b.size());
+        }
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        for r in &reads {
+            r.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        reads
+            .iter()
+            .map(|r| {
+                let v = r.slice(..).get_mapped_range().expect("map").to_vec();
+                r.unmap();
+                v
+            })
+            .collect()
+    }
+
+    pub fn write_state(&mut self, gpu: &Gpu, parts: &[Vec<u8>]) -> bool {
+        let bufs = self.state_buffers();
+        if parts.len() != bufs.len() || parts.iter().zip(bufs.iter()).any(|(p, b)| p.len() as u64 != b.size()) {
+            return false;
+        }
+        for (p, b) in parts.iter().zip(bufs.iter()) {
+            gpu.queue.write_buffer(b, 0, p);
+        }
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("state_w") });
+        for b in [&self.lap, &self.flux, &self.flux_s, &self.alpha, &self.delta, &self.tmp, &self.acc_s, &self.strata_h2, &self.strata_pig2, &self.alpha_s] {
+            enc.clear_buffer(b, 0, None);
+        }
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        let nt = (self.tiles16[0] * self.tiles16[1]) as usize;
+        gpu.queue.write_buffer(&self.tile_moved, 0, bytemuck::cast_slice(&vec![1u32; nt]));
+        self.needs_full_shade = true;
+        true
+    }
+
     pub fn encode_frame(&mut self, enc: &mut wgpu::CommandEncoder, substeps: u32) {
         let (gx, gy) = self.groups();
         let nt16 = self.tiles16[0] * self.tiles16[1];
@@ -1120,6 +1301,9 @@ impl Film {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pre"), timestamp_writes: None });
             let g = &self.bg_tiles;
+            if self.journal.gen != 0 {
+                dispatch(&mut pass, &self.journal.p_journal, &[&self.bg0, &self.bg1, &self.journal.bg, g], self.tiles16[0], self.tiles16[1], 1);
+            }
             if self.contact_count > 0 {
                 dispatch(&mut pass, &self.p_brush, &[&self.bg0, &self.bg1, &self.bg_brush, g], gx, gy, 1);
             }

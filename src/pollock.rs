@@ -66,6 +66,13 @@ pub struct Palette {
     accents: Vec<Paint>,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GroundMethod {
+    Auto,
+    Brush,
+    Bucket,
+}
+
 struct Layer {
     name: String,
     mix: [f32; 16],
@@ -84,6 +91,7 @@ struct Layer {
     tilt: (f64, f64),
     margin: f64,
     edge_bias: bool,
+    strokes: usize,
 }
 
 struct Gesture {
@@ -121,6 +129,7 @@ pub struct Painter {
     reload_pending: bool,
     ground_angle: f64,
     stroke_len: f64,
+    layer_strokes: usize,
     dip_len: f64,
     stroke_mix: [f32; 16],
     cover: Vec<f32>,
@@ -772,7 +781,7 @@ fn layer(name: String, p: &Paint, style: Style, duration: f64) -> Layer {
         Style::Scrape => (0.18, 0.0, 0.0, 0.01, 0.0),
         Style::Scrub => (0.2, 0.0, 0.62, 0.01, 0.0),
     };
-    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, brush_width: 0.09, shades: Vec::new(), tilt: (0.0, 0.0), margin: GROUND_MARGIN_FLOATING, edge_bias: false }
+    Layer { name, mix: p.mix, mu: p.mu, style, duration, pace, loop_chance, height_median, stick_diameter, flow, pour_radius: 0.02, knife_width: 0.08, brush_width: 0.09, shades: Vec::new(), tilt: (0.0, 0.0), margin: GROUND_MARGIN_FLOATING, edge_bias: false, strokes: 0 }
 }
 
 fn shade(rng: &mut StdRng, base: &[f32; 16], partner: &[f32; 16], light: f32, dark: f32, cross: f32) -> [f32; 16] {
@@ -805,12 +814,12 @@ fn shades(rng: &mut StdRng, base: &Paint, partner: &Paint, pass: usize) -> Vec<[
 }
 
 fn plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
-    let (mut layers, ground) = ground_plan(rng, pal);
+    let (mut layers, ground) = ground_plan(rng, pal, GroundMethod::Auto, 0);
     layers.extend(figure(rng, pal));
     (layers, ground)
 }
 
-fn ground_plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
+fn ground_plan(rng: &mut StdRng, pal: &Palette, method: GroundMethod, strokes: usize) -> (Vec<Layer>, String) {
     let mut layers: Vec<Layer> = Vec::new();
     let dry = |rng: &mut StdRng, layers: &mut Vec<Layer>, chance: f64| {
         if rng.random::<f64>() < chance {
@@ -818,7 +827,11 @@ fn ground_plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
         }
     };
     let grounds = [("brushed", 6.0), ("raw canvas", 0.5), ("floods", 1.0), ("washes", 1.0), ("scraped", 0.8), ("tilt run", 0.8)];
-    let ground = *weighted(rng, &grounds);
+    let ground = match method {
+        GroundMethod::Auto => *weighted(rng, &grounds),
+        GroundMethod::Brush => "brushed",
+        GroundMethod::Bucket => "floods",
+    };
     let mut gcols: Vec<Paint> = pal.ground.clone();
     if gcols.len() > 1 && rng.random::<f64>() < 0.3 {
         gcols.swap(0, 1);
@@ -862,10 +875,33 @@ fn ground_plan(rng: &mut StdRng, pal: &Palette) -> (Vec<Layer>, String) {
                 l.edge_bias = true;
                 layers.push(l);
             }
-            if rng.random::<f64>() < 0.35 {
+            if method == GroundMethod::Auto && rng.random::<f64>() < 0.35 {
                 let p = &gcols[gcols.len() - 1];
                 let d = rng.random_range(6.0..10.0);
                 layers.push(layer(format!("{} flood", p.name), p, Style::Flood, d));
+            }
+            if strokes > 0 {
+                layers.truncate(strokes);
+                let total: f64 = layers.iter().map(|l| l.duration).sum();
+                let mut left = strokes;
+                for k in (1..layers.len()).rev() {
+                    let n = ((strokes as f64 * layers[k].duration / total).round() as usize).clamp(1, left - k);
+                    layers[k].strokes = n;
+                    left -= n;
+                }
+                layers[0].strokes = left;
+            }
+        }
+        "floods" if strokes > 0 => {
+            let chunk = strokes.div_ceil(6).max(1);
+            let mut k = 0;
+            while k < strokes {
+                let n = chunk.min(strokes - k);
+                let p = &gcols[(k / chunk) % gcols.len()];
+                let mut l = layer(format!("{} flood", p.name), p, Style::Flood, 1.0);
+                l.strokes = n;
+                layers.push(l);
+                k += n;
             }
         }
         "floods" => {
@@ -1133,9 +1169,9 @@ impl Painter {
         Self::assemble(rng, seed, w, h, pal, layers, ground, rounds, true)
     }
 
-    pub fn background(seed: u64, w: f64, h: f64, pal: Palette) -> Self {
+    pub fn background(seed: u64, w: f64, h: f64, pal: Palette, method: GroundMethod, strokes: usize) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let (layers, ground) = ground_plan(&mut rng, &pal);
+        let (layers, ground) = ground_plan(&mut rng, &pal, method, strokes);
         Self::assemble(rng, seed, w, h, pal, layers, ground, 0, false)
     }
 
@@ -1148,7 +1184,7 @@ impl Painter {
 
     fn assemble(mut rng: StdRng, seed: u64, w: f64, h: f64, pal: Palette, layers: Vec<Layer>, ground: String, rounds: usize, figured: bool) -> Self {
         let total: f64 = layers.iter().map(|l| l.duration).sum();
-        let names: Vec<String> = layers.iter().map(|l| format!("{} {:.0}s", l.name, l.duration)).collect();
+        let names: Vec<String> = layers.iter().map(|l| if l.strokes > 0 { format!("{} x{}", l.name, l.strokes) } else { format!("{} {:.0}s", l.name, l.duration) }).collect();
         log::warn!("pollock seed {} palette {} ground {} total {:.0} s: {}", seed, pal.name, ground, total, names.join(", "));
         let layers_empty = layers.is_empty();
         let pos = DVec2::new(w * rng.random_range(0.2..0.8), h * rng.random_range(0.2..0.8));
@@ -1171,6 +1207,7 @@ impl Painter {
             reload_pending: false,
             ground_angle: 0.0,
             stroke_len: 0.0,
+            layer_strokes: 0,
             dip_len: 0.0,
             stroke_mix: [0.0; 16],
             cover: vec![0.0; COVER_W * COVER_H],
@@ -1236,6 +1273,9 @@ impl Painter {
             return format!("{} on {}: {} layers in {} rounds, paused", self.palette, self.ground, self.layers.len(), self.round + 1);
         }
         let l = &self.layers[self.layer];
+        if l.strokes > 0 {
+            return format!("{} on {}  layer {}/{} {}  stroke {}/{}", self.palette, self.ground, self.layer + 1, self.layers.len(), l.name, self.layer_strokes, l.strokes);
+        }
         format!("{} on {}  layer {}/{} {}  {:.0}/{:.0} s", self.palette, self.ground, self.layer + 1, self.layers.len(), l.name, self.layer_t, l.duration)
     }
 
@@ -1556,9 +1596,12 @@ impl Painter {
         }
         self.t += dt;
         self.layer_t += dt;
-        if self.layer_t >= self.layers[self.layer].duration {
+        let cur = &self.layers[self.layer];
+        let finished = if cur.strokes > 0 { self.layer_strokes >= cur.strokes && self.gesture.as_ref().map(|g| self.t >= g.t_end).unwrap_or(true) } else { self.layer_t >= cur.duration };
+        if finished {
             self.layer += 1;
             self.layer_t = 0.0;
+            self.layer_strokes = 0;
             self.gesture = None;
             self.cut_pending = true;
             self.reload_pending = true;
@@ -1578,6 +1621,7 @@ impl Painter {
                 self.teleport();
             }
             self.new_gesture();
+            self.layer_strokes += 1;
             reload = true;
         }
         self.noise(dt);

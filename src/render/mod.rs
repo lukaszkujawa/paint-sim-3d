@@ -194,6 +194,8 @@ impl Renderer {
 
 pub struct TubeRenderer {
     pub pipeline: wgpu::RenderPipeline,
+    pub ghost: wgpu::RenderPipeline,
+    pub solid: u32,
     pub bg: wgpu::BindGroup,
     pub vbuf: wgpu::Buffer,
     pub ibuf: wgpu::Buffer,
@@ -223,6 +225,28 @@ impl TubeRenderer {
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
             ],
         };
+        let ghost = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tube_ghost"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone())] },
+            primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_ghost"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: gpu.config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tube"),
             layout: Some(&pl),
@@ -250,7 +274,7 @@ impl TubeRenderer {
         let vbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tube_v"), size: (vcap * 36) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let ibuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tube_i"), size: (icap * 4) as u64, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let (depth, depth_view) = Self::make_depth(gpu);
-        Self { pipeline, bg, vbuf, ibuf, vcap, icap, count: 0, depth, depth_view }
+        Self { pipeline, ghost, solid: 0, bg, vbuf, ibuf, vcap, icap, count: 0, depth, depth_view }
     }
 
     fn make_depth(gpu: &Gpu) -> (wgpu::Texture, wgpu::TextureView) {
@@ -274,7 +298,7 @@ impl TubeRenderer {
         self.depth_view = v;
     }
 
-    pub fn upload(&mut self, gpu: &Gpu, verts: &[crate::tools::TubeVertex], idx: &[u32]) {
+    pub fn upload(&mut self, gpu: &Gpu, verts: &[crate::tools::TubeVertex], idx: &[u32], solid: usize) {
         let nv = verts.len().min(self.vcap);
         let mut ni = idx.len().min(self.icap);
         ni -= ni % 3;
@@ -285,6 +309,7 @@ impl TubeRenderer {
             gpu.queue.write_buffer(&self.ibuf, 0, bytemuck::cast_slice(&idx[..ni]));
         }
         self.count = if nv == verts.len() { ni as u32 } else { 0 };
+        self.solid = (solid - solid % 3).min(self.count as usize) as u32;
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass) {
@@ -295,7 +320,13 @@ impl TubeRenderer {
         pass.set_bind_group(0, &self.bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.count, 0, 0..1);
+        if self.solid > 0 {
+            pass.draw_indexed(0..self.solid, 0, 0..1);
+        }
+        if self.count > self.solid {
+            pass.set_pipeline(&self.ghost);
+            pass.draw_indexed(self.solid..self.count, 0, 0..1);
+        }
     }
 }
 

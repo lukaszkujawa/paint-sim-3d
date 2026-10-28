@@ -29,6 +29,7 @@ const KNIFE_CAPACITY_PER_WIDTH: f64 = 5.0e-5;
 const KNIFE_HOLD_PER_WIDTH: f64 = 1.2e-5;
 const KNIFE_SPILL_PER_M: f64 = 2.5;
 const KNIFE_END_RIDGE: f64 = 0.8;
+const PEN_STALE_S: f32 = 0.3;
 const PEN_FLOW_MIN: f64 = 0.1;
 const PEN_FLOW_MAX: f64 = 1.5;
 const PEN_WIDTH_MIN: f32 = 0.35;
@@ -82,6 +83,7 @@ struct App {
     view_fitted: bool,
     pollock_pal: pollock::Palette,
     pen_down: bool,
+    pen_last: Instant,
     pen_raw: f32,
     pen_seen: bool,
     pen_pressure: bool,
@@ -236,6 +238,7 @@ impl App {
             view_fitted: false,
             pollock_pal: pollock::Palette::random(rand::random::<u64>()),
             pen_down: false,
+            pen_last: Instant::now(),
             pen_raw: 0.0,
             pen_seen: false,
             pen_pressure: true,
@@ -1506,12 +1509,16 @@ impl App {
             }
             if w > 0.0 { [c[0] / w, c[1] / w, c[2] / w] } else { [0.5, 0.5, 0.5] }
         };
-        let mut marker = self.air.drops.clone();
+        let (mut tv, mut ti) = tools::tube_mesh(&self.air.rods, &self.air.drops, &color_of);
+        let solid = ti.len();
         if self.tool.kind == ToolKind::Brush {
             let r = self.brush.ferrule_r;
-            marker.push(rod::Drop { x: self.brush.handle, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() });
+            let ferrule = [rod::Drop { x: self.brush.handle, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() }];
+            let (fv, fi) = tools::tube_mesh(&[], &ferrule, &color_of);
+            let base = tv.len() as u32;
+            tv.extend(fv);
+            ti.extend(fi.iter().map(|i| i + base));
         }
-        let (mut tv, mut ti) = tools::tube_mesh(&self.air.rods, &marker, &color_of);
         if self.auto.is_none() && (self.painter_active || !self.cursor_over_panel()) {
             let ground = if self.painter_active { Some(DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0)) } else { self.cam.plane_hit(self.ndc(), 0.0).map(|g| DVec3::new(g.x as f64, g.y as f64, 0.0)) };
             let gx = gizmo::GizmoCtx {
@@ -1534,7 +1541,7 @@ impl App {
             let pc = |comp: &[f32; 16]| color_of(&color::PaintMix { frac: *comp }.normalized().packed());
             self.roller.mesh(&mut tv, &mut ti, self.tool.pos, &pc);
         }
-        self.tubes.upload(&self.gpu, &tv, &ti);
+        self.tubes.upload(&self.gpu, &tv, &ti, solid);
         let ms_mesh = t_mesh.elapsed().as_secs_f32() * 1e3;
         let nverts: usize = self.air.rods.iter().map(|r| r.n()).sum();
 
@@ -1745,7 +1752,12 @@ impl ApplicationHandler for Pending {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if app.pen_down {
-                    return;
+                    if app.pen_last.elapsed().as_secs_f32() < PEN_STALE_S {
+                        return;
+                    }
+                    app.pen_down = false;
+                    app.pen_raw = 0.0;
+                    app.mouse_down[0] = false;
                 }
                 let prev = app.cursor;
                 app.cursor = [position.x as f32, position.y as f32];
@@ -1766,6 +1778,7 @@ impl ApplicationHandler for Pending {
                 }
             }
             WindowEvent::Touch(t) => {
+                app.pen_last = Instant::now();
                 app.cursor = [t.location.x as f32, t.location.y as f32];
                 if let Some(f) = t.force {
                     app.pen_raw = f.normalized() as f32;

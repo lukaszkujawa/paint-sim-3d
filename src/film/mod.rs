@@ -315,7 +315,7 @@ impl Default for FilmSettings {
             lnmu_cure: 5.0,
             v_cap: 1.0,
             tilt_deg: 0.0,
-            tilt_dir_deg: 0.0,
+            tilt_dir_deg: -90.0,
             gravity: 9.81,
             medium_mu: 0.08,
             debug_view: 0,

@@ -45,8 +45,24 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
+const GHOST_NEAR_Z: f32 = 0.004;
+const GHOST_FAR_Z: f32 = 0.16;
+const GHOST_NEAR_ALPHA: f32 = 0.85;
+const GHOST_FAR_ALPHA: f32 = 0.18;
+
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(shade(in), 1.0);
+}
+
+@fragment
+fn fs_ghost(in: VOut) -> @location(0) vec4<f32> {
+    let t = clamp((in.wpos.z - GHOST_NEAR_Z) / (GHOST_FAR_Z - GHOST_NEAR_Z), 0.0, 1.0);
+    let a = mix(GHOST_NEAR_ALPHA, GHOST_FAR_ALPHA, sqrt(t));
+    return vec4<f32>(shade(in), a);
+}
+
+fn shade(in: VOut) -> vec3<f32> {
     let n = normalize(in.nrm);
     let v = normalize(cam.eye.xyz - in.wpos);
     let l = normalize(cam.light.xyz);
@@ -56,5 +72,5 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let fres = 0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
     let env = mix(cam.ground.rgb, cam.sky.rgb, clamp(reflect(-v, n).z * 0.5 + 0.5, 0.0, 1.0));
     let c = in.col * (cam.light.w * ndl + cam.sky.rgb * (0.5 + 0.5 * n.z)) + vec3<f32>(spec * cam.light.w) + env * fres;
-    return vec4<f32>(to_srgb(tonemap(c)), 1.0);
+    return to_srgb(tonemap(c));
 }

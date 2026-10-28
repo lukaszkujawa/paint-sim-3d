@@ -182,11 +182,18 @@ pub fn pigment_table(set: &PigmentSet) -> Vec<f32> {
     t
 }
 
+const SURFACE_K1: f32 = 0.04;
+const SURFACE_K2: f32 = 0.5;
+
+fn surface(r: f32) -> f32 {
+    (1.0 - SURFACE_K1) * (1.0 - SURFACE_K2) * r / (1.0 - SURFACE_K2 * r).max(1e-3)
+}
+
 pub fn masstone_rgb(set: &PigmentSet, cmf: &[f32], i: usize) -> [f32; 3] {
     let p = &set.pigments[i];
     let mut xyz = [0.0f32; 3];
     for b in 0..NBAND {
-        let r = p.reflectance[b];
+        let r = surface(p.reflectance[b]);
         xyz[0] += r * cmf[b * 3];
         xyz[1] += r * cmf[b * 3 + 1];
         xyz[2] += r * cmf[b * 3 + 2];
@@ -226,7 +233,7 @@ fn mix_xyz(set: &PigmentSet, cmf: &[f32], mix: &[f32; 16]) -> ([f32; 3], [f32; 3
             sc += c * p.tint * p.scatter;
         }
         let a = k / sc.max(1e-9);
-        let r_inf = (1.0 + a - (a * a + 2.0 * a).sqrt()).clamp(0.0, 1.0);
+        let r_inf = surface((1.0 + a - (a * a + 2.0 * a).sqrt()).clamp(0.0, 1.0));
         for c in 0..3 {
             xyz[c] += r_inf * cmf[b * 3 + c];
             white[c] += cmf[b * 3 + c];

@@ -30,6 +30,8 @@ const KNIFE_HOLD_PER_WIDTH: f64 = 1.2e-5;
 const KNIFE_SPILL_PER_M: f64 = 2.5;
 const KNIFE_END_RIDGE: f64 = 0.8;
 const KNIFE_BANDS: usize = 8;
+const KNIFE_POSE_HISTORY: usize = 8;
+const KNIFE_PENDING_DECAY: f64 = 0.5;
 const KNIFE_SMEAR: f64 = 0.35;
 const KNIFE_BAND_MIX_PER_M: f64 = 1.2;
 const PEN_STALE_S: f32 = 0.3;
@@ -73,6 +75,8 @@ struct App {
     prev_tool_pos: Option<DVec3>,
     knife_dir: [f64; 2],
     knife_bands: [KnifeBand; KNIFE_BANDS],
+    knife_pending: [f64; KNIFE_BANDS],
+    knife_poses: std::collections::VecDeque<(u32, DVec3, DVec3)>,
     knife_prev: Option<DVec3>,
     knife_track: Option<DVec3>,
     pending_deposits: Vec<Deposit>,
@@ -246,6 +250,8 @@ impl App {
             prev_tool_pos: None,
             knife_dir: [1.0, 0.0],
             knife_bands: [KnifeBand { vol: 0.0, comp: [0.0; 16] }; KNIFE_BANDS],
+            knife_pending: [0.0; KNIFE_BANDS],
+            knife_poses: std::collections::VecDeque::new(),
             knife_prev: None,
             knife_track: None,
             pending_deposits: Vec::new(),
@@ -634,6 +640,35 @@ impl App {
                 paint.frac[12] = 0.2;
                 let d = Deposit::stroke(line(t0), line(t1), 0.003, (1.5e-6 * dt) as f32, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour);
                 self.pending_deposits.push(d);
+            }
+            return true;
+        }
+        if a.script == "tiltoil" {
+            let f = self.frame_index;
+            let w = self.film.settings.width_m as f64;
+            let hgt = self.film.settings.height_m as f64;
+            self.tool.kind = ToolKind::Bucket;
+            self.tool.mu = if a.mu > 0.0 { a.mu } else { 40.0 };
+            self.paint = color::PaintMix::pure(if a.pig >= 0 { a.pig as usize } else { 3 });
+            self.paint.frac[12] = 0.0;
+            self.paint.frac[13] = if a.yield_pa >= 0.0 { a.yield_pa } else { 250.0 };
+            let t = f as f64 / 60.0;
+            let span = 3.0 * a.seed.max(1) as f64;
+            let tilt_at = (60.0 * span) as u64 + 60;
+            if a.seed > 0 {
+                self.tool.pos = DVec3::new(w * (0.25 + 0.5 * (t / span).min(1.0)), hgt * (0.6 + 0.08 * (t * 7.5 / span).sin()), 0.15);
+                self.tool.flowing = f > 5 && (f as f64) < 5.0 + 60.0 * span;
+            } else {
+                self.tool.pos = DVec3::new(w * 0.5, hgt * 0.6, 0.15);
+                self.tool.flowing = f > 5 && f < 90;
+            }
+            self.tool.vel = DVec3::ZERO;
+            if f < tilt_at {
+                self.film.settings.tilt_deg = 0.0;
+            }
+            if f == tilt_at {
+                self.film.settings.tilt_deg = if a.tilt > 0.0 { a.tilt } else { 90.0 };
+                self.film.settings.tilt_dir_deg = -90.0;
             }
             return true;
         }
@@ -1494,10 +1529,15 @@ impl App {
                     let mut fill = [0.0f32; KNIFE_BANDS];
                     let mut smear = [0.0f32; KNIFE_BANDS];
                     for (i, band) in self.knife_bands.iter().enumerate() {
-                        let ratio = (band.vol / need).min(1.0);
+                        let ratio = ((band.vol - self.knife_pending[i]).max(0.0) / need).min(1.0);
                         fill[i] = ratio as f32;
                         smear[i] = (KNIFE_SMEAR * ratio) as f32;
                         pig[i] = color::PaintMix { frac: band.comp }.normalized().packed();
+                        self.knife_pending[i] += need * (1.5 * ratio).min(1.0) * ratio.powf(0.6);
+                    }
+                    self.knife_poses.push_back((self.frame_index as u32, p, blade_dir));
+                    while self.knife_poses.len() > KNIFE_POSE_HISTORY {
+                        self.knife_poses.pop_front();
                     }
                     knife = Some(KnifeParams {
                         a: [a.x as f32, a.y as f32],
@@ -1507,7 +1547,7 @@ impl App {
                         height: gap as f32,
                         half_width: hw as f32,
                         active: 1,
-                        pad0: 0,
+                        frame: self.frame_index as u32,
                         pad1: 0,
                         bands: KNIFE_BANDS as u32,
                         pad2: 0,
@@ -1540,18 +1580,12 @@ impl App {
                     if mix > 0.0 {
                         let old = self.knife_bands;
                         for i in 0..KNIFE_BANDS {
-                            let mut b = KnifeBand { vol: old[i].vol * (1.0 - mix), comp: old[i].comp };
-                            let mut nb = Vec::new();
-                            if i > 0 {
-                                nb.push(i - 1);
+                            let neighbours = [i.checked_sub(1), Some(i + 1).filter(|&n| n < KNIFE_BANDS)];
+                            let given = neighbours.iter().flatten().count() as f64 * 0.5 * mix * old[i].vol;
+                            let mut b = KnifeBand { vol: old[i].vol - given, comp: old[i].comp };
+                            for j in neighbours.iter().flatten() {
+                                b.blend(0.5 * mix * old[*j].vol, &old[*j].comp);
                             }
-                            if i + 1 < KNIFE_BANDS {
-                                nb.push(i + 1);
-                            }
-                            for &j in &nb {
-                                b.blend(old[j].vol * mix / nb.len() as f64, &old[j].comp);
-                            }
-                            b.vol = old[i].vol * (1.0 - mix) + nb.iter().map(|&j| old[j].vol).sum::<f64>() / nb.len() as f64 * mix;
                             self.knife_bands[i] = b;
                         }
                     }
@@ -1581,11 +1615,14 @@ impl App {
             self.knife_track = None;
         }
         self.scrap_total += scraps.iter().map(|s| s.vol.max(0.0) as f64).sum::<f64>();
+        for p in &mut self.knife_pending {
+            *p *= KNIFE_PENDING_DECAY;
+        }
         if !scraps.is_empty() {
-            let centre = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
-            let blade = DVec3::new(-self.knife_dir[1], self.knife_dir[0], 0.0);
             let width = self.tool.knife_width.max(1e-6);
+            let fallback = (DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0), DVec3::new(-self.knife_dir[1], self.knife_dir[0], 0.0));
             for s in &scraps {
+                let (centre, blade) = self.knife_poses.iter().rev().find(|q| q.0 == s.frame).map(|q| (q.1, q.2)).unwrap_or(fallback);
                 let i = (s.cell % self.film.w) as f64 + 0.5;
                 let j = (s.cell / self.film.w) as f64 + 0.5;
                 let cell = DVec3::new(i * self.film.dx as f64, j * self.film.dx as f64, 0.0);
@@ -1594,6 +1631,7 @@ impl App {
                 let vol = s.vol as f64;
                 if vol < 0.0 {
                     self.knife_bands[bi].vol = (self.knife_bands[bi].vol + vol).max(0.0);
+                    self.knife_pending[bi] = (self.knife_pending[bi] + vol).max(0.0);
                     continue;
                 }
                 let mut comp = [0.0f32; 16];

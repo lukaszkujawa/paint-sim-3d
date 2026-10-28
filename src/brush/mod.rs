@@ -180,7 +180,7 @@ impl Brush {
         for s in 1..=k {
             let hk = start.lerp(handle, s as f64 / k as f64);
             let (c, r) = self.substep(hk, dt / k as f64, floor, dx);
-            contacts = c;
+            contacts.extend(c);
             releases.extend(r);
         }
         (contacts, releases)

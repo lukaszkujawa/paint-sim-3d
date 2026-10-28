@@ -926,7 +926,6 @@ fn spec_lobe_aniso(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32
     let hvec = normalize(v + l);
     let a = max(rough * rough, 0.002);
     let a_wide = select(min(a + sin(KEY_HALF_ANGLE), 1.0), max(a, BEAUTY_MIN_ALPHA), beauty_mode());
-    let energy = select((a / a_wide) * (a / a_wide), 1.0, beauty_mode());
     var t = vec3<f32>(tdir, 0.0);
     t = normalize(t - n * dot(t, n));
     let b = cross(n, t);
@@ -936,7 +935,7 @@ fn spec_lobe_aniso(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32
     let ndl = max(dot(n, l), 0.0);
     let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, hvec), 0.0), 5.0);
     let a2 = at * ab;
-    return d_ggx_aniso(n, t, b, hvec, at, ab) * energy * v_smith(ndv, ndl, a2) * f;
+    return d_ggx_aniso(n, t, b, hvec, at, ab) * v_smith(ndv, ndl, a2) * f;
 }
 
 fn d_ggx(ndh: f32, a2: f32) -> f32 {
@@ -955,12 +954,11 @@ fn spec_lobe(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32) -> f
     let a = max(rough * rough, 0.002);
     let a_wide = select(min(a + sin(KEY_HALF_ANGLE), 1.0), max(a, BEAUTY_MIN_ALPHA), beauty_mode());
     let a2 = a_wide * a_wide;
-    let energy = select((a / a_wide) * (a / a_wide), 1.0, beauty_mode());
     let ndh = max(dot(n, hvec), 0.0);
     let ndv = max(dot(n, v), 1e-3);
     let ndl = max(dot(n, l), 0.0);
     let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, hvec), 0.0), 5.0);
-    return d_ggx(ndh, a2) * energy * v_smith(ndv, ndl, a_wide * a_wide) * f;
+    return d_ggx(ndh, a2) * v_smith(ndv, ndl, a_wide * a_wide) * f;
 }
 
 fn env_dfg(f0: f32, rough: f32, ndv: f32) -> f32 {

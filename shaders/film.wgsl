@@ -1,3 +1,7 @@
+const DRAINED_FILM: f32 = 1e-7;
+const WAKE_BAND: u32 = 8u;
+const PLUG_RADIUS: i32 = 3;
+const YIELD_MENISCUS: f32 = 1e-3;
 fn pressure_at(i: i32, j: i32) -> vec2<f32> {
     return pres[idx(refl_i(i), refl_j(j))];
 }
@@ -35,6 +39,56 @@ fn laplacian(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
         }
     }
     pres[c] = vec2<f32>(-P.phys.y * l + disjoining(hv), P.phys.x * P.g.z * (s0 - hold) + pl);
+}
+
+fn yield_cap(gc: vec2<f32>, ty: f32) -> vec2<f32> {
+    let gcl = length(gc);
+    let gc_max = P.phys.y / (YIELD_MENISCUS * YIELD_MENISCUS);
+    if ty <= 0.0 || gcl <= gc_max { return gc; }
+    return gc * (gc_max / gcl);
+}
+
+fn plug_mobility(ca: u32, cb: u32, gtilt: vec2<f32>) -> f32 {
+    let gb = length(gtilt);
+    if gb < 1e-6 { return 0.0; }
+    let up = select(cb, ca, gtilt.x >= 0.0);
+    return tmp[up] * h[up] / gb;
+}
+
+@compute @workgroup_size(16, 16)
+fn plug(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let id = tile_cell(wid, lid);
+    if !in_grid(id) { return; }
+    let c = idx(id.x, id.y);
+    tmp[c] = 0.0;
+    if h[c] <= 0.0 { return; }
+    let gb = P.phys.x * length(P.g.xy);
+    if gb < 1e-6 { return; }
+    var sum = 0.0;
+    var mass = 0.0;
+    var yielding = false;
+    for (var dy = -PLUG_RADIUS; dy <= PLUG_RADIUS; dy++) {
+        for (var dxi = -PLUG_RADIUS; dxi <= PLUG_RADIUS; dxi++) {
+            let x = i32(id.x) + dxi;
+            let y = i32(id.y) + dy;
+            if x < 0 || y < 0 || x >= i32(P.size.x) || y >= i32(P.size.y) { continue; }
+            let n = idx(u32(x), u32(y));
+            let hn = h[n];
+            if hn <= 0.0 { continue; }
+            let r = rheo[n];
+            if r.y > 0.0 { yielding = true; }
+            let q = hb_flux(gb, hn, max(r.x, 1e-4), r.y).x;
+            sum += q;
+            mass += hn;
+        }
+    }
+    if !yielding || mass <= 0.0 { return; }
+    tmp[c] = sum / mass;
+}
+
+fn yield_depth(ca: u32, cb: u32, hf: f32, ty: f32, g: vec2<f32>) -> f32 {
+    if ty <= 0.0 { return hf; }
+    return select(h[cb], h[ca], g.x >= 0.0);
 }
 
 fn hb_flux(gmag: f32, hf: f32, mu: f32, ty: f32) -> vec3<f32> {
@@ -272,13 +326,17 @@ fn face(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>, di
     let ty = wa * ra.y + wb * rb.y;
     let thin = min(ha, hb) / hf;
     let fcap = thin * thin * thin;
-    let g = gcap * fcap + ghyd + gtilt;
+    let g = yield_cap(gcap * fcap, ty) + ghyd + gtilt;
     let gmag = length(g);
-    let qy = hb_flux(gmag, hf, mu, ty);
-    if qy.x <= 0.0 { return out; }
-    let meff = qy.x / gmag;
+    let qy = hb_flux(gmag, yield_depth(ca, cb, hf, ty, g), mu, ty);
+    let meff = select(0.0, qy.x / max(gmag, 1e-9), qy.x > 0.0);
+    var mtilt = meff;
+    if ty > 0.0 {
+        mtilt = plug_mobility(ca, cb, gtilt);
+    }
+    if meff <= 0.0 && mtilt <= 0.0 { return out; }
     let fcap2 = pow(thin, P.front3.w);
-    let qvec = meff * gtilt + min(meff, P.misc.w) * ghyd + min(meff, P.phys.w) * (gcap * fcap2);
+    let qvec = mtilt * gtilt + min(meff, P.misc.w) * ghyd + min(meff, P.phys.w) * (gcap * fcap2);
     var qn = qvec.x;
     let tr = rim_translation(ca, cb, hf, face_dir);
     if wetting {
@@ -778,7 +836,10 @@ fn apply_cell(id: vec3<u32>) -> bool {
     if nb_ok(i - 1, j + 1) { let cn = idx(id.x - 1u, id.y + 1u); nb_face(c, flux[cn].w, cn, ac, &st); }
     let src = st.src;
     let h0 = h[c];
-    let hn = max(h0 - P.dt * st.div * P.inv_dx, 0.0);
+    var hn = max(h0 - P.dt * st.div * P.inv_dx, 0.0);
+    if hn < h0 && hn < DRAINED_FILM {
+        hn = 0.0;
+    }
     h[c] = hn;
     let moved = abs(hn - h0) > MOVE_EPS;
     if h0 <= 0.0 && src != c {
@@ -842,9 +903,9 @@ fn face_mob(ca: u32, cb: u32, gcap: vec2<f32>, ghyd: vec2<f32>, gtilt: vec2<f32>
     let ty = wa * ra.y + wb * rb.y;
     let thin = min(ha, hb) / hf;
     let fcap = thin * thin * thin;
-    let g = gcap * fcap + ghyd + gtilt;
+    let g = yield_cap(gcap * fcap, ty) + ghyd + gtilt;
     let gmag = length(g);
-    let qy = hb_flux(gmag, hf, mu, ty);
+    let qy = hb_flux(gmag, yield_depth(ca, cb, hf, ty, g), mu, ty);
     if qy.x <= 0.0 { return 0.0; }
     var mob = min(max(qy.x / gmag - P.misc.w, 0.0), P.front.z);
     if min(ha, hb) < 0.5 * max(ha, hb) {
@@ -1309,10 +1370,10 @@ fn mark_tiles(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
         let c = idx(i, j);
         if h[c] > 0.0 {
             var bits = 1u;
-            if lid.x < 2u { bits |= 2u; }
-            if lid.x > 13u { bits |= 4u; }
-            if lid.y < 2u { bits |= 8u; }
-            if lid.y > 13u { bits |= 16u; }
+            if lid.x < WAKE_BAND { bits |= 2u; }
+            if lid.x >= 16u - WAKE_BAND { bits |= 4u; }
+            if lid.y < WAKE_BAND { bits |= 8u; }
+            if lid.y >= 16u - WAKE_BAND { bits |= 16u; }
             if abs(h[c] - h_frame[c]) > FRAME_EPS { bits |= MOVED; }
             atomicOr(&wg_any, bits);
         }

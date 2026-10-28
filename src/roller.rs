@@ -137,13 +137,15 @@ impl Roller {
                 let sc = if i >= 13 { 100.0 } else { 1.0 };
                 comp[i] = (r[1 + i] as f64 * 1e-15 * sc / vol) as f32;
             }
+            let valid = |dl: i64| (0..NAP_LANES as i64).contains(&(lane as i64 + dl));
+            let norm: f64 = PICKUP_KERNEL.iter().filter(|t| valid(t.0)).map(|t| t.2).sum();
             for (dl, ds, w) in PICKUP_KERNEL {
-                let l = lane as i64 + dl;
-                if l < 0 || l >= NAP_LANES as i64 {
+                if !valid(dl) {
                     continue;
                 }
+                let l = (lane as i64 + dl) as usize;
                 let sec = (k as i64 + ds).rem_euclid(NAP_SECTORS as i64) as usize;
-                blend(&mut self.cells[l as usize * NAP_SECTORS + sec], vol * w, &comp);
+                blend(&mut self.cells[l * NAP_SECTORS + sec], vol * w / norm, &comp);
             }
             total += vol;
         }
@@ -166,12 +168,11 @@ impl Roller {
                     nb.push((l + 1) * NAP_SECTORS + s);
                 }
                 let me = &old[l * NAP_SECTORS + s];
-                let avg_vol = nb.iter().map(|&j| old[j].vol).sum::<f64>() / nb.len() as f64;
-                let mut c = Cell { vol: me.vol * (1.0 - m), comp: me.comp };
+                let share = 0.25 * m;
+                let mut c = Cell { vol: me.vol * (1.0 - share * nb.len() as f64), comp: me.comp };
                 for &j in &nb {
-                    blend(&mut c, old[j].vol * m / nb.len() as f64, &old[j].comp);
+                    blend(&mut c, old[j].vol * share, &old[j].comp);
                 }
-                c.vol = me.vol * (1.0 - m) + avg_vol * m;
                 self.cells[l * NAP_SECTORS + s] = c;
             }
         }

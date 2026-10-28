@@ -244,7 +244,7 @@ pub struct KnifeParams {
     pub height: f32,
     pub half_width: f32,
     pub active: u32,
-    pub pad0: u32,
+    pub frame: u32,
     pub pad1: u32,
     pub bands: u32,
     pub pad2: u32,
@@ -260,7 +260,7 @@ pub struct KnifeParams {
 pub struct Scrap {
     pub cell: u32,
     pub vol: f32,
-    pub pad0: u32,
+    pub frame: u32,
     pub pad1: u32,
     pub pig: [u32; 8],
 }
@@ -416,6 +416,7 @@ pub struct Film {
     bg_brush: wgpu::BindGroup,
     p_brush: wgpu::ComputePipeline,
     p_lap: wgpu::ComputePipeline,
+    p_plug: wgpu::ComputePipeline,
     p_flux: wgpu::ComputePipeline,
     p_limit: wgpu::ComputePipeline,
     p_nose: wgpu::ComputePipeline,
@@ -670,6 +671,7 @@ impl Film {
         let ls: [&wgpu::BindGroupLayout; 4] = [&l0, &l1, &l_fac, &l_tiles];
         let p_lap = compute_pipeline(d, "laplacian", &sm_film, "laplacian", &lf);
         let p_flux = compute_pipeline(d, "fluxes", &sm_film, "fluxes", &lf);
+        let p_plug = compute_pipeline(d, "plug", &sm_film, "plug", &lf);
         let p_limit = compute_pipeline(d, "limiter", &sm_film, "limiter", &lf);
         let p_nose = compute_pipeline(d, "nose", &sm_film, "nose", &lf);
         let p_shed = compute_pipeline(d, "shed", &sm_film, "shed_pass", &lf);
@@ -730,7 +732,7 @@ impl Film {
             sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, detail_tex, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
-            p_lap, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
+            p_lap, p_plug, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
             p_strata_limit, p_strata_update, p_strata_fill, p_cg_setup, p_cg_init, p_cg_ia, p_cg_ib, p_cg_ic, p_cg_rinit, p_cg_ra, p_cg_rb, p_cg_finish, p_cg_rmass, p_cg_rescale, p_cg_lap_p, p_cg_lap_h, p_cg_lap_u, cg_bufs, cg_report: [0.0; 4], implicit_steps: 1, p_deposit, p_cure, p_shade,
             max_deposits, h_max: 0.0, s_max: 0.0, mu_min: 1.0, h_max_pending: 0.0, substeps_last: 1, pigments, cmf_table, deposit_count: 0, total_deposited: 0.0, weave_volume: weave_vol,
         };
@@ -1167,6 +1169,7 @@ impl Film {
             }
             for _ in 0..substeps {
                 ind(&mut pass, &self.p_lap, &gf);
+                ind(&mut pass, &self.p_plug, &gf);
                 ind(&mut pass, &self.p_flux, &gf);
                 ind(&mut pass, &self.p_limit, &gf);
                 ind(&mut pass, &self.p_apply, &gf);

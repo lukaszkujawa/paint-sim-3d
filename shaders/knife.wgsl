@@ -8,7 +8,7 @@ struct KnifeParams {
     height: f32,
     half_width: f32,
     enabled: u32,
-    pad0: u32,
+    frame: u32,
     pad1: u32,
     bands: u32,
     pad2: u32,
@@ -22,7 +22,7 @@ struct KnifeParams {
 struct Scrap {
     cell: u32,
     vol: f32,
-    pad0: u32,
+    frame: u32,
     pad1: u32,
     pig0: vec4<u32>,
     pig1: vec4<u32>,
@@ -46,7 +46,7 @@ fn emit(c: u32, vol: f32, pig: array<f32, 16>) {
         var r: Scrap;
         r.cell = c;
         r.vol = vol;
-        r.pad0 = 0u;
+        r.frame = K.frame;
         r.pad1 = 0u;
         r.pig0 = pack_pig_a(pig);
         r.pig1 = pack_pig_b(pig);

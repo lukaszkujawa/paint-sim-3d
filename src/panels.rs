@@ -431,8 +431,8 @@ impl App {
         num(ui, "Pressure", &mut r.pressure, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Nap texture", &mut r.nap, 0.0, 1.0, 100.0, " %", false);
         prop(ui, "Load", |ui| {
-            let frac = (r.load / r.capacity()).clamp(0.0, 1.0) as f32;
-            ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.1} mL  ·  film {:.0} µm", r.load * 1e6, r.film(r.pressure) * 1e6)).small()));
+            let frac = (r.load() / r.capacity()).clamp(0.0, 1.0) as f32;
+            ui.add(egui::ProgressBar::new(frac).desired_height(14.0).text(RichText::new(format!("{:.1} mL  ·  film {:.0} µm", r.load() * 1e6, r.film(r.pressure) * 1e6)).small()));
         });
         ui.horizontal(|ui| {
             if ui.button("Load roller").on_hover_text("R").clicked() {

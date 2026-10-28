@@ -617,6 +617,32 @@ impl App {
             }
             return true;
         }
+        if a.script == "roller" {
+            let f = self.frame_index;
+            let w = self.film.settings.width_m as f64;
+            let hgt = self.film.settings.height_m as f64;
+            let dt = 1.0 / 60.0;
+            if f < 60 {
+                self.tool.kind = ToolKind::Pour;
+                self.tool.flowing = false;
+                for (i, pig) in [2usize, 3, 5, 7, 11].iter().enumerate() {
+                    let x = (w * 0.5 - 0.04 + 0.02 * i as f64) as f32;
+                    let t0 = f as f64 / 60.0;
+                    let t1 = (f + 1) as f64 / 60.0;
+                    let y = |t: f64| (hgt * 0.5 + 0.1 + 0.15 * t) as f32;
+                    let mut paint = color::PaintMix::pure(*pig);
+                    paint.frac[12] = 0.25;
+                    self.pending_deposits.push(Deposit::stroke([x, y(t0)], [x, y(t1)], 0.006, 2.5e-8, paint.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+                }
+                return true;
+            }
+            self.tool.kind = ToolKind::Roller;
+            let t = (f as f64 - 120.0).max(0.0) * dt;
+            let p = DVec3::new(w * 0.5, hgt * 0.5 + 0.28 - 0.15 * t, 0.0);
+            self.tool.pos = p;
+            self.tool.flowing = f > 121 && p.y > hgt * 0.5 - 0.32;
+            return true;
+        }
         if a.script == "knife" {
             let f = self.frame_index;
             let w = self.film.settings.width_m as f64;

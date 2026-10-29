@@ -8,9 +8,9 @@ use image::ImageDecoder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
 
 const EVAL_WIDTH: u32 = 1536;
 const EDGE_WEIGHT: f32 = 2.0;
@@ -19,23 +19,37 @@ const APPROACH_MIN: f64 = 0.004;
 const APPROACH_MAX: f64 = 0.03;
 const HOVER: f64 = 0.004;
 const PRESS_PER_SIZE: f64 = 1.0;
-const PRESS_MIN: f64 = 0.0025;
+const PRESS_MIN: f64 = 0.0005;
 const APPROACH_STEPS: f64 = 4.0;
 const BRUSH_REST: f64 = 0.75;
 const TRAVEL_PER_SIZE: f64 = 1.0;
 const REFINEMENTS: usize = 16;
 const WINDOW: usize = 40;
-const SHRINK_BELOW: f64 = 0.15;
 const SHRINK: f64 = 0.8;
+const TILE: usize = 8;
+const REGION_HW: f32 = 1.5;
+const MIN_HW: f64 = 0.75;
+const STOPS: [f32; 4] = [f32::INFINITY, 30.0, 18.0, 10.0];
+const LOOKAHEAD: usize = 160;
+const EXECUTE: usize = 48;
+const PRUNE_VISIBLE: f32 = 0.25;
+const LEVEL_DROP: f32 = 0.5;
+const MISS_LIMIT: usize = 24;
+const TABU: f32 = 0.5;
+const REGIONS: usize = 4;
+const AIMED_SHARE: f32 = 0.5;
+const LOAD_REF: f64 = 0.012;
+const LOAD_MAX: f64 = 8.0;
+const BRISTLE_PER_SIZE: f64 = 5.0;
+const BRISTLE_MIN: f64 = 0.006;
 const SIZE_SPREAD: f64 = 0.4;
 const SIZE_CHANGED: f64 = 0.01;
 const MIN_GAIN: f32 = 2.0;
 const CHANGED_DE: f32 = 4.0;
-const REFRESH_EVERY: u32 = 60;
-const LOWER_FRAMES: u32 = 2;
+const LOWER_FRAMES: u32 = 1;
 const WARMUP_FRAMES: u32 = 3;
-const LIFT_FRAMES: u32 = 2;
-const SETTLE_FRAMES: u32 = 4;
+const LIFT_FRAMES: u32 = 1;
+const SETTLE_FRAMES: u32 = 2;
 const THREAD_SETTLE_MAX: u32 = 180;
 const POUR_FILM: f64 = 2.0e-4;
 const PREVIEW_W: u32 = 288;
@@ -108,12 +122,14 @@ pub struct EvolveState {
     photo_gen: u64,
     saved_paint: Option<[f32; 16]>,
     saved_height: Option<f64>,
+    saved_load: Option<f64>,
+    saved_len: Option<f64>,
     user_sizes: Vec<(ToolKind, BrushShape, f64)>,
 }
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, user_sizes: Vec::new() }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
     }
 }
 
@@ -125,10 +141,12 @@ struct ToolRange {
     len: (f32, f32),
     speed: f64,
     long: bool,
+    reach: f64,
 }
 
 fn tool_range(kind: ToolKind, shape: BrushShape) -> Option<ToolRange> {
-    let r = |lo, hi, half_width, len, speed| Some(ToolRange { lo, hi, half_width, len, speed, long: kind != ToolKind::Sponge });
+    let reach = if kind == ToolKind::Brush { 30.0 } else { f64::INFINITY };
+    let r = |lo, hi, half_width, len, speed| Some(ToolRange { lo, hi, half_width, len, speed, long: kind != ToolKind::Sponge, reach });
     match kind {
         ToolKind::Pour => r(0.0008, 0.02, 1.15, (2.0, 10.0), 0.5),
         ToolKind::Brush if shape == BrushShape::Flat => r(0.0001, 0.1, 0.5, (2.0, 8.0), 0.3),
@@ -271,6 +289,7 @@ struct Cand {
     bend: f32,
     along: f32,
     traced: bool,
+    stop: f32,
     size: f64,
     hw: f32,
     pts: Vec<[f32; 2]>,
@@ -278,6 +297,7 @@ struct Cand {
     score: f32,
 }
 
+#[derive(Clone)]
 pub struct Plan {
     pub path: Vec<DVec2>,
     pub lead: f64,
@@ -285,10 +305,13 @@ pub struct Plan {
     pub mix: [f32; 16],
     pub speed: f64,
     pub kind: ToolKind,
+    pub dry: bool,
     pts: Vec<[f32; 2]>,
     hw: f32,
     lab: [f32; 3],
     predicted: f32,
+    width_gain: f64,
+    pass: u32,
 }
 
 impl Plan {
@@ -337,226 +360,19 @@ pub enum Phase {
     Settle(Plan, u32),
 }
 
-pub struct Evolver {
-    pub w: usize,
-    pub h: usize,
-    pub factor: u32,
+struct Model {
+    w: usize,
+    h: usize,
     cell: f64,
-    photo: Vec<[f32; 3]>,
-    white: [f32; 3],
-    black: [f32; 3],
-    pub calibrated: bool,
     target: Vec<[f32; 3]>,
     tangent: Vec<[f32; 3]>,
     weight: Vec<f32>,
-    mask: Vec<f32>,
-    focus: Option<Focus>,
-    cdf: Vec<f64>,
-    current: Vec<[f32; 3]>,
-    err: Vec<f32>,
     swatches: Vec<Swatch>,
-    rng: StdRng,
-    tool: Option<(ToolKind, BrushShape)>,
-    range: Option<ToolRange>,
-    longest: f32,
-    scratch: RefCell<Vec<f32>>,
-    photo_gen: u64,
-    applied: Option<f64>,
-    pub size_hi: f64,
-    width_gain: f64,
-    opacity: f32,
-    recent: VecDeque<bool>,
-    pub tried: u64,
-    pub painted: u64,
-    pub kept: u64,
-    pub passes: u32,
-    pub start_err: f32,
-    pub mean_err: f32,
-    pub status: String,
-    pub dry_due: bool,
-    since_refresh: u32,
-    pub phase: Phase,
 }
 
-impl Evolver {
-    pub fn new(photo: &image::RgbaImage, film_w: u32, film_h: u32, dx: f32, set: &PigmentSet, cmf: &[f32], seed: u64) -> Self {
-        let factor = (film_w / EVAL_WIDTH).max(1);
-        let (w, h) = ((film_w / factor) as usize, (film_h / factor) as usize);
-        let img = image::imageops::resize(&cover_crop(photo, w as f32 / h as f32), w as u32, h as u32, image::imageops::FilterType::Triangle);
-        let white = color::mix_rgb(set, cmf, &color::PaintMix::pure(WHITE).frac).map(decode);
-        let black = color::mix_rgb(set, cmf, &color::PaintMix::pure(BLACK).frac).map(decode);
-        let photo: Vec<[f32; 3]> = (0..w * h)
-            .into_par_iter()
-            .map(|k| {
-                let p = img.get_pixel((k % w) as u32, (h - 1 - k / w) as u32);
-                [decode(p[0] as f32 / 255.0), decode(p[1] as f32 / 255.0), decode(p[2] as f32 / 255.0)]
-            })
-            .collect();
-        Self {
-            w,
-            h,
-            factor,
-            cell: dx as f64 * factor as f64,
-            photo,
-            white,
-            black,
-            calibrated: false,
-            target: vec![[0.0; 3]; w * h],
-            tangent: vec![[0.0; 3]; w * h],
-            weight: vec![1.0; w * h],
-            mask: vec![1.0; w * h],
-            focus: None,
-            cdf: Vec::new(),
-            current: vec![[0.0; 3]; w * h],
-            err: vec![0.0; w * h],
-            swatches: swatches(set, cmf),
-            rng: StdRng::seed_from_u64(seed),
-            tool: None,
-            range: None,
-            longest: 0.0,
-            scratch: RefCell::new(vec![0.0; w * h]),
-            photo_gen: 0,
-            applied: None,
-            size_hi: 0.0,
-            width_gain: 1.0,
-            opacity: 0.9,
-            recent: VecDeque::new(),
-            tried: 0,
-            painted: 0,
-            kept: 0,
-            passes: 0,
-            start_err: 0.0,
-            mean_err: 0.0,
-            status: String::new(),
-            dry_due: false,
-            since_refresh: 0,
-            phase: Phase::Wait(WARMUP_FRAMES),
-        }
-    }
-
-    pub fn calibrate(&mut self, gain: [f32; 3]) {
-        let (white, black) = (self.white, self.black);
-        self.target = self
-            .photo
-            .par_iter()
-            .map(|p| {
-                let mut rgb = [0.0f32; 3];
-                for c in 0..3 {
-                    rgb[c] = (tonemap_inverse(p[c]) / gain[c]).clamp(black[c], white[c]);
-                }
-                lab(rgb)
-            })
-            .collect();
-        let (tangent, edges) = structure(&self.target, self.w, self.h);
-        self.tangent = tangent;
-        self.weight = edges.iter().map(|e| 1.0 + EDGE_WEIGHT * e).collect();
-        self.calibrated = true;
-        log::info!("display gain {:.2} {:.2} {:.2}", gain[0], gain[1], gain[2]);
-    }
-
-    pub fn observe(&mut self, lab: Vec<[f32; 3]>) {
-        self.current = lab;
-        self.err = self.current.par_iter().zip(&self.target).map(|(a, b)| de(*a, *b)).collect();
-        self.mean_err = self.err.iter().sum::<f32>() / self.err.len().max(1) as f32;
-        if self.start_err == 0.0 {
-            self.start_err = self.mean_err;
-        }
-        self.since_refresh = 0;
-    }
-
-    pub fn refresh_due(&self) -> bool {
-        self.since_refresh >= REFRESH_EVERY
-    }
-
-    pub fn set_tool(&mut self, kind: ToolKind, shape: BrushShape, size: f64) -> Option<f64> {
-        let user_changed = self.applied.map(|a| (size - a).abs() > SIZE_CHANGED * a).unwrap_or(true);
-        if self.tool == Some((kind, shape)) && !user_changed {
-            return None;
-        }
-        if self.tool != Some((kind, shape)) {
-            self.tool = Some((kind, shape));
-            self.range = tool_range(kind, shape);
-            self.width_gain = 1.0;
-            self.opacity = 0.9;
-        }
-        self.recent.clear();
-        self.applied = None;
-        let r = self.range?;
-        self.size_hi = size.clamp(r.lo, r.hi);
-        Some(size)
-    }
-
-    pub fn has_tool(&self) -> bool {
-        self.range.is_some()
-    }
-
-    pub fn applied(&mut self, size: f64) {
-        self.applied = Some(size);
-    }
-
-    pub fn resume(&mut self) {
-        self.phase = Phase::Wait(WARMUP_FRAMES);
-        self.tool = None;
-        self.applied = None;
-        self.recent.clear();
-        self.status.clear();
-    }
-
-    pub fn size_lo(&self) -> f64 {
-        self.range.map(|r| r.lo).unwrap_or(0.0)
-    }
-
-    fn size_floor(&self) -> f64 {
-        self.size_lo().max(SIZE_SPREAD * self.size_hi)
-    }
-
-    pub fn progress(&self) -> f32 {
-        if self.start_err <= 0.0 {
-            return 0.0;
-        }
-        (1.0 - self.mean_err / self.start_err).clamp(0.0, 1.0)
-    }
-
-    fn set_focus(&mut self, focus: Focus) {
-        if self.focus == Some(focus) {
-            return;
-        }
-        self.focus = Some(focus);
-        let (w, h) = (self.w, self.h);
-        let aspect = w as f32 / h as f32;
-        self.mask = (0..w * h).into_par_iter().map(|k| focus.weight(((k % w) as f32 + 0.5) / w as f32, 1.0 - ((k / w) as f32 + 0.5) / h as f32, aspect)).collect();
-    }
-
-    fn gain(&self, k: usize, delta: f32) -> f32 {
-        if delta < 0.0 {
-            delta * self.mask[k]
-        } else {
-            delta
-        }
-    }
-
-    fn build_cdf(&mut self) {
-        let mut acc = 0.0f64;
-        self.cdf = self
-            .err
-            .iter()
-            .zip(&self.weight)
-            .zip(&self.mask)
-            .map(|((e, w), m)| {
-                acc += (*e as f64) * (*e as f64) * *w as f64 * *m as f64;
-                acc
-            })
-            .collect();
-    }
-
-    fn sample_point(&mut self) -> [f32; 2] {
-        let total = self.cdf.last().copied().unwrap_or(0.0);
-        if total <= 0.0 {
-            return [self.rng.random::<f32>() * self.w as f32, self.rng.random::<f32>() * self.h as f32];
-        }
-        let pick = self.rng.random::<f64>() * total;
-        let k = self.cdf.partition_point(|c| *c < pick).min(self.err.len() - 1);
-        [(k % self.w) as f32 + self.rng.random::<f32>(), (k / self.w) as f32 + self.rng.random::<f32>()]
+impl Model {
+    fn index(&self, p: [f32; 2]) -> usize {
+        (p[1].max(0.0) as usize).min(self.h - 1) * self.w + (p[0].max(0.0) as usize).min(self.w - 1)
     }
 
     fn bbox(&self, pts: &[[f32; 2]], pad: f32) -> [usize; 4] {
@@ -575,8 +391,7 @@ impl Evolver {
         ]
     }
 
-    fn footprint(&self, pts: &[[f32; 2]], hw: f32) -> Vec<(usize, f32)> {
-        let mut cov = self.scratch.borrow_mut();
+    fn footprint(&self, cov: &mut [f32], pts: &[[f32; 2]], hw: f32) -> Vec<(usize, f32)> {
         let mut touched = Vec::new();
         let segs: Vec<[[f32; 2]; 2]> = if pts.len() < 2 { vec![[pts[0], pts[0]]] } else { pts.windows(2).map(|w| [w[0], w[1]]).collect() };
         for [a, e] in segs {
@@ -607,10 +422,294 @@ impl Evolver {
         out
     }
 
+    fn nearest(&self, want: [f32; 3]) -> usize {
+        let mut best = (f32::MAX, 0);
+        for (k, s) in self.swatches.iter().enumerate() {
+            let d = (s.lab[0] - want[0]).powi(2) + (s.lab[1] - want[1]).powi(2) + (s.lab[2] - want[2]).powi(2);
+            if d < best.0 {
+                best = (d, k);
+            }
+        }
+        best.1
+    }
+
+    fn mask(&self, focus: Focus) -> Vec<f32> {
+        let (w, h) = (self.w, self.h);
+        let aspect = w as f32 / h as f32;
+        (0..w * h).into_par_iter().map(|k| focus.weight(((k % w) as f32 + 0.5) / w as f32, 1.0 - ((k / w) as f32 + 0.5) / h as f32, aspect)).collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct Schedule {
+    pub size_hi: f64,
+    reference: Option<f32>,
+    window: VecDeque<f32>,
+    misses: usize,
+    pub pass: u32,
+    pub done: bool,
+}
+
+impl Schedule {
+    fn new(size_hi: f64) -> Self {
+        Self { size_hi, reference: None, window: VecDeque::new(), misses: 0, pass: 0, done: false }
+    }
+}
+
+struct Job {
+    kind: ToolKind,
+    range: ToolRange,
+    reset: Option<f64>,
+    candidates: usize,
+    follow: f64,
+    longest: f64,
+    focus: Focus,
+    paint: [f32; 16],
+    width_gain: f64,
+    opacity: f32,
+    gen: u64,
+}
+
+pub struct Batch {
+    plans: Vec<Plan>,
+    sched: Schedule,
+    planned: usize,
+    pruned: usize,
+    gen: u64,
+}
+
+struct Region {
+    window: [usize; 4],
+    tile: usize,
+    angle: f32,
+    elongation: f32,
+    grain: f32,
+    coherence: f32,
+    cdf: Vec<f32>,
+}
+
+struct Sketch {
+    m: Arc<Model>,
+    mask: Vec<f32>,
+    focus: Option<Focus>,
+    current: Vec<[f32; 3]>,
+    err: Vec<f32>,
+    tiles: Vec<f32>,
+    tabu: Vec<f32>,
+    sat: Vec<f32>,
+    tw: usize,
+    th: usize,
+    scratch: Vec<f32>,
+    rng: StdRng,
+    kind: ToolKind,
+    range: ToolRange,
+    longest: f32,
+    width_gain: f64,
+    opacity: f32,
+    sched: Schedule,
+    last_tiles: Vec<usize>,
+}
+
+impl Sketch {
+    fn new(m: Arc<Model>, seed: u64, kind: ToolKind, range: ToolRange, size_hi: f64) -> Self {
+        let n = m.w * m.h;
+        let (tw, th) = (m.w.div_ceil(TILE), m.h.div_ceil(TILE));
+        Self {
+            mask: vec![1.0; n],
+            focus: None,
+            current: vec![[0.0; 3]; n],
+            err: vec![0.0; n],
+            tiles: vec![0.0; tw * th],
+            tabu: vec![1.0; tw * th],
+            sat: vec![0.0; (tw + 1) * (th + 1)],
+            tw,
+            th,
+            scratch: vec![0.0; n],
+            rng: StdRng::seed_from_u64(seed),
+            kind,
+            range,
+            longest: 0.0,
+            width_gain: 1.0,
+            opacity: 0.9,
+            sched: Schedule::new(size_hi),
+            last_tiles: Vec::new(),
+            m,
+        }
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        if self.focus != Some(focus) {
+            self.focus = Some(focus);
+            self.mask = self.m.mask(focus);
+        }
+    }
+
+    fn tile_of(&self, k: usize) -> usize {
+        (k / self.m.w / TILE) * self.tw + (k % self.m.w) / TILE
+    }
+
+    fn refresh_tiles(&mut self) {
+        self.tiles.iter_mut().for_each(|t| *t = 0.0);
+        for k in 0..self.err.len() {
+            let t = self.tile_of(k);
+            self.tiles[t] += self.err[k] * self.m.weight[k] * self.mask[k];
+        }
+        self.tabu.iter_mut().for_each(|t| *t = 1.0);
+    }
+
+    fn rebase(&mut self, real: &[[f32; 3]], pending: &[Plan]) {
+        let m = self.m.clone();
+        self.current = real.to_vec();
+        self.err = self.current.par_iter().zip(&m.target).map(|(a, b)| de(*a, *b)).collect();
+        self.refresh_tiles();
+        for p in pending {
+            let foot = m.footprint(&mut self.scratch, &p.pts, p.hw);
+            self.apply(&foot, p.lab);
+        }
+    }
+
+    fn apply(&mut self, foot: &[(usize, f32)], c: [f32; 3]) {
+        let o = self.opacity;
+        for &(k, a) in foot {
+            let a = a * o;
+            let cur = self.current[k];
+            let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
+            let e = de(new, self.m.target[k]);
+            let t = self.tile_of(k);
+            self.tiles[t] += (e - self.err[k]) * self.m.weight[k] * self.mask[k];
+            self.current[k] = new;
+            self.err[k] = e;
+        }
+    }
+
+    fn gain(&self, k: usize, delta: f32) -> f32 {
+        if delta < 0.0 { delta * self.mask[k] } else { delta }
+    }
+
+    fn size_lo(&self) -> f64 {
+        self.range.lo.max(MIN_HW * self.m.cell / (self.range.half_width * self.width_gain))
+    }
+
+    fn size_floor(&self) -> f64 {
+        self.size_lo().max(SIZE_SPREAD * self.sched.size_hi)
+    }
+
+    fn hw(&self, size: f64) -> f32 {
+        ((size * self.range.half_width * self.width_gain) / self.m.cell).max(0.6) as f32
+    }
+
+    fn len_range(&self, size: f64, hw: f32) -> (f32, f32) {
+        let r = self.range;
+        let lo = (hw * r.len.0).max(2.0);
+        let hi = if r.long { self.longest.max(hw * r.len.1) } else { hw * r.len.1 };
+        let hi = hi.min((r.reach * size / self.m.cell) as f32);
+        (lo, hi.max(lo * 1.2))
+    }
+
+    fn regions(&mut self) -> Vec<Region> {
+        let (tw, th) = (self.tw, self.th);
+        for j in 0..th {
+            let mut row = 0.0f32;
+            for i in 0..tw {
+                row += self.tiles[j * tw + i].max(0.0);
+                self.sat[(j + 1) * (tw + 1) + i + 1] = self.sat[j * (tw + 1) + i + 1] + row;
+            }
+        }
+        let hw = self.hw(self.sched.size_hi);
+        let r = ((REGION_HW * hw) / TILE as f32).ceil().max(0.0) as usize;
+        let mut ranked: Vec<(f32, usize, usize)> = Vec::with_capacity(tw * th);
+        for j in 0..th {
+            for i in 0..tw {
+                let (x0, y0, x1, y1) = (i.saturating_sub(r), j.saturating_sub(r), (i + r + 1).min(tw), (j + r + 1).min(th));
+                let s = self.sat[y1 * (tw + 1) + x1] - self.sat[y0 * (tw + 1) + x1] - self.sat[y1 * (tw + 1) + x0] + self.sat[y0 * (tw + 1) + x0];
+                let area = ((x1 - x0) * (y1 - y0)) as f32 / ((2 * r + 1) * (2 * r + 1)) as f32;
+                let s = s * self.tabu[j * tw + i] / area.max(0.25).sqrt();
+                if s > 0.0 {
+                    ranked.push((s, i, j));
+                }
+            }
+        }
+        let keep = (REGIONS * 64).min(ranked.len());
+        if keep == 0 {
+            return Vec::new();
+        }
+        ranked.select_nth_unstable_by(keep - 1, |a, b| b.0.total_cmp(&a.0));
+        ranked.truncate(keep);
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut picked: Vec<(usize, usize)> = Vec::new();
+        for &(_, i, j) in &ranked {
+            if picked.iter().all(|&(pi, pj)| pi.abs_diff(i) > r || pj.abs_diff(j) > r) {
+                picked.push((i, j));
+                if picked.len() == REGIONS {
+                    break;
+                }
+            }
+        }
+        picked.into_iter().filter_map(|(i, j)| self.region_at(i, j, r)).collect()
+    }
+
+    fn region_at_all(&self) -> Vec<Region> {
+        let m = &self.m;
+        let mut cdf = Vec::with_capacity(m.w * m.h);
+        let mut acc = 0.0f32;
+        for k in 0..m.w * m.h {
+            acc += self.err[k] * self.err[k] * m.weight[k] * self.mask[k];
+            cdf.push(acc);
+        }
+        vec![Region { window: [0, 0, m.w, m.h], tile: 0, angle: 0.0, elongation: 0.0, grain: 0.0, coherence: -0.3, cdf }]
+    }
+
+    fn region_at(&self, i: usize, j: usize, r: usize) -> Option<Region> {
+        let m = &self.m;
+        let half = r * TILE + TILE / 2;
+        let (cx, cy) = (i * TILE + TILE / 2, j * TILE + TILE / 2);
+        let window = [cx.saturating_sub(half), cy.saturating_sub(half), (cx + half).min(m.w), (cy + half).min(m.h)];
+        let mut cdf = Vec::with_capacity((window[2] - window[0]) * (window[3] - window[1]));
+        let (mut acc, mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let (mut tx, mut ty, mut tn) = (0.0f32, 0.0f32, 0.0f32);
+        for y in window[1]..window[3] {
+            for x in window[0]..window[2] {
+                let k = y * m.w + x;
+                let e = self.err[k] * self.err[k] * m.weight[k] * self.mask[k];
+                acc += e;
+                cdf.push(acc);
+                let (fx, fy) = (x as f32, y as f32);
+                sx += e * fx;
+                sy += e * fy;
+                sxx += e * fx * fx;
+                sxy += e * fx * fy;
+                syy += e * fy * fy;
+                let t = m.tangent[k];
+                tx += t[2] * (t[0] * t[0] - t[1] * t[1]);
+                ty += t[2] * 2.0 * t[0] * t[1];
+                tn += 1.0;
+            }
+        }
+        if acc <= 0.0 {
+            return None;
+        }
+        let (mx, my) = (sx / acc, sy / acc);
+        let (cxx, cxy, cyy) = (sxx / acc - mx * mx, sxy / acc - mx * my, syy / acc - my * my);
+        let angle = 0.5 * (2.0 * cxy).atan2(cxx - cyy);
+        let tr = cxx + cyy;
+        let elongation = if tr > 1e-6 { ((cxx - cyy).powi(2) + 4.0 * cxy * cxy).sqrt() / tr } else { 0.0 };
+        let grain = 0.5 * ty.atan2(tx);
+        let coherence = ((tx * tx + ty * ty).sqrt() / tn.max(1.0)).min(1.0);
+        Some(Region { window, tile: j * self.tw + i, angle, elongation, grain, coherence, cdf })
+    }
+
+    fn sample_in(&mut self, reg: &Region) -> [f32; 2] {
+        let total = *reg.cdf.last().unwrap();
+        let pick = self.rng.random::<f32>() * total;
+        let k = reg.cdf.partition_point(|c| *c < pick).min(reg.cdf.len() - 1);
+        let rw = reg.window[2] - reg.window[0];
+        [(reg.window[0] + k % rw) as f32 + self.rng.random::<f32>(), (reg.window[1] + k / rw) as f32 + self.rng.random::<f32>()]
+    }
+
     fn means(&self, foot: &[(usize, f32)]) -> ([f32; 3], [f32; 3]) {
         let mut acc = [0.0f32; 7];
         for &(k, a) in foot {
-            let (t, c) = (self.target[k], self.current[k]);
+            let (t, c) = (self.m.target[k], self.current[k]);
             for i in 0..3 {
                 acc[i] += a * t[i];
                 acc[3 + i] += a * c[i];
@@ -631,20 +730,9 @@ impl Evolver {
             let a = a * o;
             let cur = self.current[k];
             let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
-            delta += self.gain(k, self.weight[k] * (de(new, self.target[k]) - self.err[k]));
+            delta += self.gain(k, self.m.weight[k] * (de(new, self.m.target[k]) - self.err[k]));
         }
         delta
-    }
-
-    fn nearest(&self, want: [f32; 3]) -> usize {
-        let mut best = (f32::MAX, 0);
-        for (k, s) in self.swatches.iter().enumerate() {
-            let d = (s.lab[0] - want[0]).powi(2) + (s.lab[1] - want[1]).powi(2) + (s.lab[2] - want[2]).powi(2);
-            if d < best.0 {
-                best = (d, k);
-            }
-        }
-        best.1
     }
 
     fn pick_colour(&mut self, foot: &[(usize, f32)], jitter: f32) -> usize {
@@ -655,20 +743,20 @@ impl Evolver {
             want[c] = cur[c] + (m[c] - cur[c]) / o + jitter * gauss(&mut self.rng) * if c == 0 { 1.0 } else { 1.4 };
         }
         want[0] = want[0].clamp(0.0, 100.0);
-        self.nearest(want)
+        self.m.nearest(want)
     }
 
     fn trace(&self, c: &Cand) -> Vec<[f32; 2]> {
+        let m = &self.m;
         let step = (0.5 * c.hw).max(c.len / MAX_POINTS).max(1.0);
-        let (xmax, ymax) = (self.w as f32 - EDGE_PX, self.h as f32 - EDGE_PX);
+        let (xmax, ymax) = (m.w as f32 - EDGE_PX, m.h as f32 - EDGE_PX);
         let walk = |sign: f32, dist: f32| -> Vec<[f32; 2]> {
             let mut p = c.centre;
             let mut d = [sign * c.angle.cos(), sign * c.angle.sin()];
             let mut out = Vec::new();
             let mut gone = 0.0;
             while gone + step <= dist {
-                let k = (p[1] as usize).min(self.h - 1) * self.w + (p[0] as usize).min(self.w - 1);
-                let t = self.tangent[k];
+                let t = m.tangent[m.index(p)];
                 if t[2] > TRACE_COHERENT {
                     let flip = if t[0] * d[0] + t[1] * d[1] < 0.0 { -1.0 } else { 1.0 };
                     let n = [d[0] + TRACE_TURN * (flip * t[0] - d[0]), d[1] + TRACE_TURN * (flip * t[1] - d[1])];
@@ -693,16 +781,13 @@ impl Evolver {
         pts
     }
 
-    fn shape(&self, c: &Cand) -> Vec<[f32; 2]> {
-        if c.traced {
-            return self.trace(c);
-        }
+    fn bezier(&self, c: &Cand) -> Vec<[f32; 2]> {
         let (s, co) = c.angle.sin_cos();
         let start = [c.centre[0] - co * c.len * c.along, c.centre[1] - s * c.len * c.along];
         let end = [start[0] + co * c.len, start[1] + s * c.len];
         let ctrl = [(start[0] + end[0]) * 0.5 - s * c.bend * c.len, (start[1] + end[1]) * 0.5 + co * c.bend * c.len];
         let n = if c.len < 2.0 { 1 } else { (c.len / c.hw.max(2.0)).ceil().clamp(8.0, MAX_POINTS) as usize };
-        let (xmax, ymax) = (self.w as f32 - EDGE_PX, self.h as f32 - EDGE_PX);
+        let (xmax, ymax) = (self.m.w as f32 - EDGE_PX, self.m.h as f32 - EDGE_PX);
         (0..=n)
             .map(|k| {
                 let t = k as f32 / n as f32;
@@ -714,60 +799,90 @@ impl Evolver {
             .collect()
     }
 
+    fn clip(&self, pts: Vec<[f32; 2]>, centre: [f32; 2], stop: f32) -> Vec<[f32; 2]> {
+        if !stop.is_finite() || pts.len() < 2 {
+            return pts;
+        }
+        let m = &self.m;
+        let ci = (0..pts.len()).min_by(|a, b| {
+            let d = |p: [f32; 2]| (p[0] - centre[0]).powi(2) + (p[1] - centre[1]).powi(2);
+            d(pts[*a]).total_cmp(&d(pts[*b]))
+        }).unwrap();
+        let here = m.target[m.index(pts[ci])];
+        let inside = |p: [f32; 2]| de(m.target[m.index(p)], here) <= stop;
+        let mut a = ci;
+        while a > 0 && inside(pts[a - 1]) {
+            a -= 1;
+        }
+        let mut b = ci;
+        while b + 1 < pts.len() && inside(pts[b + 1]) {
+            b += 1;
+        }
+        pts[a..=b].to_vec()
+    }
+
     fn evaluate(&mut self, mut c: Cand, refit: bool, jitter: f32) -> Cand {
-        let r = self.range.unwrap();
-        c.size = c.size.clamp(self.size_floor(), self.size_hi);
-        c.hw = ((c.size * r.half_width * self.width_gain) / self.cell).max(0.6) as f32;
-        let (lo, hi) = self.len_range(c.hw);
+        c.size = c.size.clamp(self.size_floor(), self.sched.size_hi.max(self.size_floor()));
+        c.hw = self.hw(c.size);
+        let (lo, hi) = self.len_range(c.size, c.hw);
         c.len = c.len.clamp(lo, hi);
-        c.pts = self.shape(&c);
-        let foot = self.footprint(&c.pts, c.hw);
+        let raw = if c.traced { self.trace(&c) } else { self.bezier(&c) };
+        c.pts = self.clip(raw, c.centre, c.stop);
+        let m = self.m.clone();
+        let foot = m.footprint(&mut self.scratch, &c.pts, c.hw);
         if refit {
             c.swatch = self.pick_colour(&foot, jitter);
         }
-        c.score = self.score(&foot, self.swatches[c.swatch].lab);
+        c.score = self.score(&foot, m.swatches[c.swatch].lab);
         c
     }
 
-    fn len_range(&self, hw: f32) -> (f32, f32) {
-        let r = self.range.unwrap();
-        let lo = (hw * r.len.0).max(2.0);
-        let hi = if r.long { self.longest.max(hw * r.len.1) } else { hw * r.len.1 };
-        (lo, hi.max(lo * 1.2))
+    fn random_stop(&mut self) -> f32 {
+        STOPS[self.rng.random_range(0..STOPS.len())]
     }
 
-    fn random_cand(&mut self, follow: f64) -> Cand {
-        let r = self.range.unwrap();
-        let centre = self.sample_point();
+    fn candidate(&mut self, reg: &Region, follow: f64) -> Cand {
+        let centre = self.sample_in(reg);
         let lo = self.size_floor();
-        let size = (lo.ln() + self.rng.random::<f64>() * (self.size_hi.ln() - lo.ln())).exp();
-        let hw = ((size * r.half_width * self.width_gain) / self.cell).max(0.6) as f32;
-        let (lo, hi) = self.len_range(hw);
-        let len = (lo.ln() + self.rng.random::<f32>() * (hi.ln() - lo.ln())).exp();
-        let k = (centre[1] as usize).min(self.h - 1) * self.w + (centre[0] as usize).min(self.w - 1);
-        let t = self.tangent[k];
+        let hi = self.sched.size_hi.max(lo);
+        let size = (lo.ln() + self.rng.random::<f64>() * (hi.ln() - lo.ln())).exp();
+        let hw = self.hw(size);
+        let (llo, lhi) = self.len_range(size, hw);
+        let len = (llo.ln() + self.rng.random::<f32>() * (lhi.ln() - llo.ln())).exp();
+        let t = self.m.tangent[self.m.index(centre)];
         let traced = self.rng.random::<f64>() < follow * t[2] as f64;
-        let angle = if traced { t[1].atan2(t[0]) } else { self.rng.random::<f32>() * std::f32::consts::TAU };
-        let c = Cand { centre, angle, len, bend: 0.12 * gauss(&mut self.rng).clamp(-2.0, 2.0), along: self.rng.random(), traced, size, hw, pts: Vec::new(), swatch: 0, score: 0.0 };
+        let pick: f32 = self.rng.random();
+        let along_grain = (follow as f32 * (0.3 + reg.coherence)).min(0.9);
+        let angle = if traced {
+            t[1].atan2(t[0])
+        } else if pick < along_grain {
+            reg.grain + 0.12 * gauss(&mut self.rng)
+        } else if pick < along_grain + 0.6 * reg.elongation * (1.0 - along_grain) {
+            reg.angle + 0.2 * gauss(&mut self.rng)
+        } else {
+            self.rng.random::<f32>() * std::f32::consts::TAU
+        };
+        let stop = self.random_stop();
+        let c = Cand { centre, angle, len, bend: 0.12 * gauss(&mut self.rng).clamp(-2.0, 2.0), along: self.rng.random(), traced, stop, size, hw, pts: Vec::new(), swatch: 0, score: 0.0 };
         self.evaluate(c, true, 3.0)
     }
 
     fn mutate(&mut self, best: &Cand) -> Cand {
         let mut c = best.clone();
-        match self.rng.random_range(0..5) {
+        match self.rng.random_range(0..6) {
             0 => {
                 c.size *= (0.3 * gauss(&mut self.rng)).exp() as f64;
                 self.evaluate(c, true, 0.0)
             }
             1 => {
-                let sw = self.swatches[c.swatch].lab;
+                let sw = self.m.swatches[c.swatch].lab;
                 let want = [sw[0] + 5.0 * gauss(&mut self.rng), sw[1] + 7.0 * gauss(&mut self.rng), sw[2] + 7.0 * gauss(&mut self.rng)];
-                c.swatch = self.nearest(want);
+                c.swatch = self.m.nearest(want);
                 self.evaluate(c, false, 0.0)
             }
             2 => {
-                c.size *= (0.3 * gauss(&mut self.rng)).exp() as f64;
-                self.evaluate(c, true, 4.0)
+                c.stop = self.random_stop();
+                self.evaluate(c, true, 0.0)
             }
             3 => {
                 c.len *= (0.5 * gauss(&mut self.rng)).exp();
@@ -777,6 +892,10 @@ impl Evolver {
                 }
                 self.evaluate(c, true, 0.0)
             }
+            4 => {
+                c.size *= (0.3 * gauss(&mut self.rng)).exp() as f64;
+                self.evaluate(c, true, 4.0)
+            }
             _ => {
                 c.centre[0] += 0.3 * c.hw * gauss(&mut self.rng);
                 c.centre[1] += 0.3 * c.hw * gauss(&mut self.rng);
@@ -785,17 +904,21 @@ impl Evolver {
         }
     }
 
-    pub fn plan(&mut self, candidates: usize, follow: f64, longest: f64, focus: Focus, paint: &[f32; 16]) -> Option<Plan> {
-        let r = self.range?;
-        self.set_focus(focus);
-        self.longest = (longest / self.cell) as f32;
-        self.build_cdf();
-        self.tried += 1;
+    fn plan_one(&mut self, job: &Job) -> Option<(Plan, Vec<(usize, f32)>)> {
+        let mut regs = self.regions();
+        self.last_tiles = regs.iter().map(|r| r.tile).collect();
+        let focused = regs.len();
+        let aimed = if focused > 0 { ((job.candidates as f32 * AIMED_SHARE).round() as usize).div_ceil(focused) } else { 0 };
+        let wide = job.candidates.saturating_sub(aimed * focused).max(1);
+        regs.extend(self.region_at_all());
         let mut best: Option<Cand> = None;
-        for _ in 0..candidates.max(1) {
-            let c = self.random_cand(follow);
-            if best.as_ref().map(|b| c.score < b.score).unwrap_or(true) {
-                best = Some(c);
+        for (ri, reg) in regs.iter().enumerate() {
+            let n = if ri < focused { aimed } else { wide };
+            for _ in 0..n {
+                let c = self.candidate(reg, job.follow);
+                if best.as_ref().map(|b| c.score < b.score).unwrap_or(true) {
+                    best = Some(c);
+                }
             }
         }
         let mut best = best?;
@@ -806,28 +929,403 @@ impl Evolver {
             }
         }
         if best.score > -MIN_GAIN {
-            self.record(false);
             return None;
         }
-        let mut mix = self.swatches[best.swatch].mix;
-        mix[12] = paint[12];
-        mix[13] = paint[13];
-        mix[14] = paint[14];
-        let path = best.pts.iter().map(|p| DVec2::new(p[0] as f64 * self.cell, p[1] as f64 * self.cell)).collect();
-        self.painted += 1;
-        self.since_refresh += 1;
-        let lead = if self.tool.unwrap().0 == ToolKind::Brush { (APPROACH_HW * best.hw as f64 * self.cell).clamp(APPROACH_MIN, APPROACH_MAX) } else { 0.0 };
-        Some(Plan { path, lead, size: best.size, mix, speed: r.speed, kind: self.tool.unwrap().0, pts: best.pts, hw: best.hw, lab: self.swatches[best.swatch].lab, predicted: best.score })
+        let m = self.m.clone();
+        let mut mix = m.swatches[best.swatch].mix;
+        mix[12] = job.paint[12];
+        mix[13] = job.paint[13];
+        mix[14] = job.paint[14];
+        let path = best.pts.iter().map(|p| DVec2::new(p[0] as f64 * m.cell, p[1] as f64 * m.cell)).collect();
+        let lead = if self.kind == ToolKind::Brush { (APPROACH_HW * best.hw as f64 * m.cell).clamp(APPROACH_MIN, APPROACH_MAX) } else { 0.0 };
+        let foot = m.footprint(&mut self.scratch, &best.pts, best.hw);
+        let plan = Plan { path, lead, size: best.size, mix, speed: self.range.speed, kind: self.kind, dry: false, pts: best.pts, hw: best.hw, lab: m.swatches[best.swatch].lab, predicted: best.score, width_gain: self.width_gain, pass: self.sched.pass };
+        Some((plan, foot))
+    }
+
+    fn shrink(&mut self) {
+        let lo = self.size_lo();
+        let s = &mut self.sched;
+        if s.size_hi > lo * 1.25 {
+            s.size_hi = (s.size_hi * SHRINK).max(lo * 1.25);
+            s.pass += 1;
+            s.reference = None;
+            s.window.clear();
+            s.misses = 0;
+            self.tabu.iter_mut().for_each(|t| *t = 1.0);
+        } else {
+            s.done = true;
+        }
+    }
+
+    fn hit(&mut self, gain: f32) {
+        let s = &mut self.sched;
+        s.misses = 0;
+        s.window.push_back(gain);
+        if s.window.len() > WINDOW {
+            s.window.pop_front();
+        }
+        if s.window.len() < WINDOW {
+            return;
+        }
+        let mean = s.window.iter().sum::<f32>() / WINDOW as f32;
+        match s.reference {
+            None => {
+                s.reference = Some(mean);
+                s.window.clear();
+            }
+            Some(r) if mean < LEVEL_DROP * r => self.shrink(),
+            _ => {}
+        }
+    }
+
+    fn miss(&mut self) {
+        for t in std::mem::take(&mut self.last_tiles) {
+            self.tabu[t] *= TABU;
+        }
+        self.sched.misses += 1;
+        if self.sched.misses >= MISS_LIMIT {
+            self.shrink();
+        }
+    }
+
+    fn run(&mut self, job: &Job) -> Batch {
+        if self.kind != job.kind || self.range.lo != job.range.lo || self.range.hi != job.range.hi {
+            self.kind = job.kind;
+            self.range = job.range;
+        }
+        if let Some(s) = job.reset {
+            self.sched = Schedule::new(s);
+            self.tabu.iter_mut().for_each(|t| *t = 1.0);
+        }
+        self.set_focus(job.focus);
+        self.refresh_tiles();
+        self.longest = (job.longest / self.m.cell) as f32;
+        self.width_gain = job.width_gain;
+        self.opacity = job.opacity;
+        let start_pass = self.sched.pass;
+        let (mut plans, mut feet, mut scheds) = (Vec::new(), Vec::new(), Vec::new());
+        while plans.len() < LOOKAHEAD && !self.sched.done {
+            match self.plan_one(job) {
+                Some((plan, foot)) => {
+                    self.apply(&foot, plan.lab);
+                    self.hit(-plan.predicted);
+                    plans.push(plan);
+                    feet.push(foot);
+                    scheds.push(self.sched.clone());
+                }
+                None => self.miss(),
+            }
+        }
+        let planned = plans.len();
+        let o = self.opacity;
+        let mut keep = vec![false; planned];
+        let mut shade = std::mem::take(&mut self.scratch);
+        for i in (0..planned).rev() {
+            let (mut vis, mut area) = (0.0f32, 0.0f32);
+            for &(k, a) in &feet[i] {
+                let a = a * o;
+                let w = self.m.weight[k];
+                vis += a * (1.0 - shade[k]) * w;
+                area += a * w;
+                shade[k] = 1.0 - (1.0 - shade[k]) * (1.0 - a);
+            }
+            let f = vis / area.max(1e-6);
+            keep[i] = f >= PRUNE_VISIBLE && plans[i].predicted * f < -MIN_GAIN;
+        }
+        for foot in &feet {
+            for &(k, _) in foot {
+                shade[k] = 0.0;
+            }
+        }
+        self.scratch = shade;
+        let (mut out, mut pruned, mut last, mut pass) = (Vec::new(), 0, None, start_pass);
+        for (i, mut p) in plans.into_iter().enumerate() {
+            if out.len() >= EXECUTE {
+                break;
+            }
+            if keep[i] {
+                p.dry = p.pass > pass;
+                pass = p.pass;
+                out.push(p);
+                last = Some(i);
+            } else {
+                pruned += 1;
+            }
+        }
+        if out.len() >= EXECUTE {
+            if let Some(i) = last {
+                self.sched = scheds[i].clone();
+            }
+        }
+        Batch { plans: out, sched: self.sched.clone(), planned, pruned, gen: job.gen }
+    }
+}
+
+pub struct Evolver {
+    pub w: usize,
+    pub h: usize,
+    pub factor: u32,
+    cell: f64,
+    photo: Vec<[f32; 3]>,
+    white: [f32; 3],
+    black: [f32; 3],
+    pub calibrated: bool,
+    palette: Option<Vec<Swatch>>,
+    model: Option<Arc<Model>>,
+    mask: Vec<f32>,
+    focus: Option<Focus>,
+    current: Vec<[f32; 3]>,
+    err: Vec<f32>,
+    scratch: Vec<f32>,
+    rng: StdRng,
+    tool: Option<(ToolKind, BrushShape)>,
+    range: Option<ToolRange>,
+    reset: Option<f64>,
+    photo_gen: u64,
+    applied: Option<f64>,
+    seen: Option<f64>,
+    pub size_hi: f64,
+    width_gain: f64,
+    opacity: f32,
+    sketch: Option<Sketch>,
+    job: Option<std::thread::JoinHandle<(Sketch, Batch)>>,
+    ready: Option<Batch>,
+    queue: VecDeque<Plan>,
+    synced: bool,
+    gen: u64,
+    pub finished: bool,
+    pub tried: u64,
+    pub painted: u64,
+    pub kept: u64,
+    pub pruned: u64,
+    pub passes: u32,
+    pub start_err: f32,
+    pub mean_err: f32,
+    pub status: String,
+    pub phase: Phase,
+}
+
+impl Evolver {
+    pub fn new(photo: &image::RgbaImage, film_w: u32, film_h: u32, dx: f32, set: &PigmentSet, cmf: &[f32], seed: u64) -> Self {
+        let factor = (film_w / EVAL_WIDTH).max(1);
+        let (w, h) = ((film_w / factor) as usize, (film_h / factor) as usize);
+        let img = image::imageops::resize(&cover_crop(photo, w as f32 / h as f32), w as u32, h as u32, image::imageops::FilterType::Triangle);
+        let white = color::mix_rgb(set, cmf, &color::PaintMix::pure(WHITE).frac).map(decode);
+        let black = color::mix_rgb(set, cmf, &color::PaintMix::pure(BLACK).frac).map(decode);
+        let photo: Vec<[f32; 3]> = (0..w * h)
+            .into_par_iter()
+            .map(|k| {
+                let p = img.get_pixel((k % w) as u32, (h - 1 - k / w) as u32);
+                [decode(p[0] as f32 / 255.0), decode(p[1] as f32 / 255.0), decode(p[2] as f32 / 255.0)]
+            })
+            .collect();
+        Self {
+            w,
+            h,
+            factor,
+            cell: dx as f64 * factor as f64,
+            photo,
+            white,
+            black,
+            calibrated: false,
+            palette: Some(swatches(set, cmf)),
+            model: None,
+            mask: vec![1.0; w * h],
+            focus: None,
+            current: vec![[0.0; 3]; w * h],
+            err: vec![0.0; w * h],
+            scratch: vec![0.0; w * h],
+            rng: StdRng::seed_from_u64(seed),
+            tool: None,
+            range: None,
+            reset: None,
+            photo_gen: 0,
+            applied: None,
+            seen: None,
+            size_hi: 0.0,
+            width_gain: 1.0,
+            opacity: 0.9,
+            sketch: None,
+            job: None,
+            ready: None,
+            queue: VecDeque::new(),
+            synced: false,
+            gen: 0,
+            finished: false,
+            tried: 0,
+            painted: 0,
+            kept: 0,
+            pruned: 0,
+            passes: 0,
+            start_err: 0.0,
+            mean_err: 0.0,
+            status: String::new(),
+            phase: Phase::Wait(WARMUP_FRAMES),
+        }
+    }
+
+    pub fn calibrate(&mut self, gain: [f32; 3]) {
+        let (white, black) = (self.white, self.black);
+        let target: Vec<[f32; 3]> = self
+            .photo
+            .par_iter()
+            .map(|p| {
+                let mut rgb = [0.0f32; 3];
+                for c in 0..3 {
+                    rgb[c] = (tonemap_inverse(p[c]) / gain[c]).clamp(black[c], white[c]);
+                }
+                lab(rgb)
+            })
+            .collect();
+        let (tangent, edges) = structure(&target, self.w, self.h);
+        let weight = edges.iter().map(|e| 1.0 + EDGE_WEIGHT * e).collect();
+        let swatches = self.palette.take().unwrap_or_default();
+        self.model = Some(Arc::new(Model { w: self.w, h: self.h, cell: self.cell, target, tangent, weight, swatches }));
+        self.calibrated = true;
+        log::info!("display gain {:.2} {:.2} {:.2}", gain[0], gain[1], gain[2]);
+    }
+
+    fn model(&self) -> &Model {
+        self.model.as_ref().expect("calibrated")
+    }
+
+    pub fn observe(&mut self, lab: Vec<[f32; 3]>) {
+        self.current = lab;
+        let m = self.model.clone().expect("calibrated");
+        self.err = self.current.par_iter().zip(&m.target).map(|(a, b)| de(*a, *b)).collect();
+        self.mean_err = self.err.iter().sum::<f32>() / self.err.len().max(1) as f32;
+        if self.start_err == 0.0 {
+            self.start_err = self.mean_err;
+        }
+        self.synced = true;
+    }
+
+    pub fn synced(&self) -> bool {
+        self.synced
+    }
+
+    pub fn set_tool(&mut self, kind: ToolKind, shape: BrushShape, size: f64) -> Option<f64> {
+        let user_changed = self.applied.or(self.seen).map(|a| (size - a).abs() > SIZE_CHANGED * a).unwrap_or(true);
+        if self.tool == Some((kind, shape)) && !user_changed {
+            return None;
+        }
+        if self.tool != Some((kind, shape)) {
+            self.tool = Some((kind, shape));
+            self.range = tool_range(kind, shape);
+            self.width_gain = 1.0;
+            self.opacity = 0.9;
+        }
+        self.applied = None;
+        self.seen = Some(size);
+        self.gen += 1;
+        self.queue.clear();
+        self.ready = None;
+        self.finished = false;
+        self.synced = false;
+        let r = self.range?;
+        self.size_hi = size.clamp(r.lo, r.hi);
+        self.reset = Some(self.size_hi);
+        Some(size)
+    }
+
+    pub fn has_tool(&self) -> bool {
+        self.range.is_some()
+    }
+
+    pub fn applied(&mut self, size: f64) {
+        self.applied = Some(size);
+    }
+
+    pub fn resume(&mut self) {
+        self.phase = Phase::Wait(WARMUP_FRAMES);
+        self.tool = None;
+        self.applied = None;
+        self.seen = None;
+        self.queue.clear();
+        self.ready = None;
+        self.synced = false;
+        self.finished = false;
+        self.gen += 1;
+        self.status.clear();
+    }
+
+    pub fn progress(&self) -> f32 {
+        if self.start_err <= 0.0 {
+            return 0.0;
+        }
+        (1.0 - self.mean_err / self.start_err).clamp(0.0, 1.0)
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        if self.focus != Some(focus) {
+            self.focus = Some(focus);
+            self.mask = self.model().mask(focus);
+        }
+    }
+
+    fn gain(&self, k: usize, delta: f32) -> f32 {
+        if delta < 0.0 { delta * self.mask[k] } else { delta }
+    }
+
+    pub fn next(&mut self, candidates: usize, follow: f64, longest: f64, focus: Focus, paint: &[f32; 16]) -> Option<Plan> {
+        if let Some(p) = self.queue.pop_front() {
+            return Some(p);
+        }
+        if !self.synced {
+            return None;
+        }
+        if self.job.as_ref().map(|j| j.is_finished()).unwrap_or(false) {
+            let (sk, batch) = self.job.take().unwrap().join().expect("planner");
+            self.sketch = Some(sk);
+            if batch.gen == self.gen {
+                self.tried += batch.planned as u64;
+                self.pruned += batch.pruned as u64;
+                self.size_hi = batch.sched.size_hi;
+                self.passes = batch.sched.pass;
+                if batch.plans.is_empty() && batch.sched.done {
+                    self.finished = true;
+                }
+                log::info!("batch planned {} pruned {} painting {} size {:.1} mm pass {} closer {:.0}%", batch.planned, batch.pruned, batch.plans.len(), batch.sched.size_hi * 1e3, batch.sched.pass, self.progress() * 100.0);
+                self.ready = Some(batch);
+            }
+        }
+        if self.job.is_some() || self.finished {
+            return None;
+        }
+        self.set_focus(focus);
+        let pending = self.ready.take().map(|b| b.plans).unwrap_or_default();
+        let range = self.range?;
+        let kind = self.tool?.0;
+        let m = self.model.clone()?;
+        let size_hi = self.size_hi;
+        let seed = self.rng.random();
+        let mut sk = self.sketch.take().unwrap_or_else(|| Sketch::new(m, seed, kind, range, size_hi));
+        let job = Job { kind, range, reset: self.reset.take(), candidates, follow, longest, focus, paint: *paint, width_gain: self.width_gain, opacity: self.opacity, gen: self.gen };
+        let real = self.current.clone();
+        let ahead = pending.clone();
+        self.job = Some(std::thread::spawn(move || {
+            sk.rebase(&real, &ahead);
+            let b = sk.run(&job);
+            (sk, b)
+        }));
+        if pending.is_empty() {
+            return None;
+        }
+        self.synced = false;
+        self.queue.extend(pending);
+        self.queue.pop_front()
     }
 
     pub fn region(&self, plan: &Plan) -> [usize; 4] {
-        self.bbox(&plan.pts, plan.hw * 1.5 + 4.0)
+        self.model().bbox(&plan.pts, plan.hw * 1.5 + 4.0)
     }
 
     pub fn judge(&mut self, plan: &Plan, region: [usize; 4], after: &[[f32; 3]]) -> bool {
+        let m = self.model.clone().expect("calibrated");
         let rw = region[2] - region[0];
         let mut covs = vec![0.0f32; rw * (region[3] - region[1])];
-        for (k, c) in self.footprint(&plan.pts, plan.hw) {
+        for (k, c) in m.footprint(&mut self.scratch, &plan.pts, plan.hw) {
             let (i, j) = (k % self.w, k / self.w);
             if (region[0]..region[2]).contains(&i) && (region[1]..region[3]).contains(&j) {
                 covs[(j - region[1]) * rw + (i - region[0])] = c;
@@ -841,8 +1339,8 @@ impl Evolver {
                 let k = j * self.w + i;
                 let a = after[(j - region[1]) * rw + (i - region[0])];
                 let b = self.current[k];
-                let w = self.weight[k];
-                delta += self.gain(k, w * (de(a, self.target[k]) - self.err[k])) as f64;
+                let w = m.weight[k];
+                delta += self.gain(k, w * (de(a, m.target[k]) - self.err[k])) as f64;
                 let cov = covs[(j - region[1]) * rw + (i - region[0])];
                 let reach = de(plan.lab, b);
                 if reach > 2.0 * CHANGED_DE {
@@ -862,54 +1360,38 @@ impl Evolver {
         }
         if pred > 20 {
             let ratio = (changed as f64 / pred as f64).clamp(0.5, 2.0);
-            self.width_gain = (self.width_gain * ratio.powf(0.25)).clamp(0.15, 3.0);
+            let seen = (plan.width_gain * ratio).clamp(0.15, 3.0);
+            self.width_gain = (self.width_gain * (seen / self.width_gain).powf(0.25)).clamp(0.15, 3.0);
         }
         if den > 2000.0 {
             let o = (num / den).clamp(0.15, 1.0);
             self.opacity = 0.85 * self.opacity + 0.15 * o;
         }
+        self.painted += 1;
         let ok = delta < 0.0;
         if ok {
             self.store(region, after);
             self.kept += 1;
         }
         log::debug!("stroke {} predicted {:.0} real {:.0} kept {} gain {:.2} opacity {:.2}", self.painted, plan.predicted, delta, ok, self.width_gain, self.opacity);
-        self.record(ok);
         if self.painted % 50 == 0 {
-            log::info!("painted {} kept {} tried {} pass {} size {:.1} mm closer {:.0}% gain {:.2} opacity {:.2}", self.painted, self.kept, self.tried, self.passes, self.size_hi * 1e3, self.progress() * 100.0, self.width_gain, self.opacity);
+            log::info!("painted {} kept {} planned {} pruned {} pass {} size {:.1} mm closer {:.0}% gain {:.2} opacity {:.2}", self.painted, self.kept, self.tried, self.pruned, self.passes, self.size_hi * 1e3, self.progress() * 100.0, self.width_gain, self.opacity);
         }
         ok
     }
 
     pub fn store(&mut self, region: [usize; 4], after: &[[f32; 3]]) {
+        let m = self.model.clone().expect("calibrated");
         let rw = region[2] - region[0];
         for j in region[1]..region[3] {
             for i in region[0]..region[2] {
                 let k = j * self.w + i;
                 let a = after[(j - region[1]) * rw + (i - region[0])];
-                let e = de(a, self.target[k]);
+                let e = de(a, m.target[k]);
                 self.mean_err += (e - self.err[k]) / self.err.len() as f32;
                 self.current[k] = a;
                 self.err[k] = e;
             }
-        }
-    }
-
-    fn record(&mut self, ok: bool) {
-        self.recent.push_back(ok);
-        while self.recent.len() > WINDOW {
-            self.recent.pop_front();
-        }
-        if self.recent.len() < WINDOW {
-            return;
-        }
-        let rate = self.recent.iter().filter(|k| **k).count() as f64 / WINDOW as f64;
-        let lo = self.size_lo();
-        if rate < SHRINK_BELOW && self.size_hi > lo * 1.25 {
-            self.size_hi = (self.size_hi * SHRINK).max(lo * 1.25);
-            self.passes += 1;
-            self.dry_due = true;
-            self.recent.clear();
         }
     }
 }
@@ -1037,6 +1519,8 @@ impl App {
         self.air.detach();
         self.evo.saved_paint = Some(self.paint.frac);
         self.evo.saved_height = Some(self.tool.height);
+        self.evo.saved_len = Some(self.brush.len);
+        self.evo.saved_load = Some(self.brush.capacity / self.brush.base_capacity.max(1e-30));
         self.evo.user_sizes.clear();
         self.evo.active = true;
     }
@@ -1061,6 +1545,15 @@ impl App {
             if kind != ToolKind::Brush || s == shape {
                 self.set_tool_size(kind, size);
             }
+        }
+        if let Some(len) = self.evo.saved_len.take() {
+            if (self.brush.len - len).abs() > 1e-6 {
+                let (shape, n, size) = (self.brush.shape, self.brush.bristles.len(), self.brush.size());
+                self.rebuild_brush(shape, n, len, size);
+            }
+        }
+        if let Some(k) = self.evo.saved_load.take() {
+            self.brush.capacity = self.brush.base_capacity * k;
         }
     }
 
@@ -1111,22 +1604,19 @@ impl App {
                     return Phase::Plan;
                 }
                 ev.status.clear();
-                if ev.dry_due {
-                    ev.dry_due = false;
-                    if self.evo.dry_passes {
-                        self.begin_full();
-                        self.film.dry_now(&self.gpu);
+                match ev.next(self.evo.candidates, self.evo.follow, self.evo.longest, self.evo.focus, &self.paint.frac) {
+                    None if !ev.synced() => Phase::Observe,
+                    None => {
+                        if ev.finished {
+                            ev.status = "Finished: no stroke at the smallest size helps any more. Pick a smaller tool size or another tool and press Paint to carry on".to_string();
+                        }
+                        Phase::Plan
                     }
-                }
-                if ev.refresh_due() {
-                    return Phase::Observe;
-                }
-                let t0 = std::time::Instant::now();
-                let planned = ev.plan(self.evo.candidates, self.evo.follow, self.evo.longest, self.evo.focus, &self.paint.frac);
-                log::debug!("plan {:.1} ms", t0.elapsed().as_secs_f32() * 1e3);
-                match planned {
-                    None => Phase::Plan,
                     Some(plan) => {
+                        if plan.dry && self.evo.dry_passes {
+                            self.begin_full();
+                            self.film.dry_now(&self.gpu);
+                        }
                         self.prepare_tool(&plan);
                         ev.applied(self.tool_size(plan.kind));
                         self.begin_stroke();
@@ -1249,7 +1739,13 @@ impl App {
         match plan.kind {
             ToolKind::Pour => self.pour_radius = plan.size as f32,
             ToolKind::Brush => {
-                self.set_tool_size(ToolKind::Brush, plan.size);
+                let user_len = self.evo.saved_len.unwrap_or(self.brush.len);
+                let len = (BRISTLE_PER_SIZE * plan.size).clamp(BRISTLE_MIN.min(user_len), user_len);
+                if (self.brush.size() - plan.size).abs() > 0.02 * plan.size || (self.brush.len - len).abs() > 0.02 * len {
+                    let (shape, n) = (self.brush.shape, self.brush.bristles.len());
+                    self.rebuild_brush(shape, n, len, plan.size);
+                }
+                self.brush.capacity = self.brush.base_capacity * (LOAD_REF / plan.size).clamp(1.0, LOAD_MAX);
                 let len = self.brush.len;
                 let user = self.evo.saved_height.filter(|h| *h < len - PRESS_MIN).unwrap_or(BRUSH_REST * len);
                 let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, (self.brush.len - user).max(PRESS_MIN));
@@ -1348,5 +1844,70 @@ impl App {
         drop(data);
         buf.unmap();
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn sketch_bench() {
+        let path = std::env::var("EVO_PHOTO").unwrap();
+        let out = std::env::var("EVO_OUT").unwrap_or_default();
+        let total: usize = std::env::var("EVO_N").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
+        let set = color::load_pigments();
+        let cmf = color::cmf_table();
+        let img = image::open(&path).unwrap().to_rgba8();
+        let photo = cover_crop(&img, 1.5);
+        let mut ev = Evolver::new(&photo, 3072, 2048, 1.2 / 3072.0, &set, &cmf, 7);
+        ev.calibrate([2.11, 2.2, 2.27]);
+        let m = ev.model.clone().unwrap();
+        let kind = ToolKind::Brush;
+        let range = tool_range(kind, BrushShape::Round).unwrap();
+        let mut sk = Sketch::new(m.clone(), 7, kind, range, 0.016);
+        let mut base = vec![[80.0f32, 1.0, 6.0]; m.w * m.h];
+        let err0 = base.iter().zip(&m.target).map(|(a, b)| de(*a, *b)).sum::<f32>();
+        let focus = Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 };
+        let opacity: f32 = std::env::var("EVO_OPACITY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7);
+        let (mut done, mut next_report) = (0usize, 0usize);
+        let t0 = std::time::Instant::now();
+        while done < total {
+            let job = Job { kind, range, reset: None, candidates: 32, follow: 0.7, longest: 0.25, focus, paint: [0.0; 16], width_gain: 1.85, opacity, gen: 0 };
+            sk.rebase(&base, &[]);
+            let b = sk.run(&job);
+            sk.rebase(&base, &b.plans);
+            base = sk.current.clone();
+            done += b.plans.len();
+            if done >= next_report || b.plans.is_empty() {
+                let e = base.iter().zip(&m.target).map(|(a, b)| de(*a, *b)).sum::<f32>();
+                let ed = base.iter().zip(&m.target).zip(&m.weight).map(|((a, b), w)| (w - 1.0) * de(*a, *b)).sum::<f32>() / m.weight.iter().map(|w| w - 1.0).sum::<f32>();
+                print!("edge dE {:.1} ", ed);
+                println!("strokes {} closer {:.1}% size {:.1} mm pass {} pruned {} {:.1}s", done, 100.0 * (1.0 - e / err0), b.sched.size_hi * 1e3, b.sched.pass, b.pruned, t0.elapsed().as_secs_f32());
+                next_report += 600;
+            }
+            if b.plans.is_empty() && b.sched.done {
+                break;
+            }
+        }
+        if !out.is_empty() {
+            let mut im = image::RgbImage::new(m.w as u32, m.h as u32);
+            for (k, l) in base.iter().enumerate() {
+                let fy = (l[0] + 16.0) / 116.0;
+                let (fx, fz) = (fy + l[1] / 500.0, fy - l[2] / 200.0);
+                let inv = |t: f32| if t > 0.2069 { t * t * t } else { (t - 16.0 / 116.0) / 7.787 };
+                let (x, y, z) = (0.95047 * inv(fx), inv(fy), 1.08883 * inv(fz));
+                let r = 3.2406 * x - 1.5372 * y - 0.4986 * z;
+                let g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
+                let bl = 0.0557 * x - 0.2040 * y + 1.0570 * z;
+                let enc = |c: f32| {
+                    let c = c.clamp(0.0, 1.0);
+                    ((if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0) as u8
+                };
+                im.put_pixel((k % m.w) as u32, (m.h - 1 - k / m.w) as u32, image::Rgb([enc(r), enc(g), enc(bl)]));
+            }
+            im.save(&out).unwrap();
+        }
     }
 }

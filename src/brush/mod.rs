@@ -58,6 +58,7 @@ pub struct Brush {
     pub stiffness: f64,
     pub friction: f64,
     pub capacity: f64,
+    pub base_capacity: f64,
     pub release: f64,
     pub placed: bool,
     pub handle: DVec3,
@@ -114,7 +115,7 @@ impl Brush {
         };
         let tuft = TUFT * (area / n.max(1) as f64).sqrt();
         let capacity = BASE_CAPACITY * (area / BASE_AREA) * (len / BASE_LEN);
-        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, tuft, stiffness: 0.35, friction: 0.7, capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
     }
 
     pub fn size(&self) -> f64 {

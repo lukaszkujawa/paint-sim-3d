@@ -692,9 +692,9 @@ impl App {
                 }
             }
         } else {
-            ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter places one stroke at a time with the selected tool and paint, trying many random colours and sizes and keeping only strokes that bring the canvas closer to the photo.").small().weak()).wrap());
+            ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter plans strokes in memory with a quick brush model, going after the areas that differ most from the photo and following its edges, then paints only the strokes that will stay visible with the real tool, keeping those that bring the canvas closer to the photo.").small().weak()).wrap());
         }
-        ui.checkbox(&mut self.evo.dry_passes, "Let each pass dry before the next").on_hover_text("When strokes stop helping, the painter dries the canvas and moves to a smaller tool, like painting in layers");
+        ui.checkbox(&mut self.evo.dry_passes, "Let each pass dry before the next").on_hover_text("When strokes start helping much less, the painter dries the canvas and moves to a smaller tool, like painting in layers");
         prop(ui, "Tries per stroke", |ui| {
             ui.add(egui::Slider::new(&mut self.evo.candidates, 4..=128).logarithmic(true).clamping(egui::SliderClamping::Edits));
         });
@@ -743,7 +743,8 @@ impl App {
         if let Some(ev) = &self.evo.run {
             let mono = |s: String| RichText::new(s).small();
             ui.add(egui::ProgressBar::new(ev.progress()).desired_height(14.0).text(RichText::new(format!("{:.0}% closer to the photo", ev.progress() * 100.0)).small()));
-            ui.label(mono(format!("{} kept of {} painted, {} tried", ev.kept, ev.painted, ev.tried)));
+            ui.label(mono(format!("{} kept of {} painted", ev.kept, ev.painted)));
+            ui.label(mono(format!("{} planned in memory, {} skipped as hidden", ev.tried, ev.pruned)));
             if running {
                 ui.label(mono(format!("Pass {}, tool size up to {:.1} mm", ev.passes + 1, ev.size_hi * 1e3)));
             }

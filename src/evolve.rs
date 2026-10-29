@@ -38,6 +38,21 @@ const MISS_LIMIT: usize = 24;
 const TABU: f32 = 0.5;
 const REGIONS: usize = 4;
 const AIMED_SHARE: f32 = 0.5;
+const SHARPEN_MM: f32 = 1.5;
+const SMOOTH_RANGE: f32 = 0.1;
+const BILATERAL_PASSES: usize = 2;
+const SEGMENT_SMOOTH_PX: f32 = 3.0;
+const SEGMENT_RANGE: f32 = 10.0;
+const SEGMENT_STRIDE: usize = 13;
+const REGION_COUNT: usize = 16;
+const KMEANS_ROUNDS: usize = 12;
+const MODE_PASSES: usize = 2;
+const MODE_RADIUS: usize = 2;
+const OUTSIDE_DISCOUNT: f32 = 0.85;
+const KIN_DE: f32 = 15.0;
+const TAPER_MIN: f32 = 0.45;
+const TAPER_END: f32 = 0.2;
+const PREP_SETTLE: f32 = 0.35;
 const FLOW_JITTER: f32 = 0.8;
 const GATE: f32 = 0.9;
 const DETAIL_RADIUS: usize = 6;
@@ -67,6 +82,161 @@ pub struct Photo {
     pub name: String,
     pub image: image::RgbaImage,
     pub texture: Option<egui::TextureHandle>,
+    shown: Option<Prep>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Prep {
+    pub contrast: f32,
+    pub blur_mm: f32,
+    pub sharpen: f32,
+    pub smooth_mm: f32,
+}
+
+impl Prep {
+    pub fn none() -> Self {
+        Self { contrast: 1.0, blur_mm: 0.0, sharpen: 0.0, smooth_mm: 0.0 }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::none()
+    }
+}
+
+fn bilateral(src: &[[f32; 3]], w: usize, h: usize, sigma_px: f32, range: f32) -> Vec<[f32; 3]> {
+    if sigma_px < 0.5 {
+        return src.to_vec();
+    }
+    let reach = (sigma_px * 2.0).ceil() as isize;
+    let kernel: Vec<f32> = (-reach..=reach).map(|i| (-(i * i) as f32 / (2.0 * sigma_px * sigma_px)).exp()).collect();
+    let inv = 1.0 / (2.0 * range * range);
+    let mut cur = src.to_vec();
+    for _ in 0..BILATERAL_PASSES {
+        for horizontal in [true, false] {
+            let prev = cur;
+            cur = (0..w * h)
+                .into_par_iter()
+                .map(|k| {
+                    let (x, y) = ((k % w) as isize, (k / w) as isize);
+                    let c = prev[k];
+                    let (mut sum, mut tot) = ([0.0f32; 3], 0.0f32);
+                    for (o, kw) in kernel.iter().enumerate() {
+                        let d = o as isize - reach;
+                        let (sx, sy) = if horizontal { ((x + d).clamp(0, w as isize - 1), y) } else { (x, (y + d).clamp(0, h as isize - 1)) };
+                        let v = prev[sy as usize * w + sx as usize];
+                        let dist = (v[0] - c[0]).powi(2) + (v[1] - c[1]).powi(2) + (v[2] - c[2]).powi(2);
+                        let wgt = kw * (-dist * inv).exp();
+                        for i in 0..3 {
+                            sum[i] += v[i] * wgt;
+                        }
+                        tot += wgt;
+                    }
+                    sum.map(|v| v / tot.max(1e-12))
+                })
+                .collect();
+        }
+    }
+    cur
+}
+
+fn segment(lab: &[[f32; 3]], w: usize, h: usize, seed: u64) -> (Vec<u8>, Vec<[f32; 3]>) {
+    let soft = bilateral(lab, w, h, SEGMENT_SMOOTH_PX, SEGMENT_RANGE);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let sample: Vec<[f32; 3]> = soft.iter().step_by(SEGMENT_STRIDE).copied().collect();
+    let mut centres = vec![sample[rng.random_range(0..sample.len())]];
+    while centres.len() < REGION_COUNT {
+        let d2: Vec<f64> = sample.iter().map(|p| centres.iter().map(|c| de(*p, *c)).fold(f32::MAX, f32::min).powi(2) as f64).collect();
+        let total: f64 = d2.iter().sum();
+        let mut pick = rng.random::<f64>() * total;
+        let mut chosen = sample.len() - 1;
+        for (i, d) in d2.iter().enumerate() {
+            pick -= d;
+            if pick <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centres.push(sample[chosen]);
+    }
+    let nearest = |p: &[f32; 3], centres: &[[f32; 3]]| centres.iter().enumerate().map(|(i, c)| (i, de(*p, *c))).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i).unwrap_or(0);
+    for _ in 0..KMEANS_ROUNDS {
+        let mut acc = vec![[0.0f64; 4]; centres.len()];
+        for p in &sample {
+            let i = nearest(p, &centres);
+            for c in 0..3 {
+                acc[i][c] += p[c] as f64;
+            }
+            acc[i][3] += 1.0;
+        }
+        for (c, a) in centres.iter_mut().zip(&acc) {
+            if a[3] > 0.0 {
+                *c = [(a[0] / a[3]) as f32, (a[1] / a[3]) as f32, (a[2] / a[3]) as f32];
+            }
+        }
+    }
+    let mut label: Vec<u8> = soft.par_iter().map(|p| nearest(p, &centres) as u8).collect();
+    for _ in 0..MODE_PASSES {
+        let prev = label;
+        label = (0..w * h)
+            .into_par_iter()
+            .map(|k| {
+                let (x, y) = ((k % w) as isize, (k / w) as isize);
+                let mut votes = [0u16; 256];
+                let r = MODE_RADIUS as isize;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (sx, sy) = ((x + dx).clamp(0, w as isize - 1), (y + dy).clamp(0, h as isize - 1));
+                        votes[prev[sy as usize * w + sx as usize] as usize] += 1;
+                    }
+                }
+                votes.iter().enumerate().max_by_key(|(_, v)| **v).map(|(i, _)| i as u8).unwrap_or(prev[k])
+            })
+            .collect();
+    }
+    (label, centres)
+}
+
+fn taper(t: f32) -> f32 {
+    let e = (t.min(1.0 - t) / TAPER_END).clamp(0.0, 1.0);
+    TAPER_MIN + (1.0 - TAPER_MIN) * e * e * (3.0 - 2.0 * e)
+}
+
+fn gaussian(src: &[f32], w: usize, h: usize, sigma_px: f32) -> Vec<f32> {
+    if sigma_px < 0.3 {
+        return src.to_vec();
+    }
+    let r = ((((12.0 * sigma_px * sigma_px / 3.0) + 1.0).sqrt() - 1.0) * 0.5).round().max(1.0) as usize;
+    box_blur(&box_blur(&box_blur(src, w, h, r), w, h, r), w, h, r)
+}
+
+pub fn prepare(img: &image::RgbaImage, prep: Prep, px_mm: f32) -> image::RgbaImage {
+    if prep.is_none() {
+        return img.clone();
+    }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let mut rgb: Vec<[f32; 3]> = img.pixels().map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]).collect();
+    if prep.smooth_mm > 0.0 {
+        rgb = bilateral(&rgb, w, h, prep.smooth_mm / px_mm.max(1e-6), SMOOTH_RANGE);
+    }
+    let mut chans: Vec<Vec<f32>> = (0..3).map(|c| rgb.iter().map(|p| p[c]).collect()).collect();
+    for ch in chans.iter_mut() {
+        let mut v = gaussian(ch, w, h, prep.blur_mm / px_mm.max(1e-6));
+        if prep.sharpen > 0.0 {
+            let soft = gaussian(&v, w, h, (SHARPEN_MM / px_mm.max(1e-6)).max(1.0));
+            for (x, b) in v.iter_mut().zip(&soft) {
+                *x += prep.sharpen * (*x - b);
+            }
+        }
+        for x in v.iter_mut() {
+            *x = (0.5 + (*x - 0.5) * prep.contrast).clamp(0.0, 1.0);
+        }
+        *ch = v;
+    }
+    let mut out = image::RgbaImage::new(w as u32, h as u32);
+    for (k, p) in out.pixels_mut().enumerate() {
+        *p = image::Rgba([(chans[0][k] * 255.0).round() as u8, (chans[1][k] * 255.0).round() as u8, (chans[2][k] * 255.0).round() as u8, 255]);
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,6 +289,8 @@ pub struct EvolveState {
     pub candidates: usize,
     pub follow: f64,
     pub intent: f64,
+    pub prep: Prep,
+    pub prep_touched: Option<std::time::Instant>,
     pub dry_passes: bool,
     pub longest: f64,
     pub active: bool,
@@ -132,7 +304,7 @@ pub struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, prep: Prep::none(), prep_touched: None, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
     }
 }
 
@@ -217,16 +389,17 @@ pub fn load_photo(path: &Path, aspect: f32) -> Result<Photo, String> {
     img.apply_orientation(orient);
     let crop = cover_crop(&img.to_rgba8(), aspect);
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    Ok(Photo { name, image: crop, texture: None })
+    Ok(Photo { name, image: crop, texture: None, shown: None })
 }
 
-pub fn preview(photo: &mut Photo, ctx: &egui::Context) -> egui::TextureHandle {
-    if let Some(t) = &photo.texture {
+pub fn preview(photo: &mut Photo, ctx: &egui::Context, prep: Prep, canvas_mm: f32) -> egui::TextureHandle {
+    if let Some(t) = photo.texture.as_ref().filter(|_| photo.shown == Some(prep)) {
         return t.clone();
     }
     let (w, h) = photo.image.dimensions();
     let ph = ((PREVIEW_W as f32) * h as f32 / w as f32).round().max(1.0) as u32;
-    let small = image::imageops::resize(&photo.image, PREVIEW_W, ph, image::imageops::FilterType::Triangle);
+    let small = prepare(&image::imageops::resize(&photo.image, PREVIEW_W, ph, image::imageops::FilterType::Triangle), prep, canvas_mm / PREVIEW_W as f32);
+    photo.shown = Some(prep);
     let ci = egui::ColorImage::from_rgba_unmultiplied([PREVIEW_W as usize, ph as usize], small.as_raw());
     let t = ctx.load_texture("evolve_photo", ci, egui::TextureOptions::LINEAR);
     photo.texture = Some(t.clone());
@@ -293,6 +466,8 @@ struct Cand {
     along: f32,
     traced: bool,
     stop: f32,
+    bound: bool,
+    region: u8,
     size: f64,
     hw: f32,
     pts: Vec<[f32; 2]>,
@@ -370,11 +545,18 @@ struct Model {
     target: Vec<[f32; 3]>,
     flow: Vec<[f32; 3]>,
     detail: Vec<f32>,
+    label: Vec<u8>,
+    kin: Vec<bool>,
+    regions: usize,
     weight: Vec<f32>,
-    swatches: Vec<Swatch>,
+    swatches: Arc<Vec<Swatch>>,
 }
 
 impl Model {
+    fn same_shape(&self, k: usize, region: u8) -> bool {
+        self.kin[self.label[k] as usize * self.regions + region as usize]
+    }
+
     fn index(&self, p: [f32; 2]) -> usize {
         (p[1].max(0.0) as usize).min(self.h - 1) * self.w + (p[0].max(0.0) as usize).min(self.w - 1)
     }
@@ -395,10 +577,12 @@ impl Model {
         ]
     }
 
-    fn footprint(&self, cov: &mut [f32], pts: &[[f32; 2]], hw: f32) -> Vec<(usize, f32)> {
+    fn footprint(&self, cov: &mut [f32], pts: &[[f32; 2]], hw: f32, tapered: bool) -> Vec<(usize, f32)> {
         let mut touched = Vec::new();
         let segs: Vec<[[f32; 2]; 2]> = if pts.len() < 2 { vec![[pts[0], pts[0]]] } else { pts.windows(2).map(|w| [w[0], w[1]]).collect() };
-        for [a, e] in segs {
+        let n = segs.len();
+        for (si, [a, e]) in segs.into_iter().enumerate() {
+            let hw = if tapered && n > 2 { hw * taper((si as f32 + 0.5) / n as f32) } else { hw };
             let bb = self.bbox(&[a, e], hw + 1.0);
             let (ex, ey) = (e[0] - a[0], e[1] - a[1]);
             let l2 = ex * ex + ey * ey;
@@ -569,7 +753,7 @@ impl Sketch {
         self.err = self.current.par_iter().zip(&m.target).map(|(a, b)| de(*a, *b)).collect();
         self.refresh_tiles();
         for p in pending {
-            let foot = m.footprint(&mut self.scratch, &p.pts, p.hw);
+            let foot = m.footprint(&mut self.scratch, &p.pts, p.hw, p.kind == ToolKind::Brush);
             self.apply(&foot, p.lab);
         }
     }
@@ -710,16 +894,83 @@ impl Sketch {
         ([acc[0] / n, acc[1] / n, acc[2] / n], [acc[3] / n, acc[4] / n, acc[5] / n])
     }
 
-    fn score(&self, foot: &[(usize, f32)], c: [f32; 3]) -> f32 {
-        let o = self.opacity;
-        let mut delta = 0.0;
-        for &(k, a) in foot {
-            let a = a * o;
-            let cur = self.current[k];
-            let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
-            delta += self.gain(k, self.m.weight[k] * (de(new, self.m.target[k]) - self.err[k]));
+    fn pixel_delta(&self, k: usize, a: f32, c: [f32; 3], region: Option<u8>) -> f32 {
+        let a = a * self.opacity;
+        let cur = self.current[k];
+        let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
+        let d = self.gain(k, self.m.weight[k] * (de(new, self.m.target[k]) - self.err[k]));
+        match region {
+            Some(r) if d < 0.0 && !self.m.same_shape(k, r) => d * (1.0 - OUTSIDE_DISCOUNT * self.intent),
+            _ => d,
         }
-        delta
+    }
+
+    fn score(&self, foot: &[(usize, f32)], c: [f32; 3], region: Option<u8>) -> f32 {
+        foot.iter().map(|&(k, a)| self.pixel_delta(k, a, c, region)).sum()
+    }
+
+    fn trim(&mut self, pts: &[[f32; 2]], hw: f32, c: [f32; 3], region: Option<u8>) -> Vec<[f32; 2]> {
+        if pts.len() < 4 {
+            return pts.to_vec();
+        }
+        let m = self.m.clone();
+        let gains: Vec<f32> = pts
+            .windows(2)
+            .map(|w| m.footprint(&mut self.scratch, w, hw, false).iter().map(|&(k, a)| self.pixel_delta(k, a, c, region)).sum())
+            .collect();
+        let (mut best, mut best_range) = (0.0f32, (0, gains.len()));
+        let (mut run, mut start) = (0.0f32, 0usize);
+        for (i, g) in gains.iter().enumerate() {
+            if run > 0.0 {
+                run = 0.0;
+                start = i;
+            }
+            run += g;
+            if run < best {
+                best = run;
+                best_range = (start, i + 1);
+            }
+        }
+        if best >= 0.0 {
+            return pts.to_vec();
+        }
+        pts[best_range.0..=best_range.1].to_vec()
+    }
+
+    fn bounded(&self, pts: Vec<[f32; 2]>, centre: [f32; 2], region: u8, margin: f32) -> Vec<[f32; 2]> {
+        if pts.len() < 2 {
+            return pts;
+        }
+        let m = &self.m;
+        let ci = (0..pts.len()).min_by(|a, b| {
+            let d = |p: [f32; 2]| (p[0] - centre[0]).powi(2) + (p[1] - centre[1]).powi(2);
+            d(pts[*a]).total_cmp(&d(pts[*b]))
+        }).unwrap();
+        let inside = |p: [f32; 2]| m.same_shape(m.index(p), region);
+        let mut a = ci;
+        while a > 0 && inside(pts[a - 1]) {
+            a -= 1;
+        }
+        let mut b = ci;
+        while b + 1 < pts.len() && inside(pts[b + 1]) {
+            b += 1;
+        }
+        let dist = |i: usize, j: usize| ((pts[i][0] - pts[j][0]).powi(2) + (pts[i][1] - pts[j][1]).powi(2)).sqrt();
+        if b + 1 < pts.len() {
+            let mut gone = 0.0;
+            while b > ci && gone < margin {
+                gone += dist(b - 1, b);
+                b -= 1;
+            }
+        }
+        if a > 0 {
+            let mut gone = 0.0;
+            while a < ci && gone < margin {
+                gone += dist(a, a + 1);
+                a += 1;
+            }
+        }
+        pts[a..=b].to_vec()
     }
 
     fn pick_colour(&mut self, foot: &[(usize, f32)], jitter: f32) -> usize {
@@ -814,13 +1065,31 @@ impl Sketch {
         let (lo, hi) = self.len_range(c.size, c.hw);
         c.len = c.len.clamp(lo, hi);
         let raw = if c.traced { self.trace(&c) } else { self.bezier(&c) };
-        c.pts = self.clip(raw, c.centre, c.stop);
         let m = self.m.clone();
-        let foot = m.footprint(&mut self.scratch, &c.pts, c.hw);
+        let tapered = self.kind == ToolKind::Brush;
+        c.region = m.label[m.index(c.centre)];
+        let region = c.bound.then_some(c.region);
+        c.pts = if c.bound {
+            let margin = if tapered { (0.5 * APPROACH_HW * c.hw as f64).clamp(0.5 * APPROACH_MIN / m.cell, 0.5 * APPROACH_MAX / m.cell) as f32 } else { 0.0 };
+            self.bounded(raw, c.centre, c.region, margin)
+        } else {
+            self.clip(raw, c.centre, c.stop)
+        };
+        let foot = m.footprint(&mut self.scratch, &c.pts, c.hw, tapered);
         if refit {
             c.swatch = self.pick_colour(&foot, jitter);
         }
-        c.score = self.score(&foot, m.swatches[c.swatch].lab);
+        let colour = m.swatches[c.swatch].lab;
+        if c.bound {
+            let trimmed = self.trim(&c.pts, c.hw, colour, region);
+            if trimmed.len() != c.pts.len() {
+                c.pts = trimmed;
+                let foot = m.footprint(&mut self.scratch, &c.pts, c.hw, tapered);
+                c.score = self.score(&foot, colour, region);
+                return c;
+            }
+        }
+        c.score = self.score(&foot, colour, region);
         c
     }
 
@@ -849,7 +1118,8 @@ impl Sketch {
             self.rng.random::<f32>() * std::f32::consts::TAU
         };
         let stop = self.random_stop();
-        let c = Cand { centre, angle, len, bend: 0.12 * gauss(&mut self.rng).clamp(-2.0, 2.0), along: self.rng.random(), traced, stop, size, hw, pts: Vec::new(), swatch: 0, score: 0.0 };
+        let bound = shaped;
+        let c = Cand { centre, angle, len, bend: 0.12 * gauss(&mut self.rng).clamp(-2.0, 2.0), along: self.rng.random(), traced, stop, bound, region: 0, size, hw, pts: Vec::new(), swatch: 0, score: 0.0 };
         self.evaluate(c, true, 3.0)
     }
 
@@ -924,7 +1194,7 @@ impl Sketch {
         mix[14] = job.paint[14];
         let path = best.pts.iter().map(|p| DVec2::new(p[0] as f64 * m.cell, p[1] as f64 * m.cell)).collect();
         let lead = if self.kind == ToolKind::Brush { (APPROACH_HW * best.hw as f64 * m.cell).clamp(APPROACH_MIN, APPROACH_MAX) } else { 0.0 };
-        let foot = m.footprint(&mut self.scratch, &best.pts, best.hw);
+        let foot = m.footprint(&mut self.scratch, &best.pts, best.hw, self.kind == ToolKind::Brush);
         let plan = Plan { path, lead, size: best.size, mix, speed: self.range.speed, kind: self.kind, dry: false, pts: best.pts, hw: best.hw, lab: m.swatches[best.swatch].lab, predicted: best.score, width_gain: self.width_gain, pass: self.sched.pass };
         Some((plan, foot))
     }
@@ -1054,6 +1324,10 @@ impl Sketch {
 }
 
 pub struct Evolver {
+    base: image::RgbaImage,
+    first: Vec<[f32; 3]>,
+    pub prep: Prep,
+    gain: Option<[f32; 3]>,
     pub w: usize,
     pub h: usize,
     pub factor: u32,
@@ -1062,7 +1336,7 @@ pub struct Evolver {
     white: [f32; 3],
     black: [f32; 3],
     pub calibrated: bool,
-    palette: Option<Vec<Swatch>>,
+    palette: Arc<Vec<Swatch>>,
     model: Option<Arc<Model>>,
     mask: Vec<f32>,
     focus: Option<Focus>,
@@ -1098,20 +1372,30 @@ pub struct Evolver {
 }
 
 impl Evolver {
-    pub fn new(photo: &image::RgbaImage, film_w: u32, film_h: u32, dx: f32, set: &PigmentSet, cmf: &[f32], seed: u64) -> Self {
-        let factor = (film_w / EVAL_WIDTH).max(1);
-        let (w, h) = ((film_w / factor) as usize, (film_h / factor) as usize);
-        let img = image::imageops::resize(&cover_crop(photo, w as f32 / h as f32), w as u32, h as u32, image::imageops::FilterType::Triangle);
-        let white = color::mix_rgb(set, cmf, &color::PaintMix::pure(WHITE).frac).map(decode);
-        let black = color::mix_rgb(set, cmf, &color::PaintMix::pure(BLACK).frac).map(decode);
-        let photo: Vec<[f32; 3]> = (0..w * h)
+    fn linear(img: &image::RgbaImage, prep: Prep, cell_mm: f32) -> Vec<[f32; 3]> {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let img = prepare(img, prep, cell_mm);
+        (0..w * h)
             .into_par_iter()
             .map(|k| {
                 let p = img.get_pixel((k % w) as u32, (h - 1 - k / w) as u32);
                 [decode(p[0] as f32 / 255.0), decode(p[1] as f32 / 255.0), decode(p[2] as f32 / 255.0)]
             })
-            .collect();
+            .collect()
+    }
+
+    pub fn new(photo: &image::RgbaImage, film_w: u32, film_h: u32, dx: f32, set: &PigmentSet, cmf: &[f32], seed: u64, prep: Prep) -> Self {
+        let factor = (film_w / EVAL_WIDTH).max(1);
+        let (w, h) = ((film_w / factor) as usize, (film_h / factor) as usize);
+        let img = image::imageops::resize(&cover_crop(photo, w as f32 / h as f32), w as u32, h as u32, image::imageops::FilterType::Triangle);
+        let white = color::mix_rgb(set, cmf, &color::PaintMix::pure(WHITE).frac).map(decode);
+        let black = color::mix_rgb(set, cmf, &color::PaintMix::pure(BLACK).frac).map(decode);
+        let photo = Self::linear(&img, prep, dx * factor as f32 * 1e3);
         Self {
+            base: img,
+            first: Vec::new(),
+            prep,
+            gain: None,
             w,
             h,
             factor,
@@ -1120,7 +1404,7 @@ impl Evolver {
             white,
             black,
             calibrated: false,
-            palette: Some(swatches(set, cmf)),
+            palette: Arc::new(swatches(set, cmf)),
             model: None,
             mask: vec![1.0; w * h],
             focus: None,
@@ -1156,7 +1440,23 @@ impl Evolver {
         }
     }
 
+    pub fn set_prep(&mut self, prep: Prep) {
+        self.prep = prep;
+        self.photo = Self::linear(&self.base, prep, (self.cell * 1e3) as f32);
+        if let Some(g) = self.gain {
+            self.calibrate(g);
+        }
+        self.sketch = None;
+        self.gen += 1;
+        self.queue.clear();
+        self.ready = None;
+        self.synced = false;
+        self.finished = false;
+        self.start_err = 0.0;
+    }
+
     pub fn calibrate(&mut self, gain: [f32; 3]) {
+        self.gain = Some(gain);
         let (white, black) = (self.white, self.black);
         let target: Vec<[f32; 3]> = self
             .photo
@@ -1173,8 +1473,11 @@ impl Evolver {
         let weight = edges.iter().map(|e| 1.0 + EDGE_WEIGHT * e).collect();
         let flow = flow_field(&tangent, self.w, self.h);
         let detail = box_blur(&edges, self.w, self.h, DETAIL_RADIUS);
-        let swatches = self.palette.take().unwrap_or_default();
-        self.model = Some(Arc::new(Model { w: self.w, h: self.h, cell: self.cell, target, flow, detail, weight, swatches }));
+        let (label, centres) = segment(&target, self.w, self.h, 7);
+        let n = centres.len();
+        let kin: Vec<bool> = (0..n * n).map(|k| de(centres[k / n], centres[k % n]) < KIN_DE).collect();
+        let swatches = self.palette.clone();
+        self.model = Some(Arc::new(Model { w: self.w, h: self.h, cell: self.cell, target, flow, detail, label, kin, regions: n, weight, swatches }));
         self.calibrated = true;
         log::info!("display gain {:.2} {:.2} {:.2}", gain[0], gain[1], gain[2]);
     }
@@ -1188,8 +1491,11 @@ impl Evolver {
         let m = self.model.clone().expect("calibrated");
         self.err = self.current.par_iter().zip(&m.target).map(|(a, b)| de(*a, *b)).collect();
         self.mean_err = self.err.iter().sum::<f32>() / self.err.len().max(1) as f32;
+        if self.first.is_empty() {
+            self.first = self.current.clone();
+        }
         if self.start_err == 0.0 {
-            self.start_err = self.mean_err;
+            self.start_err = self.first.par_iter().zip(&m.target).map(|(a, b)| de(*a, *b)).sum::<f32>() / self.first.len().max(1) as f32;
         }
         self.synced = true;
     }
@@ -1270,7 +1576,9 @@ impl Evolver {
         }
         if self.job.as_ref().map(|j| j.is_finished()).unwrap_or(false) {
             let (sk, batch) = self.job.take().unwrap().join().expect("planner");
-            self.sketch = Some(sk);
+            if self.model.as_ref().map(|m| Arc::ptr_eq(m, &sk.m)).unwrap_or(false) {
+                self.sketch = Some(sk);
+            }
             if batch.gen == self.gen {
                 self.tried += batch.planned as u64;
                 self.pruned += batch.pruned as u64;
@@ -1318,7 +1626,7 @@ impl Evolver {
         let m = self.model.clone().expect("calibrated");
         let rw = region[2] - region[0];
         let mut covs = vec![0.0f32; rw * (region[3] - region[1])];
-        for (k, c) in m.footprint(&mut self.scratch, &plan.pts, plan.hw) {
+        for (k, c) in m.footprint(&mut self.scratch, &plan.pts, plan.hw, plan.kind == ToolKind::Brush) {
             let (i, j) = (k % self.w, k / self.w);
             if (region[0]..region[2]).contains(&i) && (region[1]..region[3]).contains(&j) {
                 covs[(j - region[1]) * rw + (i - region[0])] = c;
@@ -1558,7 +1866,7 @@ impl App {
         match self.evo.run.as_mut().filter(|ev| ev.photo_gen == gen) {
             Some(ev) => ev.resume(),
             None => {
-                let mut ev = Evolver::new(&photo.image, self.film.w, self.film.h, self.film.dx, &self.film.pigments, &self.film.cmf_table, rand::random());
+                let mut ev = Evolver::new(&photo.image, self.film.w, self.film.h, self.film.dx, &self.film.pigments, &self.film.cmf_table, rand::random(), self.evo.prep);
                 ev.photo_gen = gen;
                 self.evo.run = Some(ev);
             }
@@ -1643,6 +1951,11 @@ impl App {
             Phase::Plan => {
                 self.tool.flowing = false;
                 self.tool.vel = DVec3::ZERO;
+                let settled = self.evo.prep_touched.map(|t| t.elapsed().as_secs_f32() > PREP_SETTLE).unwrap_or(true);
+                if ev.prep != self.evo.prep && settled {
+                    ev.set_prep(self.evo.prep);
+                    return Phase::Observe;
+                }
                 let (kind, shape) = (self.tool.kind, self.brush.shape);
                 if let Some(size) = ev.set_tool(kind, shape, self.tool_size(kind)) {
                     self.evo.user_sizes.retain(|u| u.0 != kind || u.1 != shape);
@@ -1909,7 +2222,9 @@ mod tests {
         let cmf = color::cmf_table();
         let img = image::open(&path).unwrap().to_rgba8();
         let photo = cover_crop(&img, 1.5);
-        let mut ev = Evolver::new(&photo, 3072, 2048, 1.2 / 3072.0, &set, &cmf, 7);
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let prep = Prep { contrast: env("EVO_CONTRAST", 1.0), blur_mm: env("EVO_BLUR", 0.0), sharpen: env("EVO_SHARPEN", 0.0), smooth_mm: env("EVO_SMOOTH", 0.0) };
+        let mut ev = Evolver::new(&photo, 3072, 2048, 1.2 / 3072.0, &set, &cmf, 7, prep);
         ev.calibrate([2.11, 2.2, 2.27]);
         let m = ev.model.clone().unwrap();
         let kind = ToolKind::Brush;

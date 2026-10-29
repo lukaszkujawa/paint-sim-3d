@@ -652,7 +652,7 @@ impl App {
         });
         let ctx = ui.ctx().clone();
         if let Some(photo) = self.evo.photo.as_mut() {
-            let tex = evolve::preview(photo, &ctx);
+            let tex = evolve::preview(photo, &ctx, self.evo.prep, self.film.settings.width_m * 1e3);
             let w = ui.available_width() - 12.0;
             let size = tex.size_vec2();
             let focus = &mut self.evo.focus;
@@ -724,6 +724,11 @@ impl App {
         if shape != evolve::FocusShape::Off {
             num(ui, "Soft edge", &mut self.evo.focus.soft, 0.0, 2.0, 100.0, " %", false);
             num(ui, "Outside", &mut self.evo.focus.outside, 0.0, 1.0, 100.0, " %", false);
+        }
+        let p = &mut self.evo.prep;
+        let touched = num(ui, "Contrast", &mut p.contrast, 0.5, 2.0, 100.0, " %", false) | num(ui, "Blur", &mut p.blur_mm, 0.0, 10.0, 1.0, " mm", false) | num(ui, "Sharpen", &mut p.sharpen, 0.0, 3.0, 100.0, " %", false) | num(ui, "Smooth, keep edges", &mut p.smooth_mm, 0.0, 10.0, 1.0, " mm", false);
+        if touched {
+            self.evo.prep_touched = Some(std::time::Instant::now());
         }
         num(ui, "Shape following", &mut self.evo.intent, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);

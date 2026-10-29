@@ -590,6 +590,18 @@ impl App {
                     f.outside = v.get(5).copied().unwrap_or(f.outside);
                 }
             }
+            if let Some(v) = arg("--contrast").and_then(|v| v.parse::<f32>().ok()) {
+                self.evo.prep.contrast = v / 100.0;
+            }
+            if let Some(v) = arg("--blur").and_then(|v| v.parse::<f32>().ok()) {
+                self.evo.prep.blur_mm = v;
+            }
+            if let Some(v) = arg("--smooth").and_then(|v| v.parse::<f32>().ok()) {
+                self.evo.prep.smooth_mm = v;
+            }
+            if let Some(v) = arg("--sharpen").and_then(|v| v.parse::<f32>().ok()) {
+                self.evo.prep.sharpen = v / 100.0;
+            }
             if let Some(v) = arg("--intent").and_then(|v| v.parse::<f64>().ok()) {
                 self.evo.intent = v / 100.0;
             }

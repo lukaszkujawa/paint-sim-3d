@@ -43,6 +43,11 @@ fn deposit(@builtin(global_invocation_id) id: vec3<u32>) {
     var top_lay = 0u;
     for (var q = 0u; q < n; q++) {
         let d = deposits[tile_items[start + q]];
+        let ab = d.p1 - d.p0;
+        let along = clamp(dot(p - d.p0, ab) / max(dot(ab, ab), 1e-30), 0.0, 1.0);
+        let reach = 1.415 * max(d.r0, d.r1) + 0.6 * P.dx;
+        let off = p - d.p0 - along * ab;
+        if dot(off, off) > reach * reach { continue; }
         var add = 0.0;
         for (var sy = 0u; sy < 4u; sy++) {
             for (var sx = 0u; sx < 4u; sx++) {

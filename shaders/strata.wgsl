@@ -192,8 +192,6 @@ fn strata_update(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     let id = tile_cell(wid, lid);
     if !in_grid(id) { return; }
     let c = idx(id.x, id.y);
-    var s = stack_load(c);
-    let a = alpha_s[c];
     let fr = acc_s[4u * c];
     let fu = acc_s[4u * c + 1u];
     let fdg = acc_s[4u * c + 2u];
@@ -210,6 +208,35 @@ fn strata_update(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     if id.y > 0u && cell_active(id.x, id.y - 1u) { cd = idx(id.x, id.y - 1u); fd = acc_s[4u * cd + 1u]; }
     if id.x > 0u && id.y > 0u && cell_active(id.x - 1u, id.y - 1u) { cll = idx(id.x - 1u, id.y - 1u); fll = acc_s[4u * cll + 2u]; }
     if id.x > 0u && id.y + 1u < P.size.y && cell_active(id.x - 1u, id.y + 1u) { clu = idx(id.x - 1u, id.y + 1u); flu = acc_s[4u * clu + 3u]; }
+    let z4 = vec4<f32>(0.0);
+    if all(fr == z4) && all(fu == z4) && all(fdg == z4) && all(feg == z4) && all(fl == z4) && all(fd == z4) && all(fll == z4) && all(flu == z4) {
+        let hc = h[c];
+        let th = max(strata_h[c], z4);
+        var nt = z4;
+        var cu = strata_cure[c];
+        if hc <= 0.0 {
+            cu = z4;
+        } else {
+            let sum = th.x + th.y + th.z + th.w;
+            nt = th;
+            if sum > 0.0 { nt = th * (hc / sum); }
+        }
+        var plain = true;
+        for (var k = 0u; k < 3u; k++) {
+            if nt[k] <= 0.0 && nt[k + 1u] > 0.0 { plain = false; }
+            if nt[k] > 0.0 && nt[k] < P.misc.x && nt[k + 1u] > 0.0 { plain = false; }
+        }
+        if plain {
+            strata_h2[c] = nt;
+            strata_cure[c] = cu;
+            for (var k = 0u; k < 8u; k++) {
+                strata_pig2[c * 8u + k] = strata_pig[c * 8u + k];
+            }
+            return;
+        }
+    }
+    var s = stack_load(c);
+    let a = alpha_s[c];
     let out = max(fr, vec4<f32>(0.0)) + max(fu, vec4<f32>(0.0)) + max(fdg, vec4<f32>(0.0)) + max(feg, vec4<f32>(0.0)) + max(-fl, vec4<f32>(0.0)) + max(-fd, vec4<f32>(0.0)) + max(-fll, vec4<f32>(0.0)) + max(-flu, vec4<f32>(0.0));
     for (var k = 0u; k < 4u; k++) {
         s.th[k] = max(s.th[k] - out[k] * a[k] * P.inv_dx, 0.0);

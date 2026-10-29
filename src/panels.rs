@@ -534,6 +534,9 @@ impl App {
             if ui.button("Clean brush").clicked() {
                 self.brush.clean();
             }
+            if ui.checkbox(&mut self.tool.infinite, "Never runs dry").on_hover_text("Keep the bristles topped up with the current paint").changed() && self.tool.infinite {
+                self.brush.top_up(&self.paint.frac);
+            }
         });
     }
 
@@ -696,10 +699,10 @@ impl App {
             ui.add(egui::Slider::new(&mut self.evo.candidates, 4..=128).logarithmic(true).clamping(egui::SliderClamping::Edits));
         });
         let mut shape = self.evo.focus.shape;
-        prop(ui, "Focus on", |ui| {
-            ui.selectable_value(&mut shape, evolve::FocusShape::Off, "Everything").on_hover_text("Paint the whole canvas");
+        prop(ui, "Focus", |ui| {
+            ui.selectable_value(&mut shape, evolve::FocusShape::Off, "All").on_hover_text("Paint the whole canvas");
             ui.selectable_value(&mut shape, evolve::FocusShape::Circle, "Circle").on_hover_text("Drag on the photo from the centre outwards");
-            ui.selectable_value(&mut shape, evolve::FocusShape::Rect, "Rectangle").on_hover_text("Drag on the photo from one corner to the other");
+            ui.selectable_value(&mut shape, evolve::FocusShape::Rect, "Box").on_hover_text("Drag on the photo from one corner to the other");
         });
         if shape != self.evo.focus.shape {
             let f = &mut self.evo.focus;
@@ -721,7 +724,6 @@ impl App {
         if shape != evolve::FocusShape::Off {
             num(ui, "Soft edge", &mut self.evo.focus.soft, 0.0, 2.0, 100.0, " %", false);
             num(ui, "Outside", &mut self.evo.focus.outside, 0.0, 1.0, 100.0, " %", false);
-            ui.add(egui::Label::new(RichText::new("Drag on the photo to place the region. Strokes start inside it and are only credited for what they improve there, fading across the soft edge to the outside strength; damage anywhere still counts against them.").small().weak()).wrap());
         }
         num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Longest stroke", &mut self.evo.longest, 0.01, 1.2, 100.0, " cm", true);

@@ -19,6 +19,7 @@ use render::{Beauty, Camera, Refine, Renderer, TubeRenderer};
 use tools::{Airborne, CoarseSurface, Tool, ToolKind};
 use glam::DVec3;
 use std::sync::Arc;
+use rayon::prelude::*;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -300,7 +301,7 @@ impl App {
             paint_pick: [0.5; 3],
             custom_mixes: Vec::new(),
             prof: String::new(),
-            auto_quality: true,
+            auto_quality: std::env::var("PAINT_NO_AUTOQ").is_err(),
             frame_budget_ms: 14.0,
             brush_sink: 0.88,
             brush_raise: 0.0,
@@ -610,6 +611,37 @@ impl App {
                 }
             }
             return self.apply_painter();
+        }
+        if a.script == "brushcurve" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
+            if f == 1 {
+                let shape = if args.iter().any(|a| a == "--flat") { brush::BrushShape::Flat } else { brush::BrushShape::Round };
+                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                self.rebuild_brush(shape, n, len, arg("--size").unwrap_or(30.0) * 1e-3);
+                self.tool.kind = ToolKind::Brush;
+                self.prev_kind = ToolKind::Brush;
+                self.tool.height = self.brush.len * arg("--rest").unwrap_or(0.75);
+                let mut p = color::PaintMix::pure(1);
+                p.frac[13] = 40.0;
+                p.frac[14] = (20f32).ln() + 10.0;
+                self.brush.dip(&p.frac);
+                self.paint.frac = p.frac;
+                self.tool.infinite = args.iter().any(|a| a == "--infinite");
+            }
+            let t = (f as f64 - 20.0) / 60.0;
+            self.tool.flowing = f >= 20 && t < 4.0;
+            let a = t.clamp(0.0, 4.0) * std::f64::consts::FRAC_PI_2 * arg("--turns").unwrap_or(1.0);
+            let h = self.tool.height;
+            let pos = DVec3::new(w * 0.5 + 0.2 * (a - std::f64::consts::PI * 0.5) / std::f64::consts::PI, hgt * 0.5 + 0.15 * a.sin(), h);
+            if f % 20 == 0 {
+                let v = (pos - self.tool.pos) * 60.0;
+                log::warn!("curve f {} dir {:.0} angle {:.0} load {:.3}", f, (v.y.atan2(v.x) + std::f64::consts::FRAC_PI_2).to_degrees(), self.brush.angle.to_degrees(), self.brush.total_load() / self.brush.total_capacity());
+            }
+            self.tool.pos = pos;
+            return true;
         }
         if a.script == "brush4" {
             let f = self.frame_index;
@@ -1555,7 +1587,10 @@ impl App {
         let frame_dt = (1.0 / 60.0) * scale;
         self.sim_dt = frame_dt as f64;
         if present && self.auto_quality && !self.paused {
-            let ms = (real_dt * 1e3 / steps as f32 - self.last_cpu_ms).max(0.0);
+            let ms = match self.film.clock.as_ref().filter(|c| c.valid) {
+                Some(c) => steps as f32 * c.sim_ms + c.render_ms,
+                None => (real_dt * 1e3 / steps as f32 - self.last_cpu_ms).max(0.0),
+            };
             let s = &mut self.film.settings;
             if ms > self.frame_budget_ms * 1.15 {
                 s.max_substeps = (s.max_substeps as f32 * 0.85).floor().max(8.0) as u32;
@@ -1564,6 +1599,7 @@ impl App {
             }
         }
 
+        let t_tool = Instant::now();
         let mut deposits: Vec<Deposit> = Vec::new();
         if self.auto.as_ref().map(|a| a.script.is_empty()).unwrap_or(false) {
             self.scripted_deposits(&mut deposits);
@@ -1932,6 +1968,9 @@ impl App {
             let mut res = Vec::new();
             self.film.poll_reservoir(&self.gpu, &mut res);
             self.brush_scraped += self.brush.absorb(&res);
+            if self.tool.infinite && !self.evolving() {
+                self.brush.top_up(&self.paint.frac);
+            }
             if !self.paused {
                 let lift = if self.tool.flowing { self.brush_raise } else { 0.04 };
                 let h = match pen {
@@ -1944,10 +1983,18 @@ impl App {
                 let sink = self.brush_sink;
                 let (c, rel) = brush.update(handle, frame_dt as f64, &|x, y| surf.brush_floor(x, y, sink), self.film.dx as f64);
                 contacts = c;
-                for r in rel {
-                    let pig = color::PaintMix { frac: r.comp }.normalized().packed();
-                    let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, self.film.dx).laid_by(Method::Brush).recycled();
-                    self.brush_released += r.vol * d.inside_fraction(self.film.settings.width_m, self.film.settings.height_m) as f64;
+                let (dx, w, hgt) = (self.film.dx, self.film.settings.width_m, self.film.settings.height_m);
+                let laid: Vec<(Deposit, f64)> = rel
+                    .par_iter()
+                    .map(|r| {
+                        let pig = color::PaintMix { frac: r.comp }.normalized().packed();
+                        let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, dx).laid_by(Method::Brush).recycled();
+                        let inside = r.vol * d.inside_fraction(w, hgt) as f64;
+                        (d, inside)
+                    })
+                    .collect();
+                for (d, inside) in laid {
+                    self.brush_released += inside;
                     deposits.push(d);
                 }
             }
@@ -1982,6 +2029,7 @@ impl App {
         }
         self.film.upload_contacts(&self.gpu, &contacts);
         self.prev_kind = self.tool.kind;
+        let ms_tool = t_tool.elapsed().as_secs_f32() * 1e3;
         let t_air = Instant::now();
         if !self.paused {
             let g = self.film.gravity_vec();
@@ -2056,11 +2104,17 @@ impl App {
         let Some(surface_tex) = surface_tex else {
             let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("step") });
             let slots = self.encode_sim(&mut enc, &deposits, knife, frame_dt);
-            self.gpu.queue.submit(std::iter::once(enc.finish()));
+            match self.film.prof.as_mut() {
+                Some(p) => p.finish(&self.gpu, enc),
+                None => {
+                    self.gpu.queue.submit(std::iter::once(enc.finish()));
+                }
+            }
             self.map_slots(slots);
             self.frame_index += 1;
             return;
         };
+        let t_ui = Instant::now();
         let raw = self.ui.state.take_egui_input(&self.window);
         self.ui.ctx.begin_pass(raw);
         if self.auto.is_none() {
@@ -2076,6 +2130,7 @@ impl App {
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         self.ui.state.handle_platform_output(&self.window, std::mem::take(&mut out.platform_output));
         let prims = self.ui.ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let ms_ui = t_ui.elapsed().as_secs_f32() * 1e3;
 
         let vr = self.view_rect;
         let vr = [vr[0].clamp(0.0, size.width as f32 - 1.0), vr[1].clamp(0.0, size.height as f32 - 1.0), vr[2].max(1.0), vr[3].max(1.0)];
@@ -2087,10 +2142,15 @@ impl App {
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
         let t_enc = Instant::now();
+        if let Some(c) = self.film.clock.as_mut() {
+            c.poll();
+            c.begin();
+        }
         let slots = self.encode_sim(&mut enc, &deposits, knife, frame_dt);
         let ms_enc = t_enc.elapsed().as_secs_f32() * 1e3;
-        self.prof = format!("air {:.1} ms {}  mesh {:.1} ms  encode {:.1} ms  frame {:.1} ms  rod verts {}  deposits {}", ms_air, air_detail, ms_mesh, ms_enc, real_dt * 1e3, nverts, deposits.len());
-        self.last_cpu_ms = ms_air + ms_mesh + ms_enc;
+        let (gpu_sim, gpu_render) = self.film.clock.as_ref().map(|c| (c.sim_ms, c.render_ms)).unwrap_or((0.0, 0.0));
+        self.prof = format!("tool {:.1} ms  air {:.1} ms {}  mesh {:.1} ms  ui {:.1} ms  encode {:.1} ms  gpu sim {:.1} ms  render {:.1} ms  frame {:.1} ms  rod verts {}  deposits {}", ms_tool, ms_air, air_detail, ms_mesh, ms_ui, ms_enc, gpu_sim, gpu_render, real_dt * 1e3, nverts, deposits.len());
+        self.last_cpu_ms = ms_tool + ms_air + ms_mesh + ms_ui + ms_enc;
         if self.auto.as_ref().map(|a| a.script.starts_with("stress") || a.script == "pollock").unwrap_or(false) && (self.frame_index % 300 == 0 || (real_dt > 0.05 && self.frame_index % 20 == 0)) {
             let vmax = self.air.rods.iter().flat_map(|r| r.v.iter()).map(|v| v.length()).fold(0.0f64, f64::max);
             log::warn!("vmax {:.2} m/s", vmax);
@@ -2114,7 +2174,10 @@ impl App {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: match self.film.prof.as_mut() {
+                    Some(p) => p.render_writes("render"),
+                    None => self.film.clock.as_ref().and_then(|c| c.render(true)),
+                },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2136,7 +2199,7 @@ impl App {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.film.prof.as_mut().and_then(|p| p.render_writes("tubes")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2153,7 +2216,7 @@ impl App {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.film.clock.as_ref().and_then(|c| c.render(false)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2164,7 +2227,21 @@ impl App {
             self.ui.renderer.free_texture(id);
         }
         textures_delta.clear();
-        self.gpu.queue.submit(cmds.into_iter().chain(std::iter::once(enc.finish())));
+        if let Some(c) = self.film.clock.as_ref() {
+            c.resolve(&mut enc);
+        }
+        match self.film.prof.as_mut() {
+            Some(p) => {
+                self.gpu.queue.submit(cmds);
+                p.finish(&self.gpu, enc);
+            }
+            None => {
+                self.gpu.queue.submit(cmds.into_iter().chain(std::iter::once(enc.finish())));
+            }
+        }
+        if let Some(c) = self.film.clock.as_mut() {
+            c.map();
+        }
         self.map_slots(slots);
         self.frame_index += 1;
         self.autosave_tick(false);

@@ -1,5 +1,5 @@
 use crate::color;
-use crate::gpu::{compute_pipeline, dispatch, BindBuilder, Gpu};
+use crate::gpu::{compute_pipeline, dispatch, BindBuilder, Gpu, GpuClock, GpuProf};
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -120,10 +120,11 @@ impl Deposit {
         let x1 = ((self.p0[0].max(self.p1[0]) + rm).min(hi[0]) / lattice).ceil() as i32;
         let y0 = ((self.p0[1].min(self.p1[1]) - rm).max(lo[1]) / lattice).floor() as i32;
         let y1 = ((self.p0[1].max(self.p1[1]) + rm).min(hi[1]) / lattice).ceil() as i32;
+        let height = self.profile();
         let mut sum = 0.0;
         for i in x0..x1 {
             for j in y0..y1 {
-                sum += self.height_at([(i as f32 + 0.5) * lattice, (j as f32 + 0.5) * lattice]);
+                sum += height([(i as f32 + 0.5) * lattice, (j as f32 + 0.5) * lattice]);
             }
         }
         sum * lattice * lattice
@@ -143,37 +144,44 @@ impl Deposit {
         (self.sampled_volume_in(lattice, [0.0, 0.0], [w, h]) / all).clamp(0.0, 1.0)
     }
 
+    #[cfg(test)]
     pub fn height_at(&self, p: [f32; 2]) -> f32 {
+        self.profile()(p)
+    }
+
+    fn profile(&self) -> impl Fn([f32; 2]) -> f32 + '_ {
         let (dir, l) = segment_dir(self.p0, self.p1);
-        let q0 = [p[0] - self.p0[0], p[1] - self.p0[1]];
-        let q1 = [p[0] - self.p1[0], p[1] - self.p1[1]];
-        let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
-        if l <= 0.0 {
-            let x = len(q0) / self.r0;
-            return if x < 1.0 { self.h0 * (1.0 - x * x) } else { 0.0 };
-        }
         let cap_start = self.kind & DEPOSIT_CAP_START != 0;
         let cap_end = self.kind & DEPOSIT_CAP_END != 0;
-        if !cap_start && q0[0] * self.n0[0] + q0[1] * self.n0[1] < 0.0 {
-            return 0.0;
+        let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
+        move |p: [f32; 2]| {
+            let q0 = [p[0] - self.p0[0], p[1] - self.p0[1]];
+            let q1 = [p[0] - self.p1[0], p[1] - self.p1[1]];
+            if l <= 0.0 {
+                let x = len(q0) / self.r0;
+                return if x < 1.0 { self.h0 * (1.0 - x * x) } else { 0.0 };
+            }
+            if !cap_start && q0[0] * self.n0[0] + q0[1] * self.n0[1] < 0.0 {
+                return 0.0;
+            }
+            if !cap_end && q1[0] * self.n1[0] + q1[1] * self.n1[1] >= 0.0 {
+                return 0.0;
+            }
+            let u = q0[0] * dir[0] + q0[1] * dir[1];
+            if u < -self.r0 || u > l + self.r1 {
+                return 0.0;
+            }
+            let mut dist = (q0[0] * dir[1] - q0[1] * dir[0]).abs();
+            if cap_start && u < 0.0 {
+                dist = len(q0);
+            }
+            if cap_end && u > l {
+                dist = len(q1);
+            }
+            let rt = self.r0 + (self.r1 - self.r0) * (u / l).clamp(0.0, 1.0);
+            let x = dist / rt;
+            if x < 1.0 { self.h0 * (rt / self.r0) * (1.0 - x * x) } else { 0.0 }
         }
-        if !cap_end && q1[0] * self.n1[0] + q1[1] * self.n1[1] >= 0.0 {
-            return 0.0;
-        }
-        let u = q0[0] * dir[0] + q0[1] * dir[1];
-        if u < -self.r0 || u > l + self.r1 {
-            return 0.0;
-        }
-        let mut dist = (q0[0] * dir[1] - q0[1] * dir[0]).abs();
-        if cap_start && u < 0.0 {
-            dist = len(q0);
-        }
-        if cap_end && u > l {
-            dist = len(q1);
-        }
-        let rt = self.r0 + (self.r1 - self.r0) * (u / l).clamp(0.0, 1.0);
-        let x = dist / rt;
-        if x < 1.0 { self.h0 * (rt / self.r0) * (1.0 - x * x) } else { 0.0 }
     }
 }
 
@@ -428,6 +436,8 @@ impl Journal {
 }
 
 pub struct Film {
+    pub prof: Option<GpuProf>,
+    pub clock: Option<GpuClock>,
     pub w: u32,
     pub h: u32,
     pub dx: f32,
@@ -820,7 +830,11 @@ impl Film {
             front2: [0.0; 4],
             front3: [0.0; 4],
         };
+        let prof = GpuProf::new(gpu);
+        let clock = if prof.is_none() { Some(GpuClock::new(gpu)) } else { None };
         let mut f = Self {
+            prof,
+            clock,
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
             sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
@@ -1298,27 +1312,40 @@ impl Film {
         let (gx, gy) = self.groups();
         let nt16 = self.tiles16[0] * self.tiles16[1];
         enc.clear_buffer(&self.active_count, 0, None);
+        let mut prof = self.prof.take();
+        let mut mk = |pass: &mut wgpu::ComputePass, l: &'static str| {
+            if let Some(p) = prof.as_mut() {
+                p.mark(pass, l);
+            }
+        };
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pre"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pre"), timestamp_writes: self.clock.as_ref().and_then(|c| c.compute(true)) });
             let g = &self.bg_tiles;
             if self.journal.gen != 0 {
+                mk(&mut pass, "journal");
                 dispatch(&mut pass, &self.journal.p_journal, &[&self.bg0, &self.bg1, &self.journal.bg, g], self.tiles16[0], self.tiles16[1], 1);
             }
             if self.contact_count > 0 {
+                mk(&mut pass, "brush");
                 dispatch(&mut pass, &self.p_brush, &[&self.bg0, &self.bg1, &self.bg_brush, g], gx, gy, 1);
             }
             if self.deposit_count > 0 {
+                mk(&mut pass, "deposit");
                 dispatch(&mut pass, &self.p_deposit, &[&self.bg0, &self.bg1, &self.bg_dep, g], gx, gy, 1);
             }
             if self.knife_active {
+                mk(&mut pass, "knife");
                 dispatch(&mut pass, &self.p_knife, &[&self.bg0, &self.bg1, &self.bg_knife, g], gx, gy, 1);
             }
+            mk(&mut pass, "mark");
             dispatch(&mut pass, &self.p_mark, &[&self.bg0, &self.bg1, &self.bg_fac, g], self.tiles16[0], self.tiles16[1], 1);
+            mk(&mut pass, "compact");
             dispatch(&mut pass, &self.p_compact, &[&self.bg0, &self.bg1, &self.bg_fac, g], (nt16 + 255) / 256, 1, 1);
+            mk(&mut pass, "");
         }
         enc.copy_buffer_to_buffer(&self.active_count, 0, &self.tile_indirect, 0, 4);
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sim"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sim"), timestamp_writes: self.clock.as_ref().and_then(|c| c.compute(false)) });
             let g = &self.bg_tiles;
             let ind = |pass: &mut wgpu::ComputePass, p: &wgpu::ComputePipeline, groups: &[&wgpu::BindGroup]| {
                 pass.set_pipeline(p);
@@ -1328,59 +1355,97 @@ impl Film {
                 pass.dispatch_workgroups_indirect(&self.tile_indirect, 0);
             };
             let gf: [&wgpu::BindGroup; 4] = [&self.bg0, &self.bg1, &self.bg_fac, g];
+            mk(&mut pass, "cure");
             dispatch(&mut pass, &self.p_cure, &gf, gx, gy, 1);
+            mk(&mut pass, "clear_acc");
             ind(&mut pass, &self.p_clear_acc, &gf);
             if self.settings.implicit_hydro {
                 for _ in 0..self.implicit_steps {
+                    mk(&mut pass, "lap");
                     ind(&mut pass, &self.p_lap, &gf);
+                    mk(&mut pass, "cg_setup");
                     ind(&mut pass, &self.p_cg_setup, &gf);
+                    mk(&mut pass, "cg_lap_h");
                     ind(&mut pass, &self.p_cg_lap_h, &gf);
+                    mk(&mut pass, "cg_init");
                     ind(&mut pass, &self.p_cg_init, &gf);
+                    mk(&mut pass, "cg_rinit");
                     dispatch(&mut pass, &self.p_cg_rinit, &gf, 1, 1, 1);
                     for _ in 0..self.settings.implicit_iters {
+                        mk(&mut pass, "cg_lap_p");
                         ind(&mut pass, &self.p_cg_lap_p, &gf);
+                        mk(&mut pass, "cg_ia");
                         ind(&mut pass, &self.p_cg_ia, &gf);
+                        mk(&mut pass, "cg_ra");
                         dispatch(&mut pass, &self.p_cg_ra, &gf, 1, 1, 1);
+                        mk(&mut pass, "cg_ib");
                         ind(&mut pass, &self.p_cg_ib, &gf);
+                        mk(&mut pass, "cg_rb");
                         dispatch(&mut pass, &self.p_cg_rb, &gf, 1, 1, 1);
+                        mk(&mut pass, "cg_ic");
                         ind(&mut pass, &self.p_cg_ic, &gf);
                     }
+                    mk(&mut pass, "cg_lap_u");
                     ind(&mut pass, &self.p_cg_lap_u, &gf);
+                    mk(&mut pass, "cg_finish");
                     ind(&mut pass, &self.p_cg_finish, &gf);
+                    mk(&mut pass, "cg_rmass");
                     dispatch(&mut pass, &self.p_cg_rmass, &gf, 1, 1, 1);
+                    mk(&mut pass, "cg_rescale");
                     ind(&mut pass, &self.p_cg_rescale, &gf);
                 }
             }
             for _ in 0..substeps {
+                mk(&mut pass, "lap");
                 ind(&mut pass, &self.p_lap, &gf);
+                mk(&mut pass, "plug");
                 ind(&mut pass, &self.p_plug, &gf);
+                mk(&mut pass, "flux");
                 ind(&mut pass, &self.p_flux, &gf);
+                mk(&mut pass, "limit");
                 ind(&mut pass, &self.p_limit, &gf);
+                mk(&mut pass, "apply");
                 ind(&mut pass, &self.p_apply, &gf);
+                mk(&mut pass, "nose");
                 ind(&mut pass, &self.p_nose, &gf);
                 if self.settings.slump {
+                    mk(&mut pass, "shed");
                     ind(&mut pass, &self.p_shed, &gf);
+                    mk(&mut pass, "slump");
                     ind(&mut pass, &self.p_slump, &gf);
+                    mk(&mut pass, "commit_tmp");
                     ind(&mut pass, &self.p_commit_tmp, &gf);
                 }
             }
+            mk(&mut pass, "lap");
             ind(&mut pass, &self.p_lap, &gf);
+            mk(&mut pass, "split");
             ind(&mut pass, &self.p_split, &gf);
+            mk(&mut pass, "reduce");
             dispatch(&mut pass, &self.p_reduce, &gf, self.tiles[0], self.tiles[1], 1);
+            mk(&mut pass, "pool");
             dispatch(&mut pass, &self.p_pool, &gf, (self.pool_dims[0] as u32 + 15) / 16, (self.pool_dims[1] as u32 + 15) / 16, 1);
+            mk(&mut pass, "strata_limit");
             ind(&mut pass, &self.p_strata_limit, &gf);
+            mk(&mut pass, "strata_update");
             ind(&mut pass, &self.p_strata_update, &gf);
+            mk(&mut pass, "copy_back");
             ind(&mut pass, &self.p_copy_back, &gf);
             for _ in 0..6 {
+                mk(&mut pass, "strata_fill");
                 ind(&mut pass, &self.p_strata_fill, &gf);
             }
             if self.needs_full_shade || self.frame % FULL_SHADE_EVERY == 0 {
+                mk(&mut pass, "shade_full");
                 dispatch(&mut pass, &self.p_shade_full, &[&self.bg0, &self.bg1, &self.bg_shade, g], gx, gy, 1);
                 self.needs_full_shade = false;
             } else {
+                mk(&mut pass, "shade");
                 ind(&mut pass, &self.p_shade, &[&self.bg0, &self.bg1, &self.bg_shade, g]);
             }
+            mk(&mut pass, "");
         }
+        self.prof = prof;
         self.substeps_last = substeps;
         self.frame += 1;
     }
@@ -1406,6 +1471,73 @@ mod tests {
             x += step;
         }
         sum * step * step
+    }
+
+    fn reference_height(d: &Deposit, p: [f32; 2]) -> f32 {
+        let (dir, l) = segment_dir(d.p0, d.p1);
+        let q0 = [p[0] - d.p0[0], p[1] - d.p0[1]];
+        let q1 = [p[0] - d.p1[0], p[1] - d.p1[1]];
+        let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
+        if l <= 0.0 {
+            let x = len(q0) / d.r0;
+            return if x < 1.0 { d.h0 * (1.0 - x * x) } else { 0.0 };
+        }
+        let cap_start = d.kind & DEPOSIT_CAP_START != 0;
+        let cap_end = d.kind & DEPOSIT_CAP_END != 0;
+        if !cap_start && q0[0] * d.n0[0] + q0[1] * d.n0[1] < 0.0 {
+            return 0.0;
+        }
+        if !cap_end && q1[0] * d.n1[0] + q1[1] * d.n1[1] >= 0.0 {
+            return 0.0;
+        }
+        let u = q0[0] * dir[0] + q0[1] * dir[1];
+        if u < -d.r0 || u > l + d.r1 {
+            return 0.0;
+        }
+        let mut dist = (q0[0] * dir[1] - q0[1] * dir[0]).abs();
+        if cap_start && u < 0.0 {
+            dist = len(q0);
+        }
+        if cap_end && u > l {
+            dist = len(q1);
+        }
+        let rt = d.r0 + (d.r1 - d.r0) * (u / l).clamp(0.0, 1.0);
+        let x = dist / rt;
+        if x < 1.0 { d.h0 * (rt / d.r0) * (1.0 - x * x) } else { 0.0 }
+    }
+
+    #[test]
+    fn lattice_volume_matches_reference() {
+        let pig = [0u32; 8];
+        let dx = 3.9e-4f32;
+        let mut seed = 12345u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for _ in 0..300 {
+            let p0 = [0.1 + 0.05 * rnd(), 0.1 + 0.05 * rnd()];
+            let p1 = [p0[0] + 4e-3 * (rnd() - 0.5), p0[1] + 4e-3 * (rnd() - 0.5)];
+            let r = 2e-4 + 2e-3 * rnd();
+            let d = Deposit::stroke(p0, p1, r, 1e-9, pig, dx);
+            let lattice = 0.25 * dx;
+            let rm = d.max_radius() + lattice;
+            let x0 = ((d.p0[0].min(d.p1[0]) - rm) / lattice).floor() as i32;
+            let x1 = ((d.p0[0].max(d.p1[0]) + rm) / lattice).ceil() as i32;
+            let y0 = ((d.p0[1].min(d.p1[1]) - rm) / lattice).floor() as i32;
+            let y1 = ((d.p0[1].max(d.p1[1]) + rm) / lattice).ceil() as i32;
+            let mut sum = 0.0;
+            for i in x0..x1 {
+                for j in y0..y1 {
+                    sum += reference_height(&d, [(i as f32 + 0.5) * lattice, (j as f32 + 0.5) * lattice]);
+                }
+            }
+            assert_eq!((sum * lattice * lattice).to_bits(), d.sampled_volume(lattice).to_bits());
+            for _ in 0..50 {
+                let p = [p0[0] + 6e-3 * (rnd() - 0.5), p0[1] + 6e-3 * (rnd() - 0.5)];
+                assert_eq!(reference_height(&d, p).to_bits(), d.height_at(p).to_bits());
+            }
+        }
     }
 
     #[test]

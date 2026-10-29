@@ -3,6 +3,13 @@ use crate::tools::{push_tube, TubeVertex};
 use glam::DVec3;
 use rayon::prelude::*;
 
+const BASE_CAPACITY: f64 = 6.0e-9;
+const BASE_AREA: f64 = std::f64::consts::PI * 0.008 * 0.008;
+const BASE_LEN: f64 = 0.035;
+const TUFT: f64 = 0.4;
+const STEER_MIN_SPEED: f64 = 0.002;
+const STEER_DIST: f64 = 0.35;
+
 pub struct Bristle {
     pub pts: Vec<DVec3>,
     pub prev: Vec<DVec3>,
@@ -47,6 +54,7 @@ pub struct Brush {
     pub segs: usize,
     pub ferrule_r: f64,
     pub radius: f64,
+    pub tuft: f64,
     pub stiffness: f64,
     pub friction: f64,
     pub capacity: f64,
@@ -71,7 +79,7 @@ impl Brush {
             let lean = DVec3::new(rest.x + clump * (hash01(k / 3, 29) - 0.5), rest.y + clump * (hash01(k / 3, 31) - 0.5), rest.z).normalize();
             Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest: lean, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1], last: vec![DVec3::ZERO; segs + 1], was: vec![false; segs + 1], thick }
         };
-        let (ferrule_r, width) = match shape {
+        let (ferrule_r, width, area) = match shape {
             BrushShape::Round => {
                 let ferrule_r = 0.5 * size;
                 for k in 0..n {
@@ -83,7 +91,7 @@ impl Brush {
                     let rest = DVec3::new(a.cos() * splay, a.sin() * splay, -1.0).normalize();
                     bristles.push(blank(k, root, rest));
                 }
-                (ferrule_r, size)
+                (ferrule_r, size, std::f64::consts::PI * ferrule_r * ferrule_r)
             }
             BrushShape::Flat => {
                 let width = size;
@@ -101,10 +109,12 @@ impl Brush {
                     let rest = DVec3::new(0.3 * x / (0.5 * width), 0.15 * y / (0.5 * thick), -1.0).normalize();
                     bristles.push(blank(k, root, rest));
                 }
-                (0.5 * width, width)
+                (0.5 * width, width, width * (0.18 * width).max(thick))
             }
         };
-        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, stiffness: 0.35, friction: 0.7, capacity: 6.0e-9, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+        let tuft = TUFT * (area / n.max(1) as f64).sqrt();
+        let capacity = BASE_CAPACITY * (area / BASE_AREA) * (len / BASE_LEN);
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, tuft, stiffness: 0.35, friction: 0.7, capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
     }
 
     pub fn size(&self) -> f64 {
@@ -128,6 +138,20 @@ impl Brush {
         for b in &mut self.bristles {
             b.load = self.capacity;
             b.comp = *frac;
+        }
+    }
+
+    pub fn top_up(&mut self, frac: &[f32; 16]) {
+        let cap = self.capacity;
+        for b in &mut self.bristles {
+            if b.load >= cap {
+                continue;
+            }
+            let w = (b.load / cap) as f32;
+            for i in 0..16 {
+                b.comp[i] = w * b.comp[i] + (1.0 - w) * frac[i];
+            }
+            b.load = cap;
         }
     }
 
@@ -195,7 +219,8 @@ impl Brush {
         let stiffness = self.stiffness;
         let friction = self.friction;
         let vel = if self.placed { (handle - self.handle) / dt.max(1e-6) } else { DVec3::ZERO };
-        if self.shape == BrushShape::Flat && vel.truncate().length() > 0.03 {
+        let speed = vel.truncate().length();
+        if self.shape == BrushShape::Flat && speed > STEER_MIN_SPEED {
             let want = vel.y.atan2(vel.x) + std::f64::consts::FRAC_PI_2;
             let mut d = want - self.angle;
             while d > std::f64::consts::FRAC_PI_2 {
@@ -204,7 +229,7 @@ impl Brush {
             while d < -std::f64::consts::FRAC_PI_2 {
                 d += std::f64::consts::PI;
             }
-            self.angle += d * (6.0 * dt).min(1.0);
+            self.angle += d * (speed * dt / (STEER_DIST * self.width)).min(1.0);
         }
         let roots: Vec<DVec3> = self.bristles.iter().map(|b| self.rooted(b.root)).collect();
         if !self.placed || (handle - self.handle).length() > 0.1 {
@@ -257,7 +282,7 @@ impl Brush {
                 continue;
             }
             touching += 1;
-            let rc = (radius * 2.0 * b.thick).max(0.6 * dx) as f32;
+            let rc = (radius * 2.0 * b.thick).max(self.tuft * b.thick).max(0.6 * dx) as f32;
             let shift = dir * (2.0 * rc as f64 + sp * dt);
             let nseg = segs_touching.len() as f64;
             let over = (b.load - self.capacity).max(0.0) / nseg;

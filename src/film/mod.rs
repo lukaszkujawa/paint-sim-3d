@@ -185,11 +185,15 @@ impl Deposit {
     }
 }
 
-pub fn substrate_refl(n: usize, raw: bool) -> Vec<u32> {
+pub fn substrate_refl(n: usize, raw: bool, colour: Option<[f32; 16]>) -> Vec<u32> {
     let bands: Vec<f32> = (0..16)
         .map(|b| {
             let t = b as f32 / 15.0;
-            if raw { 0.50 + 0.16 * t } else { 0.84 + 0.04 * t }
+            match colour {
+                Some(c) => c[b],
+                None if raw => 0.50 + 0.16 * t,
+                None => 0.84 + 0.04 * t,
+            }
         })
         .collect();
     let mut packed = [0u32; 8];
@@ -286,6 +290,7 @@ pub struct FilmSettings {
     pub hysteresis_deg: f32,
     pub h_star: f32,
     pub raw_canvas: bool,
+    pub canvas_rgb: Option<[f32; 3]>,
     pub weave_um: f32,
     pub cure_rate: f32,
     pub tau_cure: f32,
@@ -320,6 +325,7 @@ impl Default for FilmSettings {
             hysteresis_deg: 15.0,
             h_star: 2.0e-5,
             raw_canvas: true,
+            canvas_rgb: None,
             weave_um: 25.0,
             cure_rate: 1.0 / 600.0,
             tau_cure: 300.0,
@@ -677,7 +683,7 @@ impl Film {
         let detail_view = detail_tex.create_view(&Default::default());
         let lay = gpu.storage("lay", n * 4);
 
-        let white = substrate_refl(n as usize, settings.raw_canvas);
+        let white = substrate_refl(n as usize, settings.raw_canvas, settings.canvas_rgb.map(|c| color::reflectance_of(color::canvas_albedo(c), &cmf_table)));
         gpu.queue.write_buffer(&sub_refl, 0, bytemuck::cast_slice(&white));
         let wv = weave(w as usize, h as usize, dx, settings.weave_um * 1e-6);
         let weave_vol = wv.iter().map(|v| *v as f64).sum::<f64>() * (dx as f64) * (dx as f64);
@@ -1009,7 +1015,7 @@ impl Film {
         let n = (self.w * self.h) as usize;
         let ones: Vec<[f32; 2]> = vec![[1.0, 0.0]; n];
         gpu.queue.write_buffer(&self.rheo, 0, bytemuck::cast_slice(&ones));
-        self.white_refl = substrate_refl(n, self.settings.raw_canvas);
+        self.white_refl = substrate_refl(n, self.settings.raw_canvas, self.settings.canvas_rgb.map(|c| color::reflectance_of(color::canvas_albedo(c), &self.cmf_table)));
         gpu.queue.write_buffer(&self.sub_refl, 0, bytemuck::cast_slice(&self.white_refl));
         let wv = weave(self.w as usize, self.h as usize, self.dx, self.settings.weave_um * 1e-6);
         self.weave_volume = wv.iter().map(|v| *v as f64).sum::<f64>() * (self.dx as f64) * (self.dx as f64);

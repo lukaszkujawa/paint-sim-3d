@@ -24,6 +24,81 @@ fn unit_tint() -> f32 {
     1.0
 }
 
+const VIEW_GAIN: [f32; 3] = [1.94, 1.95, 2.17];
+
+pub fn canvas_albedo(shown: [f32; 3]) -> [f32; 3] {
+    let dec = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let enc = |c: f32| if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    let untone = |y: f32| {
+        let (a, b, c, d, e) = (2.51f32, 0.03f32, 2.43f32, 0.59f32, 0.14f32);
+        let y = y.clamp(0.0, 0.995);
+        let qa = a - y * c;
+        let qb = b - y * d;
+        (-qb + (qb * qb + 4.0 * qa * y * e).sqrt()) / (2.0 * qa)
+    };
+    let mut out = [0.0f32; 3];
+    for i in 0..3 {
+        out[i] = enc((untone(dec(shown[i])) / VIEW_GAIN[i]).clamp(0.005, 0.9));
+    }
+    out
+}
+
+pub fn reflectance_of(srgb: [f32; 3], cmf: &[f32]) -> [f32; NBAND] {
+    let lin = srgb.map(|c| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) });
+    let target = [
+        0.4124 * lin[0] + 0.3576 * lin[1] + 0.1805 * lin[2],
+        0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2],
+        0.0193 * lin[0] + 0.1192 * lin[1] + 0.9505 * lin[2],
+    ];
+    let basis: Vec<[f32; 3]> = band_wavelengths()
+        .iter()
+        .map(|l| {
+            let blue = 1.0 / (1.0 + ((l - 490.0) / 18.0).exp());
+            let red = 1.0 / (1.0 + (-(l - 585.0) / 18.0).exp());
+            [red, (1.0 - blue - red).max(0.0), blue]
+        })
+        .collect();
+    let mut m = [[0.0f32; 3]; 3];
+    for b in 0..NBAND {
+        for i in 0..3 {
+            for c in 0..3 {
+                m[i][c] += basis[b][c] * cmf[b * 3 + i];
+            }
+        }
+    }
+    let solve = |m: [[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] {
+        let det = |a: [[f32; 3]; 3]| a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        let d = det(m);
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            let mut a = m;
+            for i in 0..3 {
+                a[i][c] = v[i];
+            }
+            out[c] = if d.abs() > 1e-12 { det(a) / d } else { 0.0 };
+        }
+        out
+    };
+    let mut want = target;
+    let mut refl = [0.0f32; NBAND];
+    for _ in 0..6 {
+        let k = solve(m, want);
+        for b in 0..NBAND {
+            refl[b] = (basis[b][0] * k[0] + basis[b][1] * k[1] + basis[b][2] * k[2]).clamp(0.005, 0.97);
+        }
+        let mut got = [0.0f32; 3];
+        for b in 0..NBAND {
+            for i in 0..3 {
+                got[i] += refl[b] * cmf[b * 3 + i];
+            }
+        }
+        for i in 0..3 {
+            want[i] += target[i] - got[i];
+        }
+    }
+    refl
+}
+
 pub fn band_wavelengths() -> [f32; NBAND] {
     let mut w = [0.0; NBAND];
     for (b, x) in w.iter_mut().enumerate() {
@@ -292,5 +367,28 @@ impl PaintMix {
             }
         }
         o
+    }
+}
+
+#[cfg(test)]
+mod canvas_colour_tests {
+    use super::*;
+
+    #[test]
+    fn canvas_reflectance_reproduces_colour() {
+        let cmf = cmf_table();
+        for rgb in [[0.94f32, 0.93, 0.90], [0.74, 0.56, 0.33], [0.64, 0.37, 0.26], [0.50, 0.56, 0.62], [0.56, 0.56, 0.55], [0.30, 0.45, 0.25]] {
+            let refl = reflectance_of(rgb, &cmf);
+            let mut xyz = [0.0f32; 3];
+            for b in 0..NBAND {
+                for i in 0..3 {
+                    xyz[i] += refl[b] * cmf[b * 3 + i];
+                }
+            }
+            let got = xyz_to_srgb(xyz);
+            for c in 0..3 {
+                assert!((got[c] - rgb[c]).abs() < 0.03, "{:?} -> {:?}", rgb, got);
+            }
+        }
     }
 }

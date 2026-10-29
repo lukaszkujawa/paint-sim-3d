@@ -192,13 +192,11 @@ impl App {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.label(RichText::new("Paint Sim").strong().color(Color32::WHITE));
+            ui.label(RichText::new("Canvaz").strong().color(Color32::WHITE));
             ui.add_space(8.0);
             let file = ui.menu_button("File", |ui| {
-                if ui.button("New painting").on_hover_text("Clear the canvas (undoable)").clicked() {
-                    self.begin_full();
-                    self.clear_canvas();
-                    self.history.name.clear();
+                if ui.button("New painting...").on_hover_text("Start a fresh canvas: choose its resolution and colour").clicked() {
+                    self.canvas_dialog = Some(crate::CanvasChoice { res: self.film.w, colour: self.film.settings.canvas_rgb, weave: self.film.settings.raw_canvas, custom: self.film.settings.canvas_rgb.unwrap_or([0.90, 0.85, 0.76]), first: false });
                 }
                 if ui.button("Open...").clicked() {
                     self.open_gallery();
@@ -985,7 +983,88 @@ impl App {
         self.show_gallery = true;
     }
 
+    fn canvas_window(&mut self, ctx: &egui::Context) {
+        let Some(mut c) = self.canvas_dialog.take() else { return };
+        const SIZES: [(u32, &str); 5] = [(1536, "Draft"), (2048, "Quick"), (3072, "Standard"), (4096, "Fine"), (6144, "Ultra")];
+        const COLOURS: [(&str, Option<[f32; 3]>); 8] = [
+            ("Raw cotton", None),
+            ("Primed white", Some([0.94, 0.93, 0.90])),
+            ("Warm ivory", Some([0.93, 0.88, 0.78])),
+            ("Grey", Some([0.56, 0.56, 0.55])),
+            ("Ochre ground", Some([0.74, 0.56, 0.33])),
+            ("Terracotta", Some([0.64, 0.37, 0.26])),
+            ("Blue grey", Some([0.50, 0.56, 0.62])),
+            ("Black", Some([0.08, 0.08, 0.09])),
+        ];
+        let width_mm = self.film.settings.width_m * 1e3;
+        let mut start = false;
+        let mut keep = true;
+        let title = if c.first { "Welcome to Canvaz" } else { "New painting" };
+        if let Some(r) = egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new("Resolution").strong());
+            for (res, name) in SIZES {
+                let cell = width_mm / res as f32;
+                let note = match res {
+                    r if r <= 2048 => "fast, loose work",
+                    3072 => "balanced",
+                    4096 => "finer marks, slower",
+                    _ => "finest detail, needs a strong GPU",
+                };
+                ui.radio_value(&mut c.res, res, format!("{}  {}x{}  ·  {:.2} mm cells  ·  {}", name, res, (res as f32 * self.film.settings.height_m / self.film.settings.width_m) as u32, cell, note));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Canvas").strong());
+            egui::Grid::new("canvas_colours").spacing([6.0, 6.0]).show(ui, |ui| {
+                for (k, (name, col)) in COLOURS.iter().enumerate() {
+                    let rgb = col.unwrap_or([0.86, 0.80, 0.70]);
+                    let fill = Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8);
+                    let selected = c.colour == *col;
+                    let btn = egui::Button::new(RichText::new(*name).small().color(if rgb.iter().sum::<f32>() > 1.5 { Color32::BLACK } else { Color32::WHITE })).fill(fill).min_size(Vec2::new(86.0, 34.0)).stroke(if selected { Stroke::new(2.5, ACCENT) } else { Stroke::new(1.0, Color32::from_gray(90)) });
+                    if ui.add(btn).clicked() {
+                        c.colour = *col;
+                        c.weave = col.is_none() || c.weave;
+                    }
+                    if k % 4 == 3 {
+                        ui.end_row();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let custom = c.colour.is_some() && !COLOURS.iter().any(|(_, col)| *col == c.colour);
+                if ui.radio(custom, "Custom colour").clicked() {
+                    c.colour = Some(c.custom);
+                }
+                if ui.color_edit_button_rgb(&mut c.custom).changed() {
+                    c.colour = Some(c.custom);
+                }
+            });
+            ui.checkbox(&mut c.weave, "Canvas weave texture");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Start painting").strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(150.0, 28.0))).clicked() {
+                    start = true;
+                }
+                if ui.button(if c.first { "Use defaults" } else { "Cancel" }).clicked() {
+                    keep = false;
+                }
+            });
+            if c.res > 3072 {
+                ui.label(RichText::new("Larger canvases run slower while paint is wet. Saved paintings open at the resolution they were made with.").small().weak());
+            }
+        }) {
+            self.block_rects.push(r.response.rect);
+            self.menu_open = true;
+        }
+        if start {
+            self.start_canvas(c);
+        } else if keep {
+            self.canvas_dialog = Some(c);
+        }
+    }
+
     fn file_windows(&mut self, ctx: &egui::Context) {
+        self.canvas_window(ctx);
         if let Some(mut name) = self.save_dialog.take() {
             let mut keep = true;
             let mut save = false;

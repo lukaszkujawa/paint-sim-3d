@@ -128,6 +128,7 @@ struct App {
     brush_z: Option<f64>,
     brush_hold: f64,
     held_deposits: Vec<Deposit>,
+    canvas_dialog: Option<CanvasChoice>,
     tool_heights: Vec<(ToolKind, f64)>,
     height_kind: ToolKind,
     last_cpu_ms: f32,
@@ -198,6 +199,15 @@ struct AutoScript {
     spp: u32,
     light: Vec<f32>,
     aces: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct CanvasChoice {
+    pub res: u32,
+    pub colour: Option<[f32; 3]>,
+    pub weave: bool,
+    pub custom: [f32; 3],
+    pub first: bool,
 }
 
 struct Pending {
@@ -322,6 +332,7 @@ impl App {
             brush_z: None,
             brush_hold: 0.0,
             held_deposits: Vec::new(),
+            canvas_dialog: None,
             tool_heights: Vec::new(),
             height_kind: ToolKind::Stick,
             last_cpu_ms: 0.0,
@@ -353,6 +364,9 @@ impl App {
         }
         if app.auto.as_ref().map(|a| a.aces).unwrap_or(false) {
             app.renderer.agx = false;
+        }
+        if app.auto.is_none() {
+            app.canvas_dialog = Some(CanvasChoice { res: app.film.w, colour: app.film.settings.canvas_rgb, weave: app.film.settings.raw_canvas, custom: [0.90, 0.85, 0.76], first: true });
         }
         let light = app.auto.as_ref().map(|a| a.light.clone()).unwrap_or_default();
         if light.len() >= 3 {
@@ -411,6 +425,61 @@ impl App {
             self.tool_released += d.vol as f64 * d.inside_fraction(w, h) as f64;
             deposits.push(d);
         }
+    }
+
+    pub(crate) fn rebuild_canvas(&mut self, w: u32) {
+        if w == self.film.w {
+            return;
+        }
+        let settings = self.film.settings.clone();
+        let h = ((w as f32) * settings.height_m / settings.width_m) as u32;
+        let _ = self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        self.film = Film::new(&self.gpu, w, h, settings);
+        let old = std::mem::replace(&mut self.renderer, Renderer::new(&self.gpu, &self.film));
+        let r = &mut self.renderer;
+        r.light_dir = old.light_dir;
+        r.light_intensity = old.light_intensity;
+        r.sky = old.sky;
+        r.ground = old.ground;
+        r.aperture_mm = old.aperture_mm;
+        r.exposure = old.exposure;
+        r.bloom = old.bloom;
+        r.grain = old.grain;
+        r.vignette = old.vignette;
+        r.sharpen = old.sharpen;
+        r.agx = old.agx;
+        r.key_elevation_deg = old.key_elevation_deg;
+        r.key_azimuth_deg = old.key_azimuth_deg;
+        r.key_power = old.key_power;
+        r.fill = old.fill;
+        self.tubes = TubeRenderer::new(&self.gpu, &self.renderer.cam_buf);
+        self.beauty = Beauty::new(&self.gpu, &self.renderer);
+        self.refine = Refine::new(&self.gpu, &self.film, &self.renderer.layout, &self.renderer.cam_buf);
+        self.surface = CoarseSurface::new(self.film.pool_dims[0], self.film.pool_dims[1], 4.0 * self.film.dx as f64);
+        self.air = Airborne::new();
+        self.pending_deposits.clear();
+        self.held_deposits.clear();
+        self.tool_scraped = 0.0;
+        self.tool_released = 0.0;
+        self.sim_time = 0.0;
+        self.history.levels.clear();
+        if let Some(p) = self.painter.as_mut() {
+            p.stop();
+        }
+        self.stop_evolve();
+        self.evo.run = None;
+    }
+
+    pub(crate) fn start_canvas(&mut self, choice: CanvasChoice) {
+        self.film.settings.raw_canvas = choice.weave;
+        self.film.settings.canvas_rgb = choice.colour;
+        if choice.res != self.film.w {
+            self.rebuild_canvas(choice.res);
+        } else {
+            self.begin_full();
+        }
+        self.clear_canvas();
+        self.history.name.clear();
     }
 
     fn brush_press(&self, pressure: f64) -> f64 {
@@ -658,6 +727,33 @@ impl App {
                 }
             }
             return self.apply_painter();
+        }
+        if a.script == "canvas" {
+            let f = self.frame_index;
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).map(|p| p[1].clone());
+            if f == 20 {
+                let res = arg("--newres").and_then(|v| v.parse().ok()).unwrap_or(self.film.w);
+                let colour = arg("--canvas").map(|v| {
+                    let c: Vec<f32> = v.split(',').filter_map(|t| t.parse().ok()).collect();
+                    [c[0], c[1], c[2]]
+                });
+                self.start_canvas(CanvasChoice { res, colour, weave: arg("--noweave").is_none(), custom: [0.9; 3], first: false });
+                log::warn!("CANVAS now {}x{} dx {:.3} mm", self.film.w, self.film.h, self.film.dx * 1e3);
+            }
+            self.tool.kind = ToolKind::Pour;
+            self.tool.flowing = false;
+            if (40..160).contains(&f) {
+                let (w, hgt) = (self.film.settings.width_m, self.film.settings.height_m);
+                let t = (f - 40) as f32 / 120.0;
+                let mut p = color::PaintMix::pure(3);
+                p.frac[13] = 20.0;
+                p.frac[14] = (10f32).ln() + 10.0;
+                let a = [w * (0.3 + 0.4 * t), hgt * 0.5];
+                let b = [w * (0.3 + 0.4 * (t + 1.0 / 120.0)), hgt * 0.5];
+                self.pending_deposits.push(Deposit::capsule(a, b, 0.008, 3.0e-7, p.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+            }
+            return true;
         }
         if a.script == "physics" {
             let f = self.frame_index;
@@ -2622,7 +2718,7 @@ impl ApplicationHandler for Pending {
         if self.app.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("paint-sim").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0));
+        let attrs = Window::default_attributes().with_title("Canvaz").with_window_icon(app_icon()).with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         self.window = Some(window.clone());
         self.app = Some(App::new(window));
@@ -2860,6 +2956,12 @@ fn parse_auto() -> Option<AutoScript> {
         i += 1;
     }
     frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, rounds, snap_save, snap_load, camat, vres, spp, light, aces })
+}
+
+fn app_icon() -> Option<winit::window::Icon> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 fn pollock_stats(seeds: u64) {

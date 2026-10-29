@@ -23,7 +23,7 @@ impl Gpu {
         .expect("adapter");
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("paint-sim"),
+            label: Some("canvaz"),
             required_features: wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::SHADER_F16
                 | wgpu::Features::FLOAT32_FILTERABLE

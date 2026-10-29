@@ -99,7 +99,7 @@ fn unpack(data: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 pub fn painting_path(name: &str) -> PathBuf {
-    Path::new(PAINTINGS_DIR).join(format!("{}.psim", name))
+    Path::new(PAINTINGS_DIR).join(format!("{}.canvaz", name))
 }
 
 pub fn thumb_path(path: &Path) -> PathBuf {
@@ -111,7 +111,7 @@ pub fn list_paintings() -> Vec<Painting> {
     if let Ok(rd) = std::fs::read_dir(PAINTINGS_DIR) {
         for e in rd.flatten() {
             let path = e.path();
-            if path.extension().map(|x| x == "psim").unwrap_or(false) {
+            if path.extension().map(|x| x == "canvaz" || x == "psim").unwrap_or(false) {
                 let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
                 out.push(Painting { name, path, modified });
@@ -286,9 +286,16 @@ impl App {
         }
         let u = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
         let f = |o: usize| f32::from_le_bytes(data[o..o + 4].try_into().unwrap());
-        if u(4) != VERSION || u(8) != self.film.w || u(12) != self.film.h {
-            self.notice(&format!("That painting was made at {}x{} cells; this canvas is {}x{}", u(8), u(12), self.film.w, self.film.h));
+        if u(4) != VERSION {
+            self.notice("That painting was saved by an incompatible version");
             return;
+        }
+        if u(8) != self.film.w || u(12) != self.film.h {
+            self.rebuild_canvas(u(8));
+            if u(8) != self.film.w || u(12) != self.film.h {
+                self.notice(&format!("That painting was made at {}x{} cells and this canvas cannot match it", u(8), u(12)));
+                return;
+            }
         }
         self.begin_full();
         if !self.apply(&data[44..]) {

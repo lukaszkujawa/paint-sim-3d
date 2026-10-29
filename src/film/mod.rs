@@ -228,7 +228,7 @@ pub fn weave(w: usize, h: usize, dx: f32, amp: f32) -> Vec<f32> {
     v
 }
 
-pub const MAX_CONTACTS: usize = 8192;
+pub const MAX_CONTACTS: usize = 65536;
 pub const MAX_BRISTLES: usize = 512;
 
 #[repr(C)]

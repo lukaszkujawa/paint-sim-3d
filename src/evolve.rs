@@ -38,8 +38,6 @@ const MISS_LIMIT: usize = 24;
 const TABU: f32 = 0.5;
 const REGIONS: usize = 4;
 const AIMED_SHARE: f32 = 0.5;
-const LOAD_REF: f64 = 0.012;
-const LOAD_MAX: f64 = 8.0;
 const BRISTLE_PER_SIZE: f64 = 5.0;
 const BRISTLE_MIN: f64 = 0.006;
 const SIZE_SPREAD: f64 = 0.4;
@@ -1745,7 +1743,6 @@ impl App {
                     let (shape, n) = (self.brush.shape, self.brush.bristles.len());
                     self.rebuild_brush(shape, n, len, plan.size);
                 }
-                self.brush.capacity = self.brush.base_capacity * (LOAD_REF / plan.size).clamp(1.0, LOAD_MAX);
                 let len = self.brush.len;
                 let user = self.evo.saved_height.filter(|h| *h < len - PRESS_MIN).unwrap_or(BRUSH_REST * len);
                 let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, (self.brush.len - user).max(PRESS_MIN));

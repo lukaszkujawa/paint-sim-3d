@@ -45,6 +45,13 @@ const PEN_FLOW_MAX: f64 = 1.5;
 const PEN_WIDTH_MIN: f32 = 0.35;
 const PEN_KNIFE_CLOSE: f64 = 0.9;
 const PEN_BRUSH_PRESS: f64 = 0.4;
+const PEN_PRESS_DIAMETERS: f64 = 3.0;
+const HOLD_MIN: f64 = 0.02;
+const HOLD_SPAN: f64 = 0.6;
+const HOLD_EXP: f64 = 1.5;
+const HOLD_GAIN: f64 = 8.0;
+const BRUSH_DESCENT: f64 = 0.15;
+const BRUSH_CLEAR: f64 = 0.001;
 
 struct Ui {
     ctx: egui::Context,
@@ -117,6 +124,8 @@ struct App {
     frame_budget_ms: f32,
     brush_sink: f64,
     brush_raise: f64,
+    brush_z: Option<f64>,
+    brush_hold: f64,
     last_cpu_ms: f32,
     ctrl_down: bool,
     cam: Camera,
@@ -305,6 +314,8 @@ impl App {
             frame_budget_ms: 14.0,
             brush_sink: 0.88,
             brush_raise: 0.0,
+            brush_z: None,
+            brush_hold: 0.0,
             last_cpu_ms: 0.0,
             ctrl_down: false,
             cam,
@@ -385,9 +396,13 @@ impl App {
         }
     }
 
+    fn brush_press(&self, pressure: f64) -> f64 {
+        pressure * (PEN_BRUSH_PRESS * self.brush.len).min(PEN_PRESS_DIAMETERS * self.brush.size())
+    }
+
     fn rebuild_brush(&mut self, shape: brush::BrushShape, n: usize, len: f64, size: f64) {
         let old = &self.brush;
-        let (st, fr, rl, radius) = (old.stiffness, old.friction, old.release, old.radius);
+        let (st, fr, rl, radius) = (old.stiffness, old.friction, old.release, old.hair);
         let load = old.total_load();
         let cap = old.total_capacity();
         let mut comp = [0.0f32; 16];
@@ -413,7 +428,7 @@ impl App {
         }
         self.brush = b;
         if self.tool.kind == ToolKind::Brush {
-            self.tool.height = (len - press).clamp(0.002, len - 0.003);
+            self.tool.height = (len - press).clamp(0.002, len - 0.0002);
         }
     }
 
@@ -611,6 +626,146 @@ impl App {
                 }
             }
             return self.apply_painter();
+        }
+        if a.script == "brushlong" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
+            let per = 90u64;
+            let k = f.saturating_sub(1) / per;
+            let t = f.saturating_sub(1) % per;
+            let strokes = arg("--strokes").unwrap_or(40.0) as u64;
+            if f < 1 || k >= strokes {
+                self.tool.flowing = false;
+                return true;
+            }
+            if f == 1 {
+                let n = self.brush.bristles.len();
+                let len = self.brush.len;
+                self.rebuild_brush(brush::BrushShape::Round, n, len, arg("--size").unwrap_or(16.0) * 1e-3);
+                self.tool.kind = ToolKind::Brush;
+                self.prev_kind = ToolKind::Brush;
+            }
+            if t == 0 && k > 0 && args.iter().any(|a| a == "--resize") {
+                let size = if (k / 3) % 2 == 0 { arg("--size").unwrap_or(16.0) } else { 6.0 } * 1e-3;
+                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                self.rebuild_brush(brush::BrushShape::Round, n, len, size);
+            }
+            let reload = arg("--reload").unwrap_or(5.0) as u64;
+            if t == 0 && k % reload == 0 {
+                let mut p = color::PaintMix::pure(1);
+                p.frac[13] = 40.0;
+                p.frac[14] = (20f32).ln() + 10.0;
+                self.brush.clean();
+                self.brush.dip(&p.frac);
+                self.paint.frac = p.frac;
+            }
+            self.tool.height = self.brush.len - self.brush_press(arg("--pressure").unwrap_or(0.5));
+            let ang = (k as f64 * 2.399963).rem_euclid(std::f64::consts::TAU);
+            let cx = w * 0.5 + 0.25 * ((k % 7) as f64 / 6.0 - 0.5);
+            let cy = hgt * 0.5 + 0.2 * ((k / 7 % 6) as f64 / 5.0 - 0.5);
+            let s = ((t as f64 - 10.0) / 70.0).clamp(0.0, 1.0) - 0.5;
+            self.tool.flowing = (10..80).contains(&t);
+            self.tool.pos = DVec3::new(cx + 0.08 * s * ang.cos(), cy + 0.08 * s * ang.sin(), self.tool.height);
+            if t == 45 {
+                let b = &self.brush;
+                let shape: f64 = b.bristles.iter().map(|br| (br.pts[b.segs] - br.pts[0]).truncate().length()).sum::<f64>() / b.bristles.len() as f64;
+                log::warn!("LONG stroke {} touching {} load {:.2} hold {:.2} mm tip spread {:.2} mm", k, b.touching, b.total_load() / b.total_capacity(), self.brush_hold * 1e3, shape * 1e3);
+            }
+            if t == 5 {
+                let b = &self.brush;
+                let rest: f64 = b.bristles.iter().map(|br| {
+                    let mut q = br.pts[0];
+                    let mut d = 0.0f64;
+                    for i in 1..=b.segs {
+                        q += br.dirs[i - 1] * br.seg;
+                        d = d.max((br.pts[i] - q).length());
+                    }
+                    d
+                }).fold(0.0, f64::max);
+                let bad = b.bristles.iter().any(|br| br.pts.iter().any(|p| !p.is_finite()));
+                log::warn!("LONG lifted {} worst rest error {:.2} mm nan {}", k, rest * 1e3, bad);
+            }
+            return true;
+        }
+        if a.script == "brushsizes" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
+            let sizes = [1.0, 2.0, 4.0, 8.0];
+            let presses = [0.05, 0.15, 0.3, 0.15];
+            let per = 120;
+            let k = (f.saturating_sub(1) / per) as usize;
+            let t = f.saturating_sub(1) % per;
+            let (si, pi) = (k / presses.len(), k % presses.len());
+            if f < 1 || si >= sizes.len() {
+                self.tool.flowing = false;
+                return true;
+            }
+            let size = sizes[si] * 1e-3;
+            if t == 0 {
+                let len = arg("--len").map(|v| v * 1e-3).unwrap_or(self.brush.len);
+                let n = self.brush.bristles.len();
+                if (self.brush.size() - size).abs() > 1e-6 || (self.brush.len - len).abs() > 1e-6 {
+                    self.rebuild_brush(brush::BrushShape::Round, n, len, size);
+                }
+                self.tool.kind = ToolKind::Brush;
+                self.prev_kind = ToolKind::Brush;
+                let mut p = color::PaintMix::pure(1);
+                p.frac[13] = 40.0;
+                p.frac[14] = (20f32).ln() + 10.0;
+                self.brush.clean();
+                self.brush.dip(&p.frac);
+                self.paint.frac = p.frac;
+            }
+            self.tool.height = self.brush.len - self.brush_press(presses[pi] / PEN_BRUSH_PRESS);
+            let mut y0 = hgt * 0.5 - 0.045;
+            for s in &sizes[..si] {
+                y0 += 4.0 * (s * 1e-3 * 2.5).max(0.004);
+            }
+            let y = y0 + pi as f64 * (size * 2.5).max(0.004);
+            let s = ((t as f64 - 10.0) / 100.0).clamp(0.0, 1.0);
+            self.tool.flowing = (10..110).contains(&t);
+            let x = w * 0.5 - 0.035 + 0.07 * s;
+            let wave = if pi == 3 { (s * std::f64::consts::TAU).sin() * (size * 1.5).max(0.003) } else { 0.0 };
+            self.tool.pos = DVec3::new(x, y + wave, self.tool.height);
+            return true;
+        }
+        if a.script == "brushpress" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
+            if f == 1 {
+                let (n, len) = (self.brush.bristles.len(), arg("--len").map(|v| v * 1e-3).unwrap_or(self.brush.len));
+                self.rebuild_brush(brush::BrushShape::Round, n, len, arg("--size").unwrap_or(16.0) * 1e-3);
+                self.tool.kind = ToolKind::Brush;
+                self.prev_kind = ToolKind::Brush;
+            }
+            let k = (f / 100) as usize;
+            let t = f % 100;
+            let presses = [0.5, 1.0, 2.0, 4.0, 7.0, 11.0];
+            if k >= presses.len() || f < 1 {
+                self.tool.flowing = false;
+                return true;
+            }
+            let press = presses[k] * 1e-3 * self.brush.len / 0.035;
+            if t == 0 {
+                let mut p = color::PaintMix::pure(1);
+                p.frac[13] = 40.0;
+                p.frac[14] = (20f32).ln() + 10.0;
+                self.brush.clean();
+                self.brush.dip(&p.frac);
+                self.paint.frac = p.frac;
+            }
+            self.tool.height = self.brush.len - press;
+            let y = hgt * 0.5 + (k as f64 - 2.5) * 0.04;
+            let s = ((t as f64 - 10.0) / 80.0).clamp(0.0, 1.0);
+            self.tool.flowing = (10..90).contains(&t);
+            self.tool.pos = DVec3::new(w * 0.5 - 0.1 + 0.2 * s, y, self.tool.height);
+            return true;
         }
         if a.script == "brushcurve" {
             let f = self.frame_index;
@@ -1964,7 +2119,7 @@ impl App {
             if self.prev_kind != ToolKind::Brush {
                 self.tool.height = self.brush.len * 0.75;
             }
-            self.tool.height = self.tool.height.clamp(0.002, self.brush.len - 0.003);
+            self.tool.height = self.tool.height.clamp(0.002, self.brush.len - 0.0002);
             let mut res = Vec::new();
             self.film.poll_reservoir(&self.gpu, &mut res);
             self.brush_scraped += self.brush.absorb(&res);
@@ -1974,10 +2129,30 @@ impl App {
             if !self.paused {
                 let lift = if self.tool.flowing { self.brush_raise } else { 0.04 };
                 let h = match pen {
-                    Some(p) => (self.brush.len * (1.0 - PEN_BRUSH_PRESS * p)).clamp(0.002, self.brush.len - 0.0005),
+                    Some(p) => (self.brush.len - self.brush_press(p)).clamp(0.002, self.brush.len - 0.0002),
                     None => self.tool.height,
                 };
-                let handle = DVec3::new(self.tool.pos.x, self.tool.pos.y, h + lift);
+                let reach = self.brush_press(1.0);
+                let geo = (self.brush.len - h).max(0.0);
+                let landed = self.brush_z.map(|z| z <= h - self.brush_hold + 1e-4).unwrap_or(false);
+                if self.tool.flowing && self.brush_raise == 0.0 && landed {
+                    let p = (geo / reach.max(1e-6)).clamp(0.0, 1.0);
+                    let target = HOLD_MIN + HOLD_SPAN * p.powf(HOLD_EXP);
+                    let have = self.brush.touching as f64 / self.brush.bristles.len().max(1) as f64;
+                    self.brush_hold = (self.brush_hold + HOLD_GAIN * (target - have) * reach * frame_dt as f64).clamp(0.0, reach);
+                } else if !self.tool.flowing {
+                    self.brush_hold = 0.0;
+                }
+                let want = h - self.brush_hold + lift;
+                let z = match self.brush_z {
+                    Some(prev) if want < prev => {
+                        let from = prev.min(want.max(self.brush.len + self.surface.brush_floor(self.tool.pos.x, self.tool.pos.y, self.brush_sink) + BRUSH_CLEAR));
+                        want.max(from - BRUSH_DESCENT * frame_dt as f64)
+                    }
+                    _ => want,
+                };
+                self.brush_z = Some(z);
+                let handle = DVec3::new(self.tool.pos.x, self.tool.pos.y, z);
                 let surf = &self.surface;
                 let brush = &mut self.brush;
                 let sink = self.brush_sink;

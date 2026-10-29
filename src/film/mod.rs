@@ -229,6 +229,7 @@ pub fn weave(w: usize, h: usize, dx: f32, amp: f32) -> Vec<f32> {
 }
 
 pub const MAX_CONTACTS: usize = 65536;
+pub const MAX_SCRAPS: usize = 1 << 18;
 pub const MAX_BRISTLES: usize = 512;
 
 #[repr(C)]
@@ -589,6 +590,7 @@ impl Film {
         let strata_h = gpu.storage("strata_h", n * 16);
         let strata_pig = gpu.storage("strata_pig", n * 128);
         let strata_cure = gpu.storage("strata_cure", n * 16);
+        let strata_cure2 = gpu.storage("strata_cure2", n * 16);
         let sub_refl = gpu.storage("sub_refl", n * 32);
         let strata_h2 = gpu.storage("strata_h2", n * 16);
         let strata_pig2 = gpu.storage("strata_pig2", n * 128);
@@ -629,7 +631,7 @@ impl Film {
         gpu.queue.write_buffer(&tile_indirect, 0, bytemuck::cast_slice(&[0u32, 1, 1, 0]));
         let active_count = gpu.storage("active_count", 16);
         let tile_moved = gpu.storage("tile_moved", nt16 * 4);
-        let max_scraps = 1u64 << 16;
+        let max_scraps = MAX_SCRAPS as u64;
         let knife_buf = gpu.uniform("knife", std::mem::size_of::<KnifeParams>() as u64);
         let scraps = gpu.storage("scraps", max_scraps * 48);
         let scrap_count = gpu.storage("scrap_count", 16);
@@ -708,6 +710,7 @@ impl Film {
             .storage(&strata_h2, false)
             .storage(&strata_pig2, false)
             .storage(&alpha_s, false)
+            .storage(&strata_cure2, false)
             .build(&gpu.device, "film1");
         let (l_fac, bg_fac) = BindBuilder::new(stages)
             .storage(&stats_buf, false)
@@ -854,7 +857,7 @@ impl Film {
         let tilt = s.tilt_deg.to_radians();
         let dir = s.tilt_dir_deg.to_radians();
         let gxy = s.gravity * tilt.sin();
-        [gxy * dir.cos(), gxy * dir.sin(), s.gravity * tilt.cos()]
+        [gxy * dir.cos(), gxy * dir.sin(), (s.gravity * tilt.cos()).max(0.0)]
     }
 
     pub fn update_params(&mut self, gpu: &Gpu, frame_dt: f32, substeps: u32) {
@@ -862,7 +865,7 @@ impl Film {
         let s = &self.settings;
         let g = self.gravity_vec();
         let theta = s.contact_angle_deg.to_radians();
-        let pi_a = 2.0 * s.sigma * (1.0 - theta.cos()) / s.h_star;
+        let pi_a = 3.0 * s.sigma * (1.0 - theta.cos()) / s.h_star;
         let dt = frame_dt / substeps as f32;
         let dx = self.dx;
         let m_cap_exp = 0.5 * dx * dx * dx * dx / (32.0 * s.sigma * dt);
@@ -1130,7 +1133,7 @@ impl Film {
                 {
                     let view = self.scrap_read[k].slice(..).get_mapped_range().expect("map");
                     let count: u32 = bytemuck::cast_slice::<u8, u32>(&view[..4])[0];
-                    let n = (count as usize).min(1 << 16);
+                    let n = (count as usize).min(MAX_SCRAPS);
                     let data: &[Scrap] = bytemuck::cast_slice(&view[16..16 + n * 48]);
                     out.extend_from_slice(data);
                 }

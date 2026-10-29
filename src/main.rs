@@ -68,8 +68,8 @@ struct App {
     brush: brush::Brush,
     roller: roller::Roller,
     sponge: sponge::Sponge,
-    brush_scraped: f64,
-    brush_released: f64,
+    tool_scraped: f64,
+    tool_released: f64,
     prev_kind: ToolKind,
     painter: Option<pollock::Painter>,
     evo: evolve::EvolveState,
@@ -115,6 +115,7 @@ struct App {
     pen_raw: f32,
     pen_seen: bool,
     pen_pressure: bool,
+    pen_cut: bool,
     pen_curve: f32,
     pal_picks: [[f32; 3]; 6],
     paint_pick: [f32; 3],
@@ -262,10 +263,10 @@ impl App {
             air: Airborne::new(),
             surface,
             brush: if std::env::var("PAINT_BRUSH_FLAT").is_ok() { brush::Brush::build(brush::BrushShape::Flat, 160, 0.035, 0.025, 0.00015) } else { brush::Brush::new(160, 0.035, 0.008, 0.00015) },
-            brush_scraped: 0.0,
+            tool_scraped: 0.0,
             roller: roller::Roller::new(),
             sponge: sponge::Sponge::new(),
-            brush_released: 0.0,
+            tool_released: 0.0,
             prev_kind: ToolKind::Stick,
             painter: None,
             evo: evolve::EvolveState::new(),
@@ -308,6 +309,7 @@ impl App {
             pen_raw: 0.0,
             pen_seen: false,
             pen_pressure: true,
+            pen_cut: false,
             pen_curve: 1.0,
             pal_picks: [[0.5; 3]; 6],
             paint_pick: [0.5; 3],
@@ -402,6 +404,15 @@ impl App {
         }
     }
 
+    fn lay_recycled(&mut self, laid: Vec<Deposit>, deposits: &mut Vec<Deposit>) {
+        let (w, h) = (self.film.settings.width_m, self.film.settings.height_m);
+        for d in laid {
+            let d = d.recycled();
+            self.tool_released += d.vol as f64 * d.inside_fraction(w, h) as f64;
+            deposits.push(d);
+        }
+    }
+
     fn brush_press(&self, pressure: f64) -> f64 {
         pressure * (PEN_BRUSH_PRESS * self.brush.len).min(PEN_PRESS_DIAMETERS * self.brush.size())
     }
@@ -427,9 +438,9 @@ impl App {
         b.release = rl;
         if load > 0.0 && cap > 0.0 {
             b.dip(&comp);
-            let f = (load / cap).min(1.0);
+            let each = load / b.bristles.len().max(1) as f64;
             for br in &mut b.bristles {
-                br.load *= f;
+                br.load = each;
             }
         }
         self.brush = b;
@@ -647,6 +658,77 @@ impl App {
                 }
             }
             return self.apply_painter();
+        }
+        if a.script == "physics" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str, d: f64| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok()).unwrap_or(d);
+            self.tool.kind = ToolKind::Pour;
+            self.tool.flowing = false;
+            if f == 1 {
+                let st = &mut self.film.settings;
+                st.cure_rate = 0.0;
+                st.contact_angle_deg = arg("--angle", 5.0) as f32;
+                st.hysteresis_deg = 0.0;
+                st.tilt_deg = arg("--tilt", 0.0) as f32;
+                st.tilt_dir_deg = -90.0;
+                if let Some(n) = args.windows(2).find(|p| p[0] == "--maxsub").and_then(|p| p[1].parse::<u32>().ok()) {
+                    st.max_substeps = n;
+                    st.min_substeps = st.min_substeps.min(n);
+                }
+                self.tool.sigma = arg("--sigma", 0.03);
+                self.tool.mu = arg("--mu", 10.0);
+                let mut p = color::PaintMix::pure(1);
+                p.frac[12] = 0.0;
+                p.frac[13] = arg("--yield", 0.0) as f32;
+                p.frac[14] = (self.tool.mu as f32).ln() + 10.0;
+                let vol = arg("--vol", 5.0) * 1e-6;
+                let r = arg("--r0", 15.0) * 1e-3;
+                let c = [(w * 0.5) as f32, (hgt * 0.5) as f32];
+                self.pending_deposits.push(Deposit::capsule(c, c, r as f32, vol as f32, p.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+            }
+            let every = arg("--every", 60.0) as u64;
+            if f > 2 && f % every == 0 {
+                let hv: Vec<f32> = bytemuck::cast_slice(&self.read_buffer_raw(&self.film.h_buf)).to_vec();
+                let (fw, fh, dx) = (self.film.w as usize, self.film.h as usize, self.film.dx as f64);
+                let thr = arg("--thr", 2.0) * 1e-6;
+                let (mut vol, mut cx, mut cy, mut area, mut hmax) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for (k, v) in hv.iter().enumerate() {
+                    let v = *v as f64;
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let (x, y) = (((k % fw) as f64 + 0.5) * dx, ((k / fw) as f64 + 0.5) * dx);
+                    vol += v * dx * dx;
+                    cx += v * x * dx * dx;
+                    cy += v * y * dx * dx;
+                    hmax = hmax.max(v);
+                    if v > thr {
+                        area += dx * dx;
+                    }
+                }
+                cx /= vol.max(1e-30);
+                cy /= vol.max(1e-30);
+                let mut radii = Vec::new();
+                for d in 0..8 {
+                    let a = d as f64 * std::f64::consts::FRAC_PI_4;
+                    let mut r = 0.0;
+                    loop {
+                        let (x, y) = (cx + (r + dx) * a.cos(), cy + (r + dx) * a.sin());
+                        let (i, j) = ((x / dx) as i64, (y / dx) as i64);
+                        if i < 0 || j < 0 || i >= fw as i64 || j >= fh as i64 || (hv[j as usize * fw + i as usize] as f64) <= thr {
+                            break;
+                        }
+                        r += dx;
+                    }
+                    radii.push(r * 1e3);
+                }
+                let mean = (area / std::f64::consts::PI).sqrt();
+                let rs: Vec<String> = radii.iter().map(|r| format!("{:.2}", r)).collect();
+                log::warn!("PHYS t {:.2} s vol {:.4} mL R {:.3} mm hmax {:.3} mm centroid {:.3} {:.3} mm radii {}", f as f64 / 60.0, vol * 1e6, mean * 1e3, hmax * 1e3, (cx - w * 0.5) * 1e3, (cy - hgt * 0.5) * 1e3, rs.join(" "));
+            }
+            return true;
         }
         if a.script == "brushlong" {
             let f = self.frame_index;
@@ -1634,7 +1716,7 @@ impl App {
         self.stats = format!(
             "wet {:.4} mL  cured {:.4} mL  deposited {:.4} mL  brush held {:.4} mL  err {:.2}%  hmax {:.3} mm  wet cells {}  active tiles {}  nan {}  fps {:.0}  substeps {}",
             vol * 1e6, volm * 1e6, self.film.total_deposited * 1e6, self.brush.total_load() * 1e6,
-            if self.film.total_deposited > 0.0 { (vol + volm + self.brush_scraped - self.brush_released - self.film.total_deposited) / self.film.total_deposited * 100.0 } else { 0.0 },
+            if self.film.total_deposited > 0.0 { (vol + volm + self.tool_scraped - self.tool_released - self.film.total_deposited) / self.film.total_deposited * 100.0 } else { 0.0 },
             hmax * 1e3, wet, self.film.active_tiles, nan, self.fps, self.film.substeps_last
         );
         log::warn!("{}", self.stats);
@@ -2076,6 +2158,7 @@ impl App {
                             continue;
                         }
                         self.knife_bands[i].vol -= bow;
+                        self.tool_released += bow;
                         let r = (0.75 * bow / band_w).sqrt().max(self.film.dx as f64);
                         let q = p + mdir * (r + self.film.dx as f64);
                         let a = q + blade_dir * (-hw + (i as f64 + 0.15) * band_w);
@@ -2099,6 +2182,7 @@ impl App {
                             let r = (0.75 * take / dist).sqrt().max(self.film.dx as f64) as f32;
                             let e0 = q + blade_dir * (side * (hw + r as f64 * 0.6));
                             let e1 = p + blade_dir * (side * (hw + r as f64 * 0.6));
+                            self.tool_released += take;
                             deposits.push(Deposit::stroke([e0.x as f32, e0.y as f32], [e1.x as f32, e1.y as f32], r, take as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
                         }
                     }
@@ -2131,6 +2215,7 @@ impl App {
                         let a = q + blade_dir * (-hw + (i as f64 + 0.15) * band_w);
                         let b = q + blade_dir * (-hw + (i as f64 + 0.85) * band_w);
                         let pig = color::PaintMix { frac: self.knife_bands[i].comp }.normalized().packed();
+                        self.tool_released += vol;
                         deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, vol as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
                     }
                 }
@@ -2141,6 +2226,8 @@ impl App {
             self.knife_track = None;
         }
         self.scrap_total += scraps.iter().map(|s| s.vol.max(0.0) as f64).sum::<f64>();
+        self.tool_scraped += scraps.iter().map(|s| s.vol.max(0.0) as f64).sum::<f64>();
+        self.tool_released += scraps.iter().map(|s| (-s.vol).max(0.0) as f64).sum::<f64>();
         for p in &mut self.knife_pending {
             *p *= KNIFE_PENDING_DECAY;
         }
@@ -2171,13 +2258,13 @@ impl App {
         let mut picked: [Vec<[u32; 17]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         self.film.poll_reservoir(&self.gpu, &mut picked);
         if !picked[0].is_empty() {
-            self.brush_scraped += self.brush.absorb(&picked[0]);
+            self.tool_scraped += self.brush.absorb(&picked[0]);
         }
         if !picked[1].is_empty() {
-            self.roller.absorb(&picked[1]);
+            self.tool_scraped += self.roller.absorb(&picked[1]);
         }
         if !picked[2].is_empty() {
-            self.sponge.absorb(&picked[2]);
+            self.tool_scraped += self.sponge.absorb(&picked[2]);
         }
         let mut contacts = Vec::new();
         if self.tool.kind == ToolKind::Brush {
@@ -2231,7 +2318,7 @@ impl App {
                     })
                     .collect();
                 for (d, inside) in laid {
-                    self.brush_released += inside;
+                    self.tool_released += inside;
                     deposits.push(d);
                 }
             }
@@ -2242,7 +2329,7 @@ impl App {
                 let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);
                 let (c, d) = self.roller.update(at, self.tool.flowing, pressure, self.film.dx);
                 contacts = c;
-                deposits.extend(d);
+                self.lay_recycled(d, &mut deposits);
             }
         } else {
             self.roller.lift();
@@ -2253,7 +2340,7 @@ impl App {
                 let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);
                 let (c, d) = self.sponge.update(at, self.tool.flowing, pressure, frame_dt as f64, self.film.dx);
                 contacts = c;
-                deposits.extend(d);
+                self.lay_recycled(d, &mut deposits);
             }
         } else {
             self.sponge.lift();
@@ -2563,6 +2650,7 @@ impl ApplicationHandler for Pending {
                     app.pen_down = false;
                     app.pen_raw = 0.0;
                     app.mouse_down[0] = false;
+                    app.pen_cut = true;
                 }
                 let prev = app.cursor;
                 app.cursor = [position.x as f32, position.y as f32];
@@ -2605,8 +2693,15 @@ impl ApplicationHandler for Pending {
                         }
                         app.pen_down = false;
                         app.pen_raw = 0.0;
+                        app.pen_cut = false;
                     }
-                    TouchPhase::Moved => {}
+                    TouchPhase::Moved => {
+                        if app.pen_cut && !app.pen_down && !app.cursor_over_panel() {
+                            app.pen_down = true;
+                            app.mouse_down[0] = true;
+                            app.pen_cut = false;
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {

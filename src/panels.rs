@@ -147,8 +147,8 @@ impl App {
     pub(crate) fn clear_canvas(&mut self) {
         self.film.clear(&self.gpu);
         self.air = crate::Airborne::new();
-        self.brush_scraped = 0.0;
-        self.brush_released = 0.0;
+        self.tool_scraped = 0.0;
+        self.tool_released = 0.0;
         self.surface = crate::CoarseSurface::new(self.film.pool_dims[0], self.film.pool_dims[1], 4.0 * self.film.dx as f64);
         self.sim_time = 0.0;
     }

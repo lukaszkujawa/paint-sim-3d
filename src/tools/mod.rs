@@ -258,11 +258,12 @@ pub struct Airborne {
     pub emitted_volume: f64,
     pub prof: [f32; 3],
     pub rod_steps: u32,
+    prev_nozzle: Option<(u64, DVec3)>,
 }
 
 impl Airborne {
     pub fn new() -> Self {
-        Self { rods: Vec::new(), drops: Vec::new(), next_id: 1, landed_volume: 0.0, emitted_volume: 0.0, prof: [0.0; 3], rod_steps: 0 }
+        Self { rods: Vec::new(), drops: Vec::new(), next_id: 1, landed_volume: 0.0, emitted_volume: 0.0, prof: [0.0; 3], rod_steps: 0, prev_nozzle: None }
     }
 
     pub fn detach(&mut self) {
@@ -284,6 +285,7 @@ impl Airborne {
                 let fl = tool.fluid();
                 let same = self.rods[i].pig == pig && (self.rods[i].fluid.mu - fl.mu).abs() < 1e-9 && (self.rods[i].fluid.sigma - fl.sigma).abs() < 1e-9;
                 if same {
+                    self.prev_nozzle = self.rods[i].nozzle.as_ref().map(|n| (self.rods[i].id, n.pos));
                     self.rods[i].nozzle = Some(nz);
                 } else {
                     self.rods[i].nozzle = None;
@@ -322,6 +324,7 @@ impl Airborne {
                 let mut t = 0.0;
                 let mut guard = 0;
                 let nozzle_end = rod.nozzle.as_ref().map(|n| (n.pos, n.vel));
+                let nozzle_start = self.prev_nozzle.filter(|(id, _)| *id == rod.id).map(|(_, p)| p);
                 while t < frame_dt && guard < 4000 {
                     guard += 1;
                     let speed = rod.tip_speed().max(0.05);
@@ -344,7 +347,11 @@ impl Airborne {
                         let k = rod.step_count.wrapping_add(rod.id.wrapping_mul(7919));
                         let jx = (k.wrapping_mul(2654435761) % 1000003) as f64 / 500001.5 - 1.0;
                         let jy = (k.wrapping_mul(40503).wrapping_add(7) % 999983) as f64 / 499991.5 - 1.0;
-                        nz.pos = pe - ve * (frame_dt - (t + dt)) + DVec3::new(jx, jy, 0.0) * (JITTER * nz.radius);
+                        let along = match nozzle_start {
+                            Some(p0) => p0 + (pe - p0) * ((t + dt) / frame_dt),
+                            None => pe - ve * (frame_dt - (t + dt)),
+                        };
+                        nz.pos = along + DVec3::new(jx, jy, 0.0) * (JITTER * nz.radius);
                     }
                     rod.step(dt, surface as &dyn Surface, &mut out, gravity);
                     t += dt;

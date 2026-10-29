@@ -70,6 +70,7 @@ const TILE: u32 = 64u;
 @group(1) @binding(5) var<storage, read_write> strata_h2: array<vec4<f32>>;
 @group(1) @binding(6) var<storage, read_write> strata_pig2: array<vec4<u32>>;
 @group(1) @binding(7) var<storage, read_write> alpha_s: array<vec4<f32>>;
+@group(1) @binding(8) var<storage, read_write> strata_cure2: array<vec4<f32>>;
 
 @group(3) @binding(0) var<storage, read_write> tile_flags: array<u32>;
 @group(3) @binding(1) var<storage, read_write> tile_list: array<u32>;

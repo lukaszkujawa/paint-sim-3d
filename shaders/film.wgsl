@@ -1,4 +1,4 @@
-const DRAINED_FILM: f32 = 1e-7;
+const DRAINED_FILM: f32 = 1e-9;
 const WAKE_BAND: u32 = 8u;
 const PLUG_RADIUS: i32 = 3;
 const YIELD_MENISCUS: f32 = 1e-3;
@@ -223,7 +223,8 @@ fn front_shape(c: u32, n: vec2<f32>) -> f32 {
 
 fn wet_threshold(c: u32) -> f32 {
     let ty = rheo[c].y;
-    let ycap = ty / (P.phys.x * P.g.z * max(h[c], 1e-4)) * P.dx;
+    let need = max(ty / (P.phys.x * max(h[c], 1e-4)) - length(P.g.xy), 0.0);
+    let ycap = need / max(P.g.z, 1e-3) * P.dx;
     return max(hold_level(1.0), ycap);
 }
 
@@ -562,7 +563,8 @@ fn nb_face(c: u32, q: f32, cn: u32, ac: f32, st: ptr<function, Inflow>) {
 fn slope_cap(c: u32) -> f32 {
     let ty = rheo[c].y;
     let hb = max(h[c], 1e-4);
-    return max(P.ein.x, ty / (P.phys.x * P.g.z * hb));
+    let need = max(ty / (P.phys.x * hb) - length(P.g.xy), 0.0);
+    return max(P.ein.x, need / max(P.g.z, 1e-3));
 }
 
 fn pack_off(dx: i32, dy: i32) -> f32 {

@@ -18,7 +18,7 @@ fn stack_load(c: u32) -> Stack {
 
 fn stack_store2(c: u32, s: Stack) {
     strata_h2[c] = vec4<f32>(s.th[0], s.th[1], s.th[2], s.th[3]);
-    strata_cure[c] = vec4<f32>(s.cu[0], s.cu[1], s.cu[2], s.cu[3]);
+    strata_cure2[c] = vec4<f32>(s.cu[0], s.cu[1], s.cu[2], s.cu[3]);
     for (var k = 0u; k < 4u; k++) {
         strata_pig2[(c * 4u + k) * 2u] = pack_pig_a(s.pg[k]);
         strata_pig2[(c * 4u + k) * 2u + 1u] = pack_pig_b(s.pg[k]);
@@ -228,7 +228,7 @@ fn strata_update(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
         }
         if plain {
             strata_h2[c] = nt;
-            strata_cure[c] = cu;
+            strata_cure2[c] = cu;
             for (var k = 0u; k < 8u; k++) {
                 strata_pig2[c * 8u + k] = strata_pig[c * 8u + k];
             }
@@ -279,6 +279,7 @@ fn strata_copy_back(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
     if !in_grid(id) { return; }
     let c = idx(id.x, id.y);
     strata_h[c] = strata_h2[c];
+    strata_cure[c] = strata_cure2[c];
     for (var k = 0u; k < 8u; k++) {
         strata_pig[c * 8u + k] = strata_pig2[c * 8u + k];
     }

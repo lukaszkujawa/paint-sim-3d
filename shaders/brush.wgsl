@@ -65,9 +65,12 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
             if cc < cap {
                 cap = cc;
                 who = k.bristle;
-                if k.pad == CONTACT_ROLLER || k.pad == CONTACT_SPONGE {
+                if k.pad == CONTACT_ROLLER {
                     method = METHOD_ROLLER;
                     stroke = vec2<f32>(k.p1.y - k.p0.y, k.p0.x - k.p1.x);
+                } else if k.pad == CONTACT_SPONGE {
+                    method = METHOD_ROLLER;
+                    stroke = k.p1 - k.p0;
                 } else {
                     method = METHOD_BRUSH;
                     stroke = k.p1 - k.p0;

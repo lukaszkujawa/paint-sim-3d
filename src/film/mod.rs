@@ -491,6 +491,7 @@ pub struct Film {
     pub reservoir: wgpu::Buffer,
     pub res_read: [wgpu::Buffer; 2],
     pub res_pending: [std::sync::Arc<std::sync::atomic::AtomicU8>; 2],
+    pub res_tool: [u8; 2],
     pub contact_count: usize,
     pub pool_buf: wgpu::Buffer,
     pub pool_read: [wgpu::Buffer; 2],
@@ -837,7 +838,7 @@ impl Film {
             clock,
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
-            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
+            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, res_tool: [0; 2], contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, detail_tex, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_plug, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
@@ -1062,10 +1063,10 @@ impl Film {
         let mut range = vec![[0u32; 2]; nt];
         let mut items: Vec<u32> = Vec::new();
         for t in 0..nt {
-            range[t] = [items.len() as u32, lists[t].len() as u32];
-            items.extend_from_slice(&lists[t]);
+            let take = lists[t].len().min(MAX_CONTACTS * 16 - items.len());
+            range[t] = [items.len() as u32, take as u32];
+            items.extend_from_slice(&lists[t][..take]);
         }
-        items.truncate(MAX_CONTACTS * 16);
         gpu.queue.write_buffer(&self.contacts, 0, bytemuck::cast_slice(&cs[..count]));
         gpu.queue.write_buffer(&self.ctile_range, 0, bytemuck::cast_slice(&range));
         if !items.is_empty() {
@@ -1073,11 +1074,12 @@ impl Film {
         }
     }
 
-    pub fn poll_reservoir(&mut self, gpu: &Gpu, out: &mut Vec<[u32; 17]>) {
+    pub fn poll_reservoir(&mut self, gpu: &Gpu, outs: &mut [Vec<[u32; 17]>; 3]) {
         let _ = gpu.device.poll(wgpu::PollType::Poll);
         for k in 0..2 {
             if self.res_pending[k].load(std::sync::atomic::Ordering::Acquire) == 2 {
                 {
+                    let out = &mut outs[(self.res_tool[k] as usize).min(2)];
                     let view = self.res_read[k].slice(..).get_mapped_range().expect("map");
                     let data: &[u32] = bytemuck::cast_slice(&view);
                     for b in 0..MAX_BRISTLES {
@@ -1098,7 +1100,7 @@ impl Film {
         }
     }
 
-    pub fn request_reservoir(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<usize> {
+    pub fn request_reservoir(&mut self, enc: &mut wgpu::CommandEncoder, tool: u8) -> Option<usize> {
         let mut slot = None;
         for k in 0..2 {
             if self.res_pending[k].load(std::sync::atomic::Ordering::Acquire) == 0 {
@@ -1109,6 +1111,7 @@ impl Film {
         let Some(k) = slot else { return None };
         enc.copy_buffer_to_buffer(&self.reservoir, 0, &self.res_read[k], 0, (MAX_BRISTLES * 17 * 4) as u64);
         enc.clear_buffer(&self.reservoir, 0, None);
+        self.res_tool[k] = tool;
         self.res_pending[k].store(1, std::sync::atomic::Ordering::Release);
         Some(k)
     }
@@ -1160,7 +1163,7 @@ impl Film {
         });
     }
 
-    pub fn upload_deposits(&mut self, gpu: &Gpu, deps: &[Deposit]) {
+    pub fn upload_deposits(&mut self, gpu: &Gpu, deps: &[Deposit]) -> usize {
         let count = deps.len().min(self.max_deposits);
         self.deposit_count = count;
         let nt = (self.tiles[0] * self.tiles[1]) as usize;
@@ -1193,14 +1196,12 @@ impl Film {
         let mut start = vec![0u32; nt];
         let mut cnt = vec![0u32; nt];
         let mut items: Vec<u32> = Vec::new();
-        for t in 0..nt {
-            start[t] = items.len() as u32;
-            cnt[t] = lists[t].len() as u32;
-            items.extend_from_slice(&lists[t]);
-        }
         let cap = self.max_deposits * 16;
-        if items.len() > cap {
-            items.truncate(cap);
+        for t in 0..nt {
+            let take = lists[t].len().min(cap - items.len());
+            start[t] = items.len() as u32;
+            cnt[t] = take as u32;
+            items.extend_from_slice(&lists[t][..take]);
         }
         if count > 0 {
             gpu.queue.write_buffer(&self.deposits, 0, bytemuck::cast_slice(&deps[..count]));
@@ -1210,6 +1211,7 @@ impl Film {
         if !items.is_empty() {
             gpu.queue.write_buffer(&self.tile_items, 0, bytemuck::cast_slice(&items));
         }
+        count
     }
 
     fn groups(&self) -> (u32, u32) {

@@ -1535,9 +1535,6 @@ impl App {
         if let Some(f) = self.evo.saved_paint.take() {
             self.paint.frac = f;
         }
-        if let Some(h) = self.evo.saved_height.take() {
-            self.tool.height = h;
-        }
         let shape = self.brush.shape;
         for (kind, s, size) in std::mem::take(&mut self.evo.user_sizes) {
             if kind != ToolKind::Brush || s == shape {
@@ -1552,6 +1549,9 @@ impl App {
         }
         if let Some(k) = self.evo.saved_load.take() {
             self.brush.capacity = self.brush.base_capacity * k;
+        }
+        if let Some(h) = self.evo.saved_height.take() {
+            self.tool.height = h;
         }
     }
 

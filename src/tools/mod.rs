@@ -6,6 +6,8 @@ use glam::DVec3;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+const MAX_DROPS: usize = 20000;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolKind {
     Stick,
@@ -448,7 +450,7 @@ impl Airborne {
                     let rd = (r * f) as f32;
                     let mut vol = d.vol;
                     let n = splash_count(u, 2.0 * r, &d.fluid);
-                    if n > 0 && d.vol > 1e-12 {
+                    if n > 0 && d.vol > 1e-12 && self.drops.len() + secondary.len() + n < MAX_DROPS {
                         let mut rng = rand::rng();
                         let each = 0.3 * vol / n as f64;
                         for _ in 0..n {
@@ -476,9 +478,7 @@ impl Airborne {
                 i += 1;
             }
         }
-        if self.drops.len() < 20000 {
-            self.drops.extend(secondary);
-        }
+        self.drops.extend(secondary);
         self.prof[2] = t_drops.elapsed().as_secs_f32() * 1e3;
     }
 }

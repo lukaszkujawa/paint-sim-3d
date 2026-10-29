@@ -126,6 +126,9 @@ struct App {
     brush_raise: f64,
     brush_z: Option<f64>,
     brush_hold: f64,
+    held_deposits: Vec<Deposit>,
+    tool_heights: Vec<(ToolKind, f64)>,
+    height_kind: ToolKind,
     last_cpu_ms: f32,
     ctrl_down: bool,
     cam: Camera,
@@ -316,6 +319,9 @@ impl App {
             brush_raise: 0.0,
             brush_z: None,
             brush_hold: 0.0,
+            held_deposits: Vec::new(),
+            tool_heights: Vec::new(),
+            height_kind: ToolKind::Stick,
             last_cpu_ms: 0.0,
             ctrl_down: false,
             cam,
@@ -1676,10 +1682,19 @@ impl App {
     fn encode_sim(&mut self, enc: &mut wgpu::CommandEncoder, deposits: &[Deposit], knife: Option<KnifeParams>, frame_dt: f32) -> [Option<usize>; 3] {
         let mut slots = [None; 3];
         if self.paused {
+            self.held_deposits.extend_from_slice(deposits);
             return slots;
         }
         self.film.poll_stats(&self.gpu, &mut self.surface.data, &mut self.surface.sub);
-        self.film.upload_deposits(&self.gpu, deposits);
+        if self.held_deposits.is_empty() {
+            let sent = self.film.upload_deposits(&self.gpu, deposits);
+            self.held_deposits.extend_from_slice(&deposits[sent..]);
+        } else {
+            let mut all = std::mem::take(&mut self.held_deposits);
+            all.extend_from_slice(deposits);
+            let sent = self.film.upload_deposits(&self.gpu, &all);
+            self.held_deposits.extend_from_slice(&all[sent..]);
+        }
         self.film.set_knife(&self.gpu, knife);
         let substeps = self.film.choose_substeps(frame_dt);
         self.film.update_params(&self.gpu, frame_dt, substeps);
@@ -1687,8 +1702,14 @@ impl App {
         self.film.encode_frame(enc, substeps);
         slots[0] = self.film.request_stats(&self.gpu, enc);
         slots[1] = self.film.request_scraps(enc);
-        if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) {
-            slots[2] = self.film.request_reservoir(enc);
+        let tag = match self.tool.kind {
+            ToolKind::Brush => Some(0),
+            ToolKind::Roller => Some(1),
+            ToolKind::Sponge => Some(2),
+            _ => None,
+        };
+        if let Some(t) = tag {
+            slots[2] = self.film.request_reservoir(enc, t);
         }
         self.sim_time += frame_dt;
         slots
@@ -1764,12 +1785,27 @@ impl App {
             self.begin_stroke();
         }
         self.stroke_down = want_pour;
+        if self.tool.kind != self.height_kind {
+            let from = self.height_kind;
+            self.tool_heights.retain(|(k, _)| *k != from);
+            self.tool_heights.push((from, self.tool.height));
+            self.height_kind = self.tool.kind;
+            self.prev_tool_pos = None;
+            if self.auto.is_none() && !self.evolving() && !self.painter_active {
+                if let Some(&(_, h)) = self.tool_heights.iter().find(|(k, _)| *k == self.tool.kind) {
+                    self.tool.height = h;
+                    if self.tool.kind == ToolKind::Brush {
+                        self.prev_kind = ToolKind::Brush;
+                    }
+                }
+            }
+        }
         let pen = self.pen();
         self.tool.flow_scale = pen.map(|p| PEN_FLOW_MIN + (PEN_FLOW_MAX - PEN_FLOW_MIN) * p).unwrap_or(1.0);
         let mut scraps: Vec<Scrap> = Vec::new();
         self.film.poll_scraps(&self.gpu, &mut scraps);
         if self.tool.kind == ToolKind::Pour {
-            if want_pour {
+            if want_pour && !self.paused {
                 if let Some(p) = self.cam.plane_hit(self.ndc(), 0.0) {
                     let p0 = self.last_pour.unwrap_or(p);
                     let vol = self.pour_rate * frame_dt * self.tool.flow_scale as f32;
@@ -1929,7 +1965,8 @@ impl App {
         deposits.append(&mut self.pending_deposits);
         if !scripted {
             let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) { 0.0 } else { self.tool.height as f32 };
-            if let Some(p) = self.cam.plane_hit(self.ndc(), pick_z).or_else(|| self.cam.plane_hit(self.ndc(), 0.0)) {
+            let general = if self.tool.kind == ToolKind::Knife { None } else { self.cam.plane_hit(self.ndc(), pick_z).or_else(|| self.cam.plane_hit(self.ndc(), 0.0)) };
+            if let Some(p) = general {
                 let p = DVec3::new(p.x as f64, p.y as f64, self.tool.height);
                 let v = match self.prev_tool_pos {
                     Some(q) => (p - q) / frame_dt as f64,
@@ -1949,6 +1986,8 @@ impl App {
                     self.prev_tool_pos = Some(p);
                 }
             }
+        } else {
+            self.prev_tool_pos = None;
         }
         self.paint.frac[14] = (self.tool.mu as f32).ln() + 10.0;
         self.film.settings.sigma = self.tool.sigma as f32;
@@ -2063,7 +2102,7 @@ impl App {
                     }
                 }
                 self.knife_prev = Some(p);
-            } else {
+            } else if !self.paused {
                 if let Some(last) = self.knife_prev {
                     let keep = hold / KNIFE_BANDS as f64;
                     for i in 0..KNIFE_BANDS {
@@ -2114,15 +2153,23 @@ impl App {
                 self.knife_bands[bi].blend(vol, &comp);
             }
         }
+        let mut picked: [Vec<[u32; 17]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        self.film.poll_reservoir(&self.gpu, &mut picked);
+        if !picked[0].is_empty() {
+            self.brush_scraped += self.brush.absorb(&picked[0]);
+        }
+        if !picked[1].is_empty() {
+            self.roller.absorb(&picked[1]);
+        }
+        if !picked[2].is_empty() {
+            self.sponge.absorb(&picked[2]);
+        }
         let mut contacts = Vec::new();
         if self.tool.kind == ToolKind::Brush {
             if self.prev_kind != ToolKind::Brush {
                 self.tool.height = self.brush.len * 0.75;
             }
             self.tool.height = self.tool.height.clamp(0.002, self.brush.len - 0.0002);
-            let mut res = Vec::new();
-            self.film.poll_reservoir(&self.gpu, &mut res);
-            self.brush_scraped += self.brush.absorb(&res);
             if self.tool.infinite && !self.evolving() {
                 self.brush.top_up(&self.paint.frac);
             }
@@ -2175,9 +2222,6 @@ impl App {
             }
         }
         if self.tool.kind == ToolKind::Roller {
-            let mut res = Vec::new();
-            self.film.poll_reservoir(&self.gpu, &mut res);
-            self.roller.absorb(&res);
             if !self.paused {
                 let pressure = pen.unwrap_or(self.roller.pressure);
                 let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);
@@ -2189,9 +2233,6 @@ impl App {
             self.roller.lift();
         }
         if self.tool.kind == ToolKind::Sponge {
-            let mut res = Vec::new();
-            self.film.poll_reservoir(&self.gpu, &mut res);
-            self.sponge.absorb(&res);
             if !self.paused {
                 let pressure = pen.unwrap_or(self.sponge.pressure);
                 let at = glam::DVec2::new(self.tool.pos.x, self.tool.pos.y);

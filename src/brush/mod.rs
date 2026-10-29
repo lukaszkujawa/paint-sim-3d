@@ -24,6 +24,7 @@ const RELEASE_REF: f64 = 1.5;
 const SWEEP_MIN: f64 = 0.25;
 const CONTACT_BODY: u32 = 3;
 const OVERFLOW: f64 = 8.0;
+const DWELL: f64 = 0.01;
 const LUBE: f64 = 0.6;
 const BEAD: f64 = 3.0e-4;
 
@@ -385,19 +386,19 @@ impl Brush {
             let nseg = segs_touching.len() as f64;
             let over = (b.load - self.capacity).max(0.0) * (OVERFLOW * dt).min(1.0) / nseg;
             let film = FILM * (b.load / self.capacity).min(1.0) * (self.release / RELEASE_REF) * b.thick / overlap;
-            let laid: Vec<(usize, usize, f64, f64)> = segs_touching
+            let laid: Vec<(usize, usize, f64)> = segs_touching
                 .iter()
                 .map(|&i| {
                     let tip = if b.pts[i].z <= b.pts[i - 1].z { i } else { i - 1 };
-                    let swept = (b.pts[tip] - b.last[tip]).truncate().length();
-                    (i, tip, swept, 2.0 * rc as f64 * swept.max(rc as f64) * film)
+                    (i, tip, (b.pts[tip] - b.last[tip]).truncate().length())
                 })
                 .collect();
-            let want: f64 = laid.iter().map(|l| l.3).sum();
-            let scale = if want > 0.0 { (b.load.min(self.capacity) / want).min(1.0) } else { 0.0 };
+            let lane = laid.iter().map(|l| l.2).fold(0.0, f64::max) + DWELL * dt;
+            let want = 2.0 * rc as f64 * lane * film;
+            let each = want.min(b.load.min(self.capacity)) / nseg;
             let mut spent = 0.0;
-            for (i, tip, swept, vol) in laid {
-                let rel = vol * scale + over;
+            for (i, tip, swept) in laid {
+                let rel = each + over;
                 spent += rel;
                 let p0 = [b.pts[i - 1].x as f32, b.pts[i - 1].y as f32];
                 let p1 = [b.pts[i].x as f32, b.pts[i].y as f32];

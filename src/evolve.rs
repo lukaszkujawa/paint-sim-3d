@@ -38,6 +38,10 @@ const MISS_LIMIT: usize = 24;
 const TABU: f32 = 0.5;
 const REGIONS: usize = 4;
 const AIMED_SHARE: f32 = 0.5;
+const FLOW_JITTER: f32 = 0.8;
+const GATE: f32 = 0.9;
+const DETAIL_RADIUS: usize = 6;
+const FLOW_SCALES: [(usize, f32); 3] = [(6, 1.0), (24, 0.6), (96, 0.4)];
 const BRISTLE_PER_SIZE: f64 = 5.0;
 const BRISTLE_MIN: f64 = 0.006;
 const SIZE_SPREAD: f64 = 0.4;
@@ -114,6 +118,7 @@ pub struct EvolveState {
     pub run: Option<Evolver>,
     pub candidates: usize,
     pub follow: f64,
+    pub intent: f64,
     pub dry_passes: bool,
     pub longest: f64,
     pub active: bool,
@@ -127,7 +132,7 @@ pub struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
     }
 }
 
@@ -363,7 +368,8 @@ struct Model {
     h: usize,
     cell: f64,
     target: Vec<[f32; 3]>,
-    tangent: Vec<[f32; 3]>,
+    flow: Vec<[f32; 3]>,
+    detail: Vec<f32>,
     weight: Vec<f32>,
     swatches: Vec<Swatch>,
 }
@@ -441,6 +447,7 @@ impl Model {
 #[derive(Clone)]
 pub struct Schedule {
     pub size_hi: f64,
+    start: f64,
     reference: Option<f32>,
     window: VecDeque<f32>,
     misses: usize,
@@ -450,7 +457,7 @@ pub struct Schedule {
 
 impl Schedule {
     fn new(size_hi: f64) -> Self {
-        Self { size_hi, reference: None, window: VecDeque::new(), misses: 0, pass: 0, done: false }
+        Self { size_hi, start: size_hi, reference: None, window: VecDeque::new(), misses: 0, pass: 0, done: false }
     }
 }
 
@@ -465,6 +472,7 @@ struct Job {
     paint: [f32; 16],
     width_gain: f64,
     opacity: f32,
+    intent: f32,
     gen: u64,
 }
 
@@ -479,10 +487,6 @@ pub struct Batch {
 struct Region {
     window: [usize; 4],
     tile: usize,
-    angle: f32,
-    elongation: f32,
-    grain: f32,
-    coherence: f32,
     cdf: Vec<f32>,
 }
 
@@ -506,6 +510,8 @@ struct Sketch {
     opacity: f32,
     sched: Schedule,
     last_tiles: Vec<usize>,
+    intent: f32,
+    gate: Vec<f32>,
 }
 
 impl Sketch {
@@ -531,6 +537,8 @@ impl Sketch {
             opacity: 0.9,
             sched: Schedule::new(size_hi),
             last_tiles: Vec::new(),
+            intent: 0.0,
+            gate: vec![1.0; n],
             m,
         }
     }
@@ -550,7 +558,7 @@ impl Sketch {
         self.tiles.iter_mut().for_each(|t| *t = 0.0);
         for k in 0..self.err.len() {
             let t = self.tile_of(k);
-            self.tiles[t] += self.err[k] * self.m.weight[k] * self.mask[k];
+            self.tiles[t] += self.err[k] * self.m.weight[k] * self.mask[k] * self.gate[k];
         }
         self.tabu.iter_mut().for_each(|t| *t = 1.0);
     }
@@ -574,7 +582,7 @@ impl Sketch {
             let new = [cur[0] + a * (c[0] - cur[0]), cur[1] + a * (c[1] - cur[1]), cur[2] + a * (c[2] - cur[2])];
             let e = de(new, self.m.target[k]);
             let t = self.tile_of(k);
-            self.tiles[t] += (e - self.err[k]) * self.m.weight[k] * self.mask[k];
+            self.tiles[t] += (e - self.err[k]) * self.m.weight[k] * self.mask[k] * self.gate[k];
             self.current[k] = new;
             self.err[k] = e;
         }
@@ -651,10 +659,10 @@ impl Sketch {
         let mut cdf = Vec::with_capacity(m.w * m.h);
         let mut acc = 0.0f32;
         for k in 0..m.w * m.h {
-            acc += self.err[k] * self.err[k] * m.weight[k] * self.mask[k];
+            acc += self.err[k] * self.err[k] * m.weight[k] * self.mask[k] * self.gate[k];
             cdf.push(acc);
         }
-        vec![Region { window: [0, 0, m.w, m.h], tile: 0, angle: 0.0, elongation: 0.0, grain: 0.0, coherence: -0.3, cdf }]
+        vec![Region { window: [0, 0, m.w, m.h], tile: 0, cdf }]
     }
 
     fn region_at(&self, i: usize, j: usize, r: usize) -> Option<Region> {
@@ -663,37 +671,18 @@ impl Sketch {
         let (cx, cy) = (i * TILE + TILE / 2, j * TILE + TILE / 2);
         let window = [cx.saturating_sub(half), cy.saturating_sub(half), (cx + half).min(m.w), (cy + half).min(m.h)];
         let mut cdf = Vec::with_capacity((window[2] - window[0]) * (window[3] - window[1]));
-        let (mut acc, mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let (mut tx, mut ty, mut tn) = (0.0f32, 0.0f32, 0.0f32);
+        let mut acc = 0.0f32;
         for y in window[1]..window[3] {
             for x in window[0]..window[2] {
                 let k = y * m.w + x;
-                let e = self.err[k] * self.err[k] * m.weight[k] * self.mask[k];
-                acc += e;
+                acc += self.err[k] * self.err[k] * m.weight[k] * self.mask[k] * self.gate[k];
                 cdf.push(acc);
-                let (fx, fy) = (x as f32, y as f32);
-                sx += e * fx;
-                sy += e * fy;
-                sxx += e * fx * fx;
-                sxy += e * fx * fy;
-                syy += e * fy * fy;
-                let t = m.tangent[k];
-                tx += t[2] * (t[0] * t[0] - t[1] * t[1]);
-                ty += t[2] * 2.0 * t[0] * t[1];
-                tn += 1.0;
             }
         }
         if acc <= 0.0 {
             return None;
         }
-        let (mx, my) = (sx / acc, sy / acc);
-        let (cxx, cxy, cyy) = (sxx / acc - mx * mx, sxy / acc - mx * my, syy / acc - my * my);
-        let angle = 0.5 * (2.0 * cxy).atan2(cxx - cyy);
-        let tr = cxx + cyy;
-        let elongation = if tr > 1e-6 { ((cxx - cyy).powi(2) + 4.0 * cxy * cxy).sqrt() / tr } else { 0.0 };
-        let grain = 0.5 * ty.atan2(tx);
-        let coherence = ((tx * tx + ty * ty).sqrt() / tn.max(1.0)).min(1.0);
-        Some(Region { window, tile: j * self.tw + i, angle, elongation, grain, coherence, cdf })
+        Some(Region { window, tile: j * self.tw + i, cdf })
     }
 
     fn sample_in(&mut self, reg: &Region) -> [f32; 2] {
@@ -754,7 +743,7 @@ impl Sketch {
             let mut out = Vec::new();
             let mut gone = 0.0;
             while gone + step <= dist {
-                let t = m.tangent[m.index(p)];
+                let t = m.flow[m.index(p)];
                 if t[2] > TRACE_COHERENT {
                     let flip = if t[0] * d[0] + t[1] * d[1] < 0.0 { -1.0 } else { 1.0 };
                     let n = [d[0] + TRACE_TURN * (flip * t[0] - d[0]), d[1] + TRACE_TURN * (flip * t[1] - d[1])];
@@ -836,7 +825,11 @@ impl Sketch {
     }
 
     fn random_stop(&mut self) -> f32 {
-        STOPS[self.rng.random_range(0..STOPS.len())]
+        if self.rng.random::<f32>() < self.intent {
+            STOPS[self.rng.random_range(STOPS.len() - 2..STOPS.len())]
+        } else {
+            STOPS[self.rng.random_range(0..STOPS.len())]
+        }
     }
 
     fn candidate(&mut self, reg: &Region, follow: f64) -> Cand {
@@ -847,16 +840,11 @@ impl Sketch {
         let hw = self.hw(size);
         let (llo, lhi) = self.len_range(size, hw);
         let len = (llo.ln() + self.rng.random::<f32>() * (lhi.ln() - llo.ln())).exp();
-        let t = self.m.tangent[self.m.index(centre)];
-        let traced = self.rng.random::<f64>() < follow * t[2] as f64;
-        let pick: f32 = self.rng.random();
-        let along_grain = (follow as f32 * (0.3 + reg.coherence)).min(0.9);
-        let angle = if traced {
-            t[1].atan2(t[0])
-        } else if pick < along_grain {
-            reg.grain + 0.12 * gauss(&mut self.rng)
-        } else if pick < along_grain + 0.6 * reg.elongation * (1.0 - along_grain) {
-            reg.angle + 0.2 * gauss(&mut self.rng)
+        let f = self.m.flow[self.m.index(centre)];
+        let shaped = self.rng.random::<f32>() < self.intent;
+        let traced = shaped && self.rng.random::<f64>() < follow;
+        let angle = if shaped {
+            f[1].atan2(f[0]) + FLOW_JITTER * (1.0 - self.intent) * gauss(&mut self.rng)
         } else {
             self.rng.random::<f32>() * std::f32::consts::TAU
         };
@@ -886,7 +874,7 @@ impl Sketch {
                 c.len *= (0.5 * gauss(&mut self.rng)).exp();
                 c.along = (c.along + 0.15 * gauss(&mut self.rng)).clamp(0.0, 1.0);
                 if !c.traced {
-                    c.angle += 0.15 * gauss(&mut self.rng);
+                    c.angle += 0.15 * (1.0 - 0.8 * self.intent) * gauss(&mut self.rng);
                 }
                 self.evaluate(c, true, 0.0)
             }
@@ -997,6 +985,11 @@ impl Sketch {
             self.tabu.iter_mut().for_each(|t| *t = 1.0);
         }
         self.set_focus(job.focus);
+        self.intent = job.intent;
+        let fine = (1.0 - self.sched.size_hi / self.sched.start.max(1e-9)).clamp(0.0, 1.0) as f32;
+        let a = GATE * self.intent * fine;
+        let m = self.m.clone();
+        self.gate = m.detail.par_iter().map(|d| 1.0 - a + a * d).collect();
         self.refresh_tiles();
         self.longest = (job.longest / self.m.cell) as f32;
         self.width_gain = job.width_gain;
@@ -1178,8 +1171,10 @@ impl Evolver {
             .collect();
         let (tangent, edges) = structure(&target, self.w, self.h);
         let weight = edges.iter().map(|e| 1.0 + EDGE_WEIGHT * e).collect();
+        let flow = flow_field(&tangent, self.w, self.h);
+        let detail = box_blur(&edges, self.w, self.h, DETAIL_RADIUS);
         let swatches = self.palette.take().unwrap_or_default();
-        self.model = Some(Arc::new(Model { w: self.w, h: self.h, cell: self.cell, target, tangent, weight, swatches }));
+        self.model = Some(Arc::new(Model { w: self.w, h: self.h, cell: self.cell, target, flow, detail, weight, swatches }));
         self.calibrated = true;
         log::info!("display gain {:.2} {:.2} {:.2}", gain[0], gain[1], gain[2]);
     }
@@ -1266,7 +1261,7 @@ impl Evolver {
         if delta < 0.0 { delta * self.mask[k] } else { delta }
     }
 
-    pub fn next(&mut self, candidates: usize, follow: f64, longest: f64, focus: Focus, paint: &[f32; 16]) -> Option<Plan> {
+    pub fn next(&mut self, candidates: usize, follow: f64, intent: f64, longest: f64, focus: Focus, paint: &[f32; 16]) -> Option<Plan> {
         if let Some(p) = self.queue.pop_front() {
             return Some(p);
         }
@@ -1299,7 +1294,7 @@ impl Evolver {
         let size_hi = self.size_hi;
         let seed = self.rng.random();
         let mut sk = self.sketch.take().unwrap_or_else(|| Sketch::new(m, seed, kind, range, size_hi));
-        let job = Job { kind, range, reset: self.reset.take(), candidates, follow, longest, focus, paint: *paint, width_gain: self.width_gain, opacity: self.opacity, gen: self.gen };
+        let job = Job { kind, range, reset: self.reset.take(), candidates, follow, longest, focus, paint: *paint, width_gain: self.width_gain, opacity: self.opacity, intent: intent as f32, gen: self.gen };
         let real = self.current.clone();
         let ahead = pending.clone();
         self.job = Some(std::thread::spawn(move || {
@@ -1392,6 +1387,62 @@ impl Evolver {
             }
         }
     }
+}
+
+fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let pass = |src: &[f32], horizontal: bool| -> Vec<f32> {
+        let (n, len) = if horizontal { (h, w) } else { (w, h) };
+        let at = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
+        let lines: Vec<Vec<f32>> = (0..n)
+            .into_par_iter()
+            .map(|line| {
+                let mut pre = vec![0.0f32; len + 1];
+                for i in 0..len {
+                    pre[i + 1] = pre[i] + src[at(line, i)];
+                }
+                (0..len)
+                    .map(|i| {
+                        let (a, b) = (i.saturating_sub(r), (i + r + 1).min(len));
+                        (pre[b] - pre[a]) / (b - a) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut out = vec![0.0f32; w * h];
+        for (line, vals) in lines.into_iter().enumerate() {
+            for (i, v) in vals.into_iter().enumerate() {
+                out[at(line, i)] = v;
+            }
+        }
+        out
+    };
+    pass(&pass(src, true), false)
+}
+
+fn flow_field(tangent: &[[f32; 3]], w: usize, h: usize) -> Vec<[f32; 3]> {
+    let dx: Vec<f32> = tangent.iter().map(|t| t[2] * (t[0] * t[0] - t[1] * t[1])).collect();
+    let dy: Vec<f32> = tangent.iter().map(|t| t[2] * 2.0 * t[0] * t[1]).collect();
+    let mut fx = vec![0.0f32; w * h];
+    let mut fy = vec![0.0f32; w * h];
+    for (r, wgt) in FLOW_SCALES {
+        let bx = box_blur(&box_blur(&dx, w, h, r), w, h, r);
+        let by = box_blur(&box_blur(&dy, w, h, r), w, h, r);
+        for k in 0..w * h {
+            fx[k] += wgt * bx[k];
+            fy[k] += wgt * by[k];
+        }
+    }
+    let mags: Vec<f32> = fx.iter().zip(&fy).map(|(x, y)| (x * x + y * y).sqrt()).collect();
+    let mut sorted = mags.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let strong = sorted[sorted.len() * 9 / 10].max(1e-6);
+    (0..w * h)
+        .into_par_iter()
+        .map(|k| {
+            let th = 0.5 * fy[k].atan2(fx[k]);
+            [th.cos(), th.sin(), (mags[k] / strong).min(1.0)]
+        })
+        .collect()
 }
 
 fn structure(lab: &[[f32; 3]], w: usize, h: usize) -> (Vec<[f32; 3]>, Vec<f32>) {
@@ -1602,7 +1653,7 @@ impl App {
                     return Phase::Plan;
                 }
                 ev.status.clear();
-                match ev.next(self.evo.candidates, self.evo.follow, self.evo.longest, self.evo.focus, &self.paint.frac) {
+                match ev.next(self.evo.candidates, self.evo.follow, self.evo.intent, self.evo.longest, self.evo.focus, &self.paint.frac) {
                     None if !ev.synced() => Phase::Observe,
                     None => {
                         if ev.finished {
@@ -1871,7 +1922,7 @@ mod tests {
         let (mut done, mut next_report) = (0usize, 0usize);
         let t0 = std::time::Instant::now();
         while done < total {
-            let job = Job { kind, range, reset: None, candidates: 32, follow: 0.7, longest: 0.25, focus, paint: [0.0; 16], width_gain: 1.85, opacity, gen: 0 };
+            let job = Job { kind, range, reset: None, candidates: 32, follow: 0.7, longest: 0.25, focus, paint: [0.0; 16], width_gain: 1.85, opacity, intent: std::env::var("EVO_INTENT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7), gen: 0 };
             sk.rebase(&base, &[]);
             let b = sk.run(&job);
             sk.rebase(&base, &b.plans);

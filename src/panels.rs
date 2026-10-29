@@ -725,6 +725,7 @@ impl App {
             num(ui, "Soft edge", &mut self.evo.focus.soft, 0.0, 2.0, 100.0, " %", false);
             num(ui, "Outside", &mut self.evo.focus.outside, 0.0, 1.0, 100.0, " %", false);
         }
+        num(ui, "Shape following", &mut self.evo.intent, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Longest stroke", &mut self.evo.longest, 0.01, 1.2, 100.0, " cm", true);
         num(ui, "Speed", &mut self.painter_speed, 1.0, 8.0, 1.0, "×", false);

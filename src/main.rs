@@ -590,6 +590,9 @@ impl App {
                     f.outside = v.get(5).copied().unwrap_or(f.outside);
                 }
             }
+            if let Some(v) = arg("--intent").and_then(|v| v.parse::<f64>().ok()) {
+                self.evo.intent = v / 100.0;
+            }
             if let Some(v) = arg("--longest").and_then(|v| v.parse::<f64>().ok()) {
                 self.evo.longest = v / 100.0;
             }
@@ -2186,7 +2189,7 @@ impl App {
                     let p = (geo / reach.max(1e-6)).clamp(0.0, 1.0);
                     let target = HOLD_MIN + HOLD_SPAN * p.powf(HOLD_EXP);
                     let have = self.brush.touching as f64 / self.brush.bristles.len().max(1) as f64;
-                    self.brush_hold = (self.brush_hold + HOLD_GAIN * (target - have) * reach * frame_dt as f64).clamp(0.0, reach);
+                    self.brush_hold = (self.brush_hold + HOLD_GAIN * (target - have) * reach * frame_dt as f64).clamp(0.0, (reach - geo).max(0.0));
                 } else if !self.tool.flowing {
                     self.brush_hold = 0.0;
                 }

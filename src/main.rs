@@ -471,6 +471,7 @@ impl App {
     }
 
     pub(crate) fn start_canvas(&mut self, choice: CanvasChoice) {
+        self.restore_exposure();
         self.film.settings.raw_canvas = choice.weave;
         self.film.settings.canvas_rgb = choice.colour;
         if choice.res != self.film.w {

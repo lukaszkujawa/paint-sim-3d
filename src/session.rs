@@ -5,6 +5,7 @@ use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"PSIM";
 const VERSION: u32 = 1;
+const EXPOSURE_TAG: &[u8; 4] = b"EXPO";
 const CHUNK: usize = 32 << 20;
 const MAX_LEVELS: usize = 64;
 const MAX_FULL: usize = 3;
@@ -261,6 +262,8 @@ impl App {
         }
         out.extend_from_slice(&self.film.total_deposited.to_le_bytes());
         out.extend_from_slice(&blob);
+        out.extend_from_slice(EXPOSURE_TAG);
+        out.extend_from_slice(&self.renderer.exposure.to_le_bytes());
         let ok = std::fs::write(&path, &out).is_ok();
         if ok {
             self.thumbnail(&path);
@@ -301,6 +304,10 @@ impl App {
         if !self.apply(&data[44..]) {
             self.notice("The painting file is damaged");
             return;
+        }
+        self.restore_exposure();
+        if let Some(tail) = data.len().checked_sub(8).map(|o| &data[o..]).filter(|t| &t[..4] == EXPOSURE_TAG) {
+            self.renderer.exposure = f32::from_le_bytes(tail[4..].try_into().unwrap());
         }
         let s = &mut self.film.settings;
         s.tilt_deg = f(16);

@@ -77,6 +77,10 @@ const MAX_POINTS: f32 = 96.0;
 const TENSOR_RADIUS: usize = 4;
 const WHITE: usize = 0;
 const BLACK: usize = 1;
+const SHADOW_KNEE: f32 = 0.3;
+const PEAK_PERCENTILE: f32 = 0.995;
+const MIN_EXPOSURE: f32 = -4.0;
+const BRISTLE_TRAIL: f64 = 0.17;
 
 pub struct Photo {
     pub name: String,
@@ -300,11 +304,12 @@ pub struct EvolveState {
     saved_load: Option<f64>,
     saved_len: Option<f64>,
     user_sizes: Vec<(ToolKind, BrushShape, f64)>,
+    fitted: Option<(f32, f32)>,
 }
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, prep: Prep::none(), prep_touched: None, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new() }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, prep: Prep::none(), prep_touched: None, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new(), fitted: None }
     }
 }
 
@@ -367,6 +372,26 @@ fn tonemap_inverse(y: f32) -> f32 {
     let qa = a - y * c;
     let qb = b - y * d;
     (-qb + (qb * qb + 4.0 * qa * y * e).sqrt()) / (2.0 * qa)
+}
+
+fn tonemap(x: f32) -> f32 {
+    ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+}
+
+fn encode(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn lift_shadows(p: f32, floor: f32) -> f32 {
+    let e = encode(p);
+    if SHADOW_KNEE <= floor || e >= SHADOW_KNEE {
+        return p;
+    }
+    decode(floor + e * (SHADOW_KNEE - floor) / SHADOW_KNEE)
 }
 
 fn gauss(rng: &mut StdRng) -> f32 {
@@ -502,6 +527,15 @@ impl Plan {
         let n = self.path.len();
         let dir = if n > 1 { Self::heading(self.path[0], self.path[1]) } else { DVec2::X };
         (self.path[0] - dir * self.lead, dir)
+    }
+
+    pub fn ahead(&self, s: f64) -> DVec2 {
+        let total = self.length();
+        if s <= total {
+            self.at(s)
+        } else {
+            *self.path.last().unwrap() + self.exit_dir() * (s - total)
+        }
     }
 
     pub fn exit_dir(&self) -> DVec2 {
@@ -937,7 +971,7 @@ impl Sketch {
         pts[best_range.0..=best_range.1].to_vec()
     }
 
-    fn bounded(&self, pts: Vec<[f32; 2]>, centre: [f32; 2], region: u8, margin: f32) -> Vec<[f32; 2]> {
+    fn bounded(&self, pts: Vec<[f32; 2]>, centre: [f32; 2], region: u8) -> Vec<[f32; 2]> {
         if pts.len() < 2 {
             return pts;
         }
@@ -954,21 +988,6 @@ impl Sketch {
         let mut b = ci;
         while b + 1 < pts.len() && inside(pts[b + 1]) {
             b += 1;
-        }
-        let dist = |i: usize, j: usize| ((pts[i][0] - pts[j][0]).powi(2) + (pts[i][1] - pts[j][1]).powi(2)).sqrt();
-        if b + 1 < pts.len() {
-            let mut gone = 0.0;
-            while b > ci && gone < margin {
-                gone += dist(b - 1, b);
-                b -= 1;
-            }
-        }
-        if a > 0 {
-            let mut gone = 0.0;
-            while a < ci && gone < margin {
-                gone += dist(a, a + 1);
-                a += 1;
-            }
         }
         pts[a..=b].to_vec()
     }
@@ -1070,8 +1089,7 @@ impl Sketch {
         c.region = m.label[m.index(c.centre)];
         let region = c.bound.then_some(c.region);
         c.pts = if c.bound {
-            let margin = if tapered { (0.5 * APPROACH_HW * c.hw as f64).clamp(0.5 * APPROACH_MIN / m.cell, 0.5 * APPROACH_MAX / m.cell) as f32 } else { 0.0 };
-            self.bounded(raw, c.centre, c.region, margin)
+            self.bounded(raw, c.centre, c.region)
         } else {
             self.clip(raw, c.centre, c.stop)
         };
@@ -1455,16 +1473,25 @@ impl Evolver {
         self.start_err = 0.0;
     }
 
+    pub fn exposure_shift(&self, gain: [f32; 3]) -> f32 {
+        let white = self.white;
+        let mut need: Vec<f32> = self.photo.par_iter().map(|p| (0..3).map(|c| tonemap_inverse(p[c]) / (gain[c] * white[c])).fold(0.0, f32::max)).collect();
+        let k = ((need.len() - 1) as f32 * PEAK_PERCENTILE) as usize;
+        let (_, peak, _) = need.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+        peak.max(1e-3).log2().min(0.0)
+    }
+
     pub fn calibrate(&mut self, gain: [f32; 3]) {
         self.gain = Some(gain);
         let (white, black) = (self.white, self.black);
+        let floor = [0, 1, 2].map(|c| encode(tonemap(gain[c] * black[c])));
         let target: Vec<[f32; 3]> = self
             .photo
             .par_iter()
             .map(|p| {
                 let mut rgb = [0.0f32; 3];
                 for c in 0..3 {
-                    rgb[c] = (tonemap_inverse(p[c]) / gain[c]).clamp(black[c], white[c]);
+                    rgb[c] = (tonemap_inverse(lift_shadows(p[c], floor[c])) / gain[c]).clamp(black[c], white[c]);
                 }
                 lab(rgb)
             })
@@ -1914,6 +1941,16 @@ impl App {
         }
     }
 
+    pub(crate) fn restore_exposure(&mut self) {
+        if let Some((user, fitted)) = self.evo.fitted.take() {
+            if (self.renderer.exposure - fitted).abs() < 1e-4 {
+                self.renderer.exposure = user;
+            }
+            self.stop_evolve();
+            self.evo.run = None;
+        }
+    }
+
     pub(crate) fn evolve_tick(&mut self) -> bool {
         if !self.evo.active {
             return false;
@@ -1942,7 +1979,21 @@ impl App {
                 self.tool.flowing = false;
                 let rgb = self.read_linear(ev, [0, 0, ev.w, ev.h]);
                 if !ev.calibrated {
-                    let gain = self.display_gain(ev, &rgb);
+                    if let Some((user, fitted)) = self.evo.fitted.take() {
+                        if (self.renderer.exposure - fitted).abs() < 1e-4 {
+                            self.renderer.exposure = user;
+                        }
+                    }
+                    let mut gain = self.display_gain(ev, &rgb);
+                    let user = self.renderer.exposure;
+                    let fitted = (user + ev.exposure_shift(gain)).max(MIN_EXPOSURE.min(user));
+                    if fitted < user {
+                        let scale = (fitted - user).exp2();
+                        gain = gain.map(|g| g * scale);
+                        self.renderer.exposure = fitted;
+                        self.evo.fitted = Some((user, fitted));
+                        self.notice(&format!("Exposure set to {:.1} EV to fit this photo's range; change it under Render", fitted));
+                    }
                     ev.calibrate(gain);
                 }
                 ev.observe(rgb.into_par_iter().map(lab).collect());
@@ -1982,14 +2033,16 @@ impl App {
                         self.prepare_tool(&plan);
                         ev.applied(self.tool_size(plan.kind));
                         self.begin_stroke();
-                        let p = plan.entry().0;
+                        let (from, dir) = plan.entry();
+                        let p = from + dir * self.trail(&plan);
                         self.tool.pos = DVec3::new(p.x, p.y, z);
                         Phase::Lower(plan, 0)
                     }
                 }
             }
             Phase::Lower(plan, n) => {
-                let p = plan.entry().0;
+                let (from, dir) = plan.entry();
+                let p = from + dir * self.trail(&plan);
                 self.tool.pos = DVec3::new(p.x, p.y, z);
                 let thread = is_thread(plan.kind);
                 self.tool.flowing = thread;
@@ -2005,11 +2058,11 @@ impl App {
             Phase::Approach(plan, s) => {
                 let s1 = (s + (plan.lead / APPROACH_STEPS).min(plan.speed * self.sim_dt)).min(plan.lead);
                 let (from, dir) = plan.entry();
-                let p = from + dir * s1;
+                let p = from + dir * (s1 + self.trail(&plan));
                 self.tool.pos = DVec3::new(p.x, p.y, z);
                 self.tool.vel = DVec3::new(dir.x, dir.y, 0.0) * plan.speed;
                 self.tool.flowing = true;
-                self.brush_raise = self.brush_hover() * (1.0 - s1 / plan.lead);
+                self.brush_raise = (self.brush.len - self.tool.height).max(0.0) + HOVER * (1.0 - s1 / plan.lead);
                 if s1 >= plan.lead {
                     self.brush_raise = 0.0;
                     Phase::Stroke(plan, 0.0)
@@ -2020,7 +2073,7 @@ impl App {
             Phase::Exit(plan, s) => {
                 let s1 = (s + (plan.lead / APPROACH_STEPS).min(plan.speed * self.sim_dt)).min(plan.lead);
                 let dir = plan.exit_dir();
-                let p = *plan.path.last().unwrap() + dir * s1;
+                let p = *plan.path.last().unwrap() + dir * (s1 + self.trail(&plan));
                 self.tool.pos = DVec3::new(p.x, p.y, z);
                 self.tool.vel = DVec3::new(dir.x, dir.y, 0.0) * plan.speed;
                 self.tool.flowing = true;
@@ -2035,7 +2088,8 @@ impl App {
                 let total = plan.length();
                 let travel = if plan.kind == ToolKind::Brush { (plan.speed * self.sim_dt).min(TRAVEL_PER_SIZE * plan.size) } else { plan.speed * self.sim_dt };
                 let s1 = (s + travel).min(total);
-                let (p0, p1) = (plan.at(s), plan.at(s1));
+                let lag = self.trail(&plan);
+                let (p0, p1) = (plan.ahead(s + lag), plan.ahead(s1 + lag));
                 self.tool.pos = DVec3::new(p1.x, p1.y, z);
                 self.tool.vel = DVec3::new(p1.x - p0.x, p1.y - p0.y, 0.0) / self.sim_dt.max(1e-6);
                 self.tool.flowing = plan.kind != ToolKind::Pour;
@@ -2086,6 +2140,10 @@ impl App {
                 Phase::Plan
             }
         }
+    }
+
+    fn trail(&self, plan: &Plan) -> f64 {
+        if plan.kind == ToolKind::Brush { BRISTLE_TRAIL * self.brush.len } else { 0.0 }
     }
 
     fn brush_hover(&self) -> f64 {

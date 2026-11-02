@@ -942,7 +942,7 @@ impl App {
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         let r = &mut self.renderer;
-        num(ui, "Exposure", &mut r.exposure, -2.0, 2.0, 1.0, " EV", false);
+        num(ui, "Exposure", &mut r.exposure, -4.0, 2.0, 1.0, " EV", false);
         num(ui, "Light elevation", &mut r.key_elevation_deg, 5.0, 90.0, 1.0, "°", false);
         num(ui, "Light direction", &mut r.key_azimuth_deg, -180.0, 180.0, 1.0, "°", false);
         num(ui, "Light power", &mut r.key_power, 0.0, 10.0, 1.0, "", false);

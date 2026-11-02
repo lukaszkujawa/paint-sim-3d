@@ -5,6 +5,8 @@ use crate::gpu::{BindBuilder, Gpu};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
+const DEFAULT_EXPOSURE: f32 = -0.35;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CamUniform {
@@ -146,7 +148,7 @@ impl Renderer {
             sky: [0.55, 0.62, 0.75],
             ground: [0.22, 0.2, 0.18],
             aperture_mm: 0.8,
-            exposure: -0.35,
+            exposure: DEFAULT_EXPOSURE,
             bloom: 0.25,
             grain: 0.006,
             vignette: 0.05,
@@ -172,7 +174,7 @@ impl Renderer {
             ground: [self.ground[0], self.ground[1], self.ground[2], 1.0],
             vp: vp.to_cols_array_2d(),
             jitter: [0.0; 4],
-            ortho: [0.0, film.settings.contact_angle_deg.to_radians().tan().max(0.05), 0.0, 0.0],
+            ortho: [0.0, film.settings.contact_angle_deg.to_radians().tan().max(0.05), 0.0, (self.exposure - DEFAULT_EXPOSURE).exp2()],
             basis_r: [1.0, 0.0, 0.0, 0.0],
             basis_u: [0.0, 1.0, 0.0, 0.0],
             lens: [0.0; 4],

@@ -1046,7 +1046,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let l = normalize(cam.light.xyz);
     if !near_paint(p) && cam.jitter.z <= 0.5 {
         let cs = color_sharp(p);
-        return vec4<f32>(to_srgb(tonemap(lit(normal_bilinear(p), v, l, 1.0, 1.0, cs.rgb, cs.a, 0.0, 0.0, 0.0, vec2<f32>(1.0, 0.0), 1.0))), 1.0);
+        return vec4<f32>(to_srgb(tonemap(cam.ortho.w * lit(normal_bilinear(p), v, l, 1.0, 1.0, cs.rgb, cs.a, 0.0, 0.0, 0.0, vec2<f32>(1.0, 0.0), 1.0))), 1.0);
     }
     let ms = micro_slope(p, detail);
     let n = normal_from_slope(base_slope(p) + ms);
@@ -1112,7 +1112,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let falloff = select(1.0, lamp_falloff(p), cam.jitter.z > 0.5);
     let c = lit(n, v, l, sh, ao, albedo, rough_s, detail.cure, coat, aniso, detail.dir, falloff);
     if cam.jitter.z > 0.5 { return vec4<f32>(select(min(c, vec3<f32>(FIREFLY_CLAMP)), vec3<f32>(0.0), c != c), 1.0); }
-    return vec4<f32>(to_srgb(tonemap(c)), 1.0);
+    return vec4<f32>(to_srgb(tonemap(c * cam.ortho.w)), 1.0);
 }
 
 fn lit(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, sh: f32, ao: f32, albedo: vec3<f32>, rough: f32, cure: f32, coat: f32, aniso: f32, tdir: vec2<f32>, falloff: f32) -> vec3<f32> {

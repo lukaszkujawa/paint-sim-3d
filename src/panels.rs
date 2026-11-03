@@ -110,6 +110,17 @@ fn num<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, v: &mut N, lo: f
     })
 }
 
+fn num_hint<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, hint: &str, v: &mut N, lo: f64, hi: f64, scale: f64, suffix: &str, log: bool) -> bool {
+    prop(ui, label, |ui| {
+        let mut d = v.to_f64() * scale;
+        let r = ui.add(egui::Slider::new(&mut d, lo * scale..=hi * scale).clamping(egui::SliderClamping::Edits).logarithmic(log).suffix(suffix).max_decimals(if N::INTEGRAL { 0 } else if hi * scale >= 100.0 { 1 } else { 2 })).on_hover_text(hint);
+        if r.changed() {
+            *v = N::from_f64(d / scale);
+        }
+        r.changed()
+    })
+}
+
 fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong().size(13.0)).default_open(open).show(ui, |ui| {
         ui.add_space(2.0);
@@ -325,7 +336,7 @@ impl App {
                 }
             }
             if let Some(ev) = self.evo.run.as_ref().filter(|_| self.evo.active) {
-                ui.label(RichText::new(format!("Evolving: {} strokes kept, {:.0}% closer", ev.kept, ev.progress() * 100.0)).small().color(INFO));
+                ui.label(RichText::new(format!("Evolving: {} strokes kept, {:.0}% like the photo", ev.kept, ev.progress() * 100.0)).small().color(INFO));
             }
             if self.pen_seen {
                 let p = if self.pen_down { self.pen_raw.clamp(0.0, 1.0).powf(self.pen_curve) } else { 0.0 };
@@ -690,9 +701,9 @@ impl App {
                 }
             }
         } else {
-            ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter plans strokes in memory with a quick brush model, going after the areas that differ most from the photo and following its edges, then paints only the strokes that will stay visible with the real tool, keeping those that bring the canvas closer to the photo.").small().weak()).wrap());
+            ui.add(egui::Label::new(RichText::new("Drop an image onto the window or load one. The painter works in layers like a person would: strokes are planned against a copy of the photo softened to the current tool size, keeping its edges, and placed only where the canvas still differs. You decide when it is time for detail: lower the tool size and it carries on with finer strokes. Each stroke starts at the worst spot, follows the contour there and stops where its colour no longer fits. Strokes are planned in memory with a quick brush model and painted with the real tool, keeping those that bring the canvas closer to the photo.").small().weak()).wrap());
         }
-        ui.checkbox(&mut self.evo.dry_passes, "Let each pass dry before the next").on_hover_text("When strokes start helping much less, the painter dries the canvas and moves to a smaller tool, like painting in layers");
+        ui.checkbox(&mut self.evo.dry_passes, "Dry the canvas when I change the tool size").on_hover_text("Each change of tool size starts a new pass; the canvas is dried first, like painting in layers");
         prop(ui, "Tries per stroke", |ui| {
             ui.add(egui::Slider::new(&mut self.evo.candidates, 4..=128).logarithmic(true).clamping(egui::SliderClamping::Edits));
         });
@@ -724,12 +735,12 @@ impl App {
             num(ui, "Outside", &mut self.evo.focus.outside, 0.0, 1.0, 100.0, " %", false);
         }
         let p = &mut self.evo.prep;
-        let touched = num(ui, "Contrast", &mut p.contrast, 0.5, 2.0, 100.0, " %", false) | num(ui, "Blur", &mut p.blur_mm, 0.0, 10.0, 1.0, " mm", false) | num(ui, "Sharpen", &mut p.sharpen, 0.0, 3.0, 100.0, " %", false) | num(ui, "Smooth, keep edges", &mut p.smooth_mm, 0.0, 10.0, 1.0, " mm", false);
+        let touched = num(ui, "Contrast", &mut p.contrast, 0.5, 2.0, 100.0, " %", false) | num(ui, "Blur", &mut p.blur_mm, 0.0, 40.0, 1.0, " mm", false) | num(ui, "Sharpen", &mut p.sharpen, 0.0, 3.0, 100.0, " %", false) | num(ui, "Smooth, keep edges", &mut p.smooth_mm, 0.0, 10.0, 1.0, " mm", false) | num_hint(ui, "Lift dark photo", "Brightens the photo before painting so a dark picture is not crushed against black paint; the painting comes out that much lighter than the photo", &mut p.lift_ev, 0.0, 3.0, 1.0, " EV", false);
         if touched {
             self.evo.prep_touched = Some(std::time::Instant::now());
         }
-        num(ui, "Shape following", &mut self.evo.intent, 0.0, 1.0, 100.0, " %", false);
-        num(ui, "Follow edges", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
+        num_hint(ui, "Shape following", "At 100% every stroke is built from the shapes in the photo: it starts where the canvas is most wrong, runs along the contour there with one colour and ends where that colour stops fitting. Lower values mix in random tries that only chase the error", &mut self.evo.intent, 0.0, 1.0, 100.0, " %", false);
+        num_hint(ui, "Follow edges", "How tightly a stroke bends to follow the contour it is on: 0% keeps it straight, 100% turns with every curve", &mut self.evo.follow, 0.0, 1.0, 100.0, " %", false);
         num(ui, "Longest stroke", &mut self.evo.longest, 0.01, 1.2, 100.0, " cm", true);
         num(ui, "Speed", &mut self.painter_speed, 1.0, 8.0, 1.0, "×", false);
         let has_photo = self.evo.photo.is_some();
@@ -740,13 +751,13 @@ impl App {
             }
         } else {
             let paint = egui::Button::new(RichText::new("Paint").strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(bw, 26.0));
-            if ui.add_enabled(has_photo && self.tool.kind != ToolKind::Knife, paint).on_hover_text("Paint the photo over whatever is on the canvas with the selected tool, paint and size until you stop it. Strokes vary in colour and between 40 and 100% of the tool size. Change the tool, size or paint and press Paint again to carry on; use File > New painting for a fresh canvas").clicked() {
+            if ui.add_enabled(has_photo, paint).on_hover_text("Paint the photo over whatever is on the canvas with the selected tool, paint and size until you stop it. Strokes vary in colour and between 40 and 100% of the tool size. Change the tool, size or paint and press Paint again to carry on; use File > New painting for a fresh canvas").clicked() {
                 self.start_evolve();
             }
         }
         if let Some(ev) = &self.evo.run {
             let mono = |s: String| RichText::new(s).small();
-            ui.add(egui::ProgressBar::new(ev.progress()).desired_height(14.0).text(RichText::new(format!("{:.0}% closer to the photo", ev.progress() * 100.0)).small()));
+            ui.add(egui::ProgressBar::new(ev.progress()).desired_height(14.0).text(RichText::new(format!("{:.0}% like the photo", ev.progress() * 100.0)).small()));
             ui.label(mono(format!("{} kept of {} painted", ev.kept, ev.painted)));
             ui.label(mono(format!("{} planned in memory, {} skipped as hidden", ev.tried, ev.pruned)));
             if running {

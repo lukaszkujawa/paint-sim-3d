@@ -24,7 +24,7 @@ fn unit_tint() -> f32 {
     1.0
 }
 
-const VIEW_GAIN: [f32; 3] = [1.94, 1.95, 2.17];
+const VIEW_GAIN: [f32; 3] = [1.6, 1.6, 1.78];
 
 pub fn canvas_albedo(shown: [f32; 3]) -> [f32; 3] {
     let dec = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
@@ -258,7 +258,7 @@ pub fn pigment_table(set: &PigmentSet) -> Vec<f32> {
 }
 
 const SURFACE_K1: f32 = 0.04;
-const SURFACE_K2: f32 = 0.5;
+const SURFACE_K2: f32 = 0.6;
 
 fn surface(r: f32) -> f32 {
     (1.0 - SURFACE_K1) * (1.0 - SURFACE_K2) * r / (1.0 - SURFACE_K2 * r).max(1e-3)

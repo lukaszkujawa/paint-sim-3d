@@ -306,9 +306,6 @@ impl App {
             return;
         }
         self.restore_exposure();
-        if let Some(tail) = data.len().checked_sub(8).map(|o| &data[o..]).filter(|t| &t[..4] == EXPOSURE_TAG) {
-            self.renderer.exposure = f32::from_le_bytes(tail[4..].try_into().unwrap());
-        }
         let s = &mut self.film.settings;
         s.tilt_deg = f(16);
         s.tilt_dir_deg = f(20);

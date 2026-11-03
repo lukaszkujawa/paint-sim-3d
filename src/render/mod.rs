@@ -5,7 +5,7 @@ use crate::gpu::{BindBuilder, Gpu};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
-const DEFAULT_EXPOSURE: f32 = -0.35;
+pub const DEFAULT_EXPOSURE: f32 = -0.35;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

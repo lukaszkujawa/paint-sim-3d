@@ -7,6 +7,10 @@ const ROUGH_DRY: f32 = 0.35;
 const WEAVE_TOP: f32 = 60e-6;
 const CURED_RELIEF: f32 = 150e-6;
 const TRACE_FILM: f32 = 50e-6;
+const K2_BARE: f32 = 0.4;
+const K2_PAINT: f32 = 0.6;
+const PAINT_FILM_LO: f32 = 30e-6;
+const PAINT_FILM_HI: f32 = 60e-6;
 
 fn stack_count_dbg(th: vec4<f32>) -> u32 {
     var n = 0u;
@@ -49,7 +53,7 @@ fn shade_cell(id: vec3<u32>) {
         }
     }
     let k1 = 0.04;
-    let k2 = mix(0.4, 0.6, wet);
+    let k2 = select(mix(K2_BARE, K2_PAINT, smoothstep(PAINT_FILM_LO, PAINT_FILM_HI, m[c])), K2_PAINT, hv > 0.0);
     for (var b = 0u; b < NBAND; b++) {
         r[b] = (1.0 - k1) * (1.0 - k2) * r[b] / max(1.0 - k2 * r[b], 1e-3);
     }

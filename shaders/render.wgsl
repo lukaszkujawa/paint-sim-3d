@@ -45,6 +45,8 @@ const KEY_HALF_ANGLE: f32 = 0.12;
 const SOFTBOX_HALF_W: f32 = 0.45;
 const SOFTBOX_HALF_H: f32 = 0.3;
 const SOFTBOX_RADIANCE: f32 = 5.0;
+const LIVE_SHEEN_FLAT: f32 = 0.04;
+const LIVE_SHEEN_RIDGE: f32 = 0.25;
 const HORIZON_GLOW: vec3<f32> = vec3<f32>(0.62, 0.6, 0.56);
 const AO_DIRS: i32 = 6;
 const AO_STEPS: i32 = 4;
@@ -1130,14 +1132,15 @@ fn lit(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, sh: f32, ao: f32, albedo: vec3<
     let rv = reflect(-v, n);
     let occlusion = clamp(pow(ndv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
     let env = env_radiance(rv, rough) * f_env * occlusion;
-    let base_spec = select(1.0, 1.0 - coat, beauty_mode());
+    let sheen = select(mix(LIVE_SHEEN_FLAT, LIVE_SHEEN_RIDGE, smoothstep(0.04, 0.4, length(n.xy))), 1.0, beauty_mode());
+    let base_spec = select(1.0, 1.0 - coat, beauty_mode()) * sheen;
     var c = diffuse + (vec3<f32>(direct) + env) * base_spec;
     if coat > 0.0 {
         let fc = env_dfg(F0_PAINT, COAT_ROUGH, ndv);
         let coat_direct = spec_lobe(n, v, l, COAT_ROUGH, F0_PAINT) * sun * ndl * sh;
         let occ_c = clamp(pow(ndv + ao, exp2(-16.0 * COAT_ROUGH - 1.0)) - 1.0 + ao, 0.0, 1.0);
         let coat_env = env_radiance(rv, COAT_ROUGH) * fc * occ_c;
-        c = c * (1.0 - coat * fc) + coat * (vec3<f32>(coat_direct) + coat_env);
+        c = c * (1.0 - coat * fc) + coat * sheen * (vec3<f32>(coat_direct) + coat_env);
     }
     return c;
 }

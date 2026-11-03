@@ -2,6 +2,12 @@ const KNIFE_BANDS: u32 = 8u;
 const KNIFE_BLADE_LEN: f32 = 0.07;
 const KNIFE_SLOPE: f32 = 0.25;
 const KNIFE_FLAT: f32 = 0.01;
+const KNIFE_COVER: f32 = 1.5;
+const KNIFE_FLEX: f32 = 0.004;
+const KNIFE_FLEX_TAPS: i32 = 4;
+const KNIFE_TOOTH: f32 = 0.8;
+const KNIFE_TOOTH_ALONG: f32 = 0.008;
+const KNIFE_TOOTH_ACROSS: f32 = 0.0012;
 
 struct KnifeParams {
     a: vec2<f32>,
@@ -43,6 +49,25 @@ fn cell_hash(x: u32, y: u32) -> f32 {
     return f32(h & 0xffffu) / 65535.0;
 }
 
+fn lattice_noise(q: vec2<f32>) -> f32 {
+    let i = floor(q);
+    let f = fract(q);
+    let u = f * f * (3.0 - 2.0 * f);
+    let o = vec2<i32>(i) + vec2<i32>(1 << 20);
+    let x = u32(o.x);
+    let y = u32(o.y);
+    let a = cell_hash(x, y);
+    let b = cell_hash(x + 1u, y);
+    let c = cell_hash(x, y + 1u);
+    let d = cell_hash(x + 1u, y + 1u);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn tooth(p: vec2<f32>, md: vec2<f32>, along: vec2<f32>) -> f32 {
+    let q = vec2<f32>(dot(p, md) / KNIFE_TOOTH_ALONG, dot(p, along) / KNIFE_TOOTH_ACROSS);
+    return 0.65 * lattice_noise(q) + 0.35 * lattice_noise(2.3 * q + vec2<f32>(17.0, 5.0));
+}
+
 fn emit(c: u32, vol: f32, pig: array<f32, 16>) {
     let slot = atomicAdd(&scrap_count, 1u);
     if slot < arrayLength(&scraps) {
@@ -77,14 +102,26 @@ fn knife(@builtin(global_invocation_id) id: vec3<u32>) {
     let nb = max(min(K.bands, KNIFE_BANDS), 1u);
     let bi = min(u32(t * f32(nb)), nb - 1u);
     let ratio = select(0.0, K.fill[bi / 4u][bi % 4u], at_edge);
-    let covered = cell_hash(id.x / 2u, id.y / 2u) < pow(ratio, 0.6);
-    let level_b = select(0.0, K.height * min(1.0, 1.5 * ratio), covered);
     let smear_b = select(0.0, K.smear[bi / 4u][bi % 4u], at_edge);
     let band_pig = unpack_pig(K.pig[2u * bi], K.pig[2u * bi + 1u]);
     let hv = h[c];
-    let cap = max(K.height + max(behind - KNIFE_FLAT, 0.0) * KNIFE_SLOPE - m[c], 0.0);
-    let level = min(level_b, cap);
+    let along = ab / max(length(ab), 1e-9);
+    var support = m[c];
+    for (var k = -KNIFE_FLEX_TAPS; k <= KNIFE_FLEX_TAPS; k++) {
+        let o = p + along * (f32(k) * KNIFE_FLEX / f32(KNIFE_FLEX_TAPS));
+        let cx = clamp(i32(o.x / P.dx), 0, i32(P.size.x) - 1);
+        let cy = clamp(i32(o.y / P.dx), 0, i32(P.size.y) - 1);
+        support = max(support, m[idx(u32(cx), u32(cy))]);
+    }
+    let blade = support + K.height + max(behind - KNIFE_FLAT, 0.0) * KNIFE_SLOPE;
+    let cap = max(blade - m[c], 0.0);
     let keep = min(hv, cap);
+    let carried = K.height * KNIFE_COVER * ratio;
+    let reach = blade - carried;
+    let soft = max(0.15 * carried, 2e-6);
+    let rough = K.height * KNIFE_TOOTH * tooth(p, normalize(mv + vec2<f32>(1e-9, 0.0)), along);
+    let contact = select(0.0, smoothstep(reach - soft, reach + soft, m[c] + keep + rough), carried > 0.0);
+    let level = keep + (cap - keep) * contact;
     let swap = keep * smear_b;
     if hv <= cap && hv >= level && swap <= 0.0 { return; }
     var s = stack_load(c);

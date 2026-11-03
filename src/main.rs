@@ -30,7 +30,9 @@ use winit::window::{Window, WindowId};
 const KNIFE_TURN_MIN: f64 = 2.0e-4;
 const KNIFE_TURN_DIST: f64 = 0.04;
 const KNIFE_CAPACITY_PER_WIDTH: f64 = 5.0e-5;
-const KNIFE_HOLD_PER_WIDTH: f64 = 1.2e-5;
+const KNIFE_RIDGE_OVERLAP: f64 = 0.35;
+const KNIFE_RESERVE_STEPS: f64 = 8.0;
+pub(crate) const KNIFE_HOLD_PER_WIDTH: f64 = 1.2e-5;
 const KNIFE_SPILL_PER_M: f64 = 2.5;
 const KNIFE_END_RIDGE: f64 = 0.8;
 const KNIFE_BANDS: usize = 8;
@@ -624,6 +626,31 @@ impl App {
     }
 
     fn scripted_tool(&mut self) -> bool {
+        if self.auto.as_ref().map(|a| a.script == "evolving").unwrap_or(false) {
+            static THEN_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(spec) = args.windows(2).find(|p| p[0] == "--then").map(|p| p[1].clone()) {
+                let steps: Vec<&str> = spec.split(',').collect();
+                let step = THEN_STEP.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(item) = steps.get(step) {
+                    let (shape, rest) = if let Some(r) = item.strip_prefix("round") { (Some(brush::BrushShape::Round), r) } else if let Some(r) = item.strip_prefix("flat") { (Some(brush::BrushShape::Flat), r) } else { (None, *item) };
+                    let (mm, n) = rest.split_once('@').map(|(a, b)| (a.parse::<f64>().unwrap_or(0.0), b.parse::<u64>().unwrap_or(u64::MAX))).unwrap_or((0.0, u64::MAX));
+                    if mm > 0.0 && self.evo.run.as_ref().map(|ev| ev.painted >= n).unwrap_or(false) {
+                        THEN_STEP.store(step + 1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(sh) = shape.filter(|sh| *sh != self.brush.shape) {
+                            let (nb, len) = (self.brush.bristles.len(), self.brush.len);
+                            self.rebuild_brush(sh, nb, len, mm * 1e-3);
+                        }
+                        let kind = self.tool.kind;
+                        self.set_tool_size(kind, mm * 1e-3);
+                        log::warn!("then: {:?} {} mm after {} strokes", shape, mm, n);
+                        if let Some(a) = self.auto.as_ref() {
+                            self.shot_request = Some(a.shot.replace(".png", &format!("_{}.png", step)));
+                        }
+                    }
+                }
+            }
+        }
         if self.evolve_tick() {
             return true;
         }
@@ -642,6 +669,7 @@ impl App {
                     "brush" => ToolKind::Brush,
                     "roller" => ToolKind::Roller,
                     "sponge" => ToolKind::Sponge,
+                    "knife" => ToolKind::Knife,
                     _ => ToolKind::Pour,
                 };
             }
@@ -660,6 +688,11 @@ impl App {
             if let Some(path) = arg("--target") {
                 self.load_photo(std::path::Path::new(&path));
             }
+            if let Some(v) = arg("--canvas") {
+                let c: Vec<f32> = v.split(',').filter_map(|t| t.parse().ok()).collect();
+                let colour = (c.len() >= 3).then(|| [c[0], c[1], c[2]]);
+                self.start_canvas(CanvasChoice { res: self.film.w, colour, weave: arg("--noweave").is_none(), custom: [0.9; 3], first: false });
+            }
             if let Some(spec) = arg("--focus") {
                 let (kind, nums) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
                 let v: Vec<f32> = nums.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -671,6 +704,9 @@ impl App {
                     f.outside = v.get(5).copied().unwrap_or(f.outside);
                 }
             }
+            if let Some(v) = arg("--thin").and_then(|v| v.parse::<f32>().ok()) {
+                self.paint.frac[12] = v / 100.0;
+            }
             if let Some(v) = arg("--contrast").and_then(|v| v.parse::<f32>().ok()) {
                 self.evo.prep.contrast = v / 100.0;
             }
@@ -679,6 +715,9 @@ impl App {
             }
             if let Some(v) = arg("--smooth").and_then(|v| v.parse::<f32>().ok()) {
                 self.evo.prep.smooth_mm = v;
+            }
+            if let Some(v) = arg("--lift").and_then(|v| v.parse::<f32>().ok()) {
+                self.evo.prep.lift_ev = v;
             }
             if let Some(v) = arg("--sharpen").and_then(|v| v.parse::<f32>().ok()) {
                 self.evo.prep.sharpen = v / 100.0;
@@ -1312,6 +1351,76 @@ impl App {
             self.tool.flowing = f > 121 && p.y > hgt * 0.5 - 0.32;
             return true;
         }
+        if a.script == "knifeart" {
+            let f = self.frame_index;
+            let (w, hgt) = (self.film.settings.width_m as f64, self.film.settings.height_m as f64);
+            let args: Vec<String> = std::env::args().collect();
+            let arg = |k: &str, d: f64| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok()).unwrap_or(d);
+            self.film.settings.cure_rate = 0.0;
+            if f < 40 {
+                self.tool.kind = ToolKind::Pour;
+                self.tool.flowing = false;
+                if f == 2 {
+                    use rand::{Rng, SeedableRng};
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+                    let mut p = color::PaintMix::pure(1);
+                    p.frac[3] = 0.6;
+                    p.frac[12] = 0.0;
+                    p.frac[13] = 150.0;
+                    p.frac[14] = (60f32).ln() + 10.0;
+                    for _ in 0..400 {
+                        let cx = w * 0.5 + (rng.random::<f64>() - 0.5) * 0.22;
+                        let cy = hgt * 0.5 + (rng.random::<f64>() - 0.5) * 0.16;
+                        let ang = rng.random::<f64>() * std::f64::consts::TAU;
+                        let len = 0.004 + rng.random::<f64>() * 0.02;
+                        let r = 0.002 + rng.random::<f64>() * 0.005;
+                        let th = 1e-4 + rng.random::<f64>() * 4e-4;
+                        let a = [(cx - 0.5 * len * ang.cos()) as f32, (cy - 0.5 * len * ang.sin()) as f32];
+                        let b = [(cx + 0.5 * len * ang.cos()) as f32, (cy + 0.5 * len * ang.sin()) as f32];
+                        let vol = (th * (len + 2.0 * r) * 2.0 * r * 0.6) as f32;
+                        self.pending_deposits.push(Deposit::capsule(a, b, r as f32, vol, p.normalized().packed(), self.film.dx).laid_by(Method::Pour));
+                    }
+                }
+                if f == 30 {
+                    self.film.dry_now(&self.gpu);
+                }
+                return true;
+            }
+            let per = 90u64;
+            let k = (f - 40) / per;
+            let t = (f - 40) % per;
+            let colours: [[f32; 2]; 6] = [[0.0, 0.0], [5.0, 0.0], [0.0, 4.0], [9.0, 0.0], [0.0, 0.0], [5.0, 4.0]];
+            self.tool.kind = ToolKind::Knife;
+            if k >= 6 {
+                self.tool.flowing = false;
+                return true;
+            }
+            if t == 0 {
+                let mut p = color::PaintMix::pure(0);
+                let c = colours[k as usize];
+                if c[0] > 0.0 { p.frac[c[0] as usize] = 0.35; }
+                if c[1] > 0.0 { p.frac[c[1] as usize] = 0.25; }
+                p.frac[12] = 0.0;
+                p.frac[13] = 120.0;
+                p.frac[14] = (40f32).ln() + 10.0;
+                self.paint = p;
+                self.tool.knife_width = 0.04;
+                self.tool.knife_height = arg("--gap", 0.3) * 1e-3;
+                self.load_knife();
+                let fill = arg("--load", 1.0);
+                for b in &mut self.knife_bands {
+                    b.vol *= fill;
+                }
+                self.knife_dir = [0.0, -1.0];
+                self.knife_track = None;
+                self.knife_prev = None;
+            }
+            let x = w * 0.5 - 0.09 + 0.036 * k as f64;
+            let s = ((t as f64 - 5.0) / 75.0).clamp(0.0, 1.0);
+            self.tool.flowing = (5..80).contains(&t);
+            self.tool.pos = DVec3::new(x, hgt * 0.5 + 0.07 - 0.14 * s, 0.0);
+            return true;
+        }
         if a.script == "knife" {
             let f = self.frame_index;
             let w = self.film.settings.width_m as f64;
@@ -1941,6 +2050,7 @@ impl App {
 
     fn step(&mut self, scale: f32, steps: u32, surface_tex: Option<wgpu::SurfaceTexture>) {
         let size = self.window.inner_size();
+        let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let present = surface_tex.is_some();
         if present && self.auto.as_ref().map(|a| a.pace).unwrap_or(false) {
             let el = self.last.elapsed();
@@ -2219,8 +2329,10 @@ impl App {
                     let mut pig = [[0u32; 8]; KNIFE_BANDS];
                     let mut fill = [0.0f32; KNIFE_BANDS];
                     let mut smear = [0.0f32; KNIFE_BANDS];
+                    let reserve = need * KNIFE_RESERVE_STEPS;
                     for (i, band) in self.knife_bands.iter().enumerate() {
-                        let ratio = ((band.vol - self.knife_pending[i]).max(0.0) / need).min(1.0);
+                        let avail = (band.vol - self.knife_pending[i]).max(0.0);
+                        let ratio = (avail / reserve).min(1.0);
                         fill[i] = ratio as f32;
                         smear[i] = (KNIFE_SMEAR * ratio) as f32;
                         pig[i] = color::PaintMix { frac: band.comp }.normalized().packed();
@@ -2248,7 +2360,7 @@ impl App {
                         fill,
                         smear,
                     });
-                    let keep = hold / KNIFE_BANDS as f64;
+                    let keep = (hold / KNIFE_BANDS as f64).max(reserve);
                     for i in 0..KNIFE_BANDS {
                         let bow = (self.knife_bands[i].vol - self.knife_pending[i] - keep).max(0.0);
                         if bow <= 0.0 {
@@ -2258,10 +2370,11 @@ impl App {
                         self.tool_released += bow;
                         let r = (0.75 * bow / band_w).sqrt().max(self.film.dx as f64);
                         let q = p + mdir * (r + self.film.dx as f64);
-                        let a = q + blade_dir * (-hw + (i as f64 + 0.15) * band_w);
-                        let b = q + blade_dir * (-hw + (i as f64 + 0.85) * band_w);
+                        let a = q + blade_dir * (-hw + (i as f64 - KNIFE_RIDGE_OVERLAP) * band_w);
+                        let b = q + blade_dir * (-hw + (i as f64 + 1.0 + KNIFE_RIDGE_OVERLAP) * band_w);
                         let pig = color::PaintMix { frac: self.knife_bands[i].comp }.normalized().packed();
-                        deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, bow as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                        let bn = [blade_dir.x as f32, blade_dir.y as f32];
+                        deposits.push(Deposit::ribbon([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], bn, bn, r as f32, r as f32, 0, bow as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
                     }
                 }
                 if let Some(q) = self.knife_prev {
@@ -2280,7 +2393,8 @@ impl App {
                             let e0 = q + blade_dir * (side * (hw + r as f64 * 0.6));
                             let e1 = p + blade_dir * (side * (hw + r as f64 * 0.6));
                             self.tool_released += take;
-                            deposits.push(Deposit::stroke([e0.x as f32, e0.y as f32], [e1.x as f32, e1.y as f32], r, take as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                            let dn = [d.x as f32, d.y as f32];
+                            deposits.push(Deposit::ribbon([e0.x as f32, e0.y as f32], [e1.x as f32, e1.y as f32], dn, dn, r, r, 0, take as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
                         }
                     }
                     let mix = (dist * KNIFE_BAND_MIX_PER_M).min(0.3);
@@ -2309,11 +2423,12 @@ impl App {
                         self.knife_bands[i].vol -= vol;
                         let r = (0.75 * vol / band_w).sqrt().max(self.film.dx as f64);
                         let q = last + d * r;
-                        let a = q + blade_dir * (-hw + (i as f64 + 0.15) * band_w);
-                        let b = q + blade_dir * (-hw + (i as f64 + 0.85) * band_w);
+                        let a = q + blade_dir * (-hw + (i as f64 - KNIFE_RIDGE_OVERLAP) * band_w);
+                        let b = q + blade_dir * (-hw + (i as f64 + 1.0 + KNIFE_RIDGE_OVERLAP) * band_w);
                         let pig = color::PaintMix { frac: self.knife_bands[i].comp }.normalized().packed();
                         self.tool_released += vol;
-                        deposits.push(Deposit::stroke([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], r as f32, vol as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
+                        let bn = [blade_dir.x as f32, blade_dir.y as f32];
+                        deposits.push(Deposit::ribbon([a.x as f32, a.y as f32], [b.x as f32, b.y as f32], bn, bn, r as f32, r as f32, 0, vol as f32, pig, self.film.dx).laid_by(Method::Knife).recycled());
                     }
                 }
                 self.knife_prev = None;
@@ -2683,6 +2798,10 @@ impl App {
                     log::warn!("beauty took {:.1} s", t0.elapsed().as_secs_f32());
                     let _ = img.save(&bp);
                     log::warn!("saved beauty {}", bp);
+                    let args: Vec<String> = std::env::args().collect();
+                    if let Some(dp) = args.windows(2).find(|p| p[0] == "--dump").map(|p| p[1].clone()) {
+                        self.dump_observed(&dp);
+                    }
                 }
                 if !auto.view.is_empty() {
                     let vp = auto.view.clone();

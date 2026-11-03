@@ -7,7 +7,11 @@ use rayon::prelude::*;
 const BASE_CAPACITY: f64 = 6.0e-9;
 const BASE_AREA: f64 = std::f64::consts::PI * 0.008 * 0.008;
 const BASE_LEN: f64 = 0.035;
-const TUFT: f64 = 0.4;
+const TUFT: f64 = 0.25;
+const DIP_MIN: f64 = 0.55;
+const DIP_CLUMP: usize = 7;
+const HAIR_AREA: f64 = 0.64e-6;
+const MAX_HAIRS: usize = 900;
 const STEER_MIN_SPEED: f64 = 0.002;
 const STEER_DIST: f64 = 0.35;
 const BELLY: f64 = 2.2;
@@ -73,6 +77,7 @@ pub struct Release {
     pub comp: [f32; 16],
     pub seed: u32,
     pub offset: f32,
+    pub fill: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -101,6 +106,7 @@ pub struct Brush {
     pub handle: DVec3,
     pub touching: usize,
     pub lean: DVec3,
+    pub requested: usize,
     pub stroke_seed: u32,
     pub ferrule: DVec3,
     pub up: DVec3,
@@ -112,6 +118,12 @@ impl Brush {
     }
 
     pub fn build(shape: BrushShape, n: usize, len: f64, size: f64, radius: f64) -> Self {
+        let requested = n;
+        let cover = match shape {
+            BrushShape::Round => std::f64::consts::PI * 0.25 * size * size,
+            BrushShape::Flat => size * (0.18 * size).max((0.18 * size).clamp(1.5e-3, 6.0e-3).min(size)),
+        };
+        let n = n.max(((cover / HAIR_AREA) as usize).min(MAX_HAIRS));
         let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
         let segs = 8;
         let mut bristles = Vec::with_capacity(n);
@@ -177,8 +189,8 @@ impl Brush {
         let tuft = TUFT * (area / n.max(1) as f64).sqrt();
         let hair = radius;
         let radius = hair.min(ferrule_r * (FILL / n.max(1) as f64).sqrt()).max(HAIR_MIN);
-        let capacity = BASE_CAPACITY * (area / BASE_AREA).sqrt() * (len / BASE_LEN);
-        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0, lean: DVec3::X, stroke_seed: 1, ferrule: DVec3::ZERO, up: DVec3::Z }
+        let capacity = BASE_CAPACITY * (area / BASE_AREA).sqrt() * (len / BASE_LEN) * requested as f64 / n.max(1) as f64;
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0, lean: DVec3::X, requested, stroke_seed: 1, ferrule: DVec3::ZERO, up: DVec3::Z }
     }
 
     pub fn size(&self) -> f64 {
@@ -204,8 +216,8 @@ impl Brush {
     }
 
     pub fn dip(&mut self, frac: &[f32; 16]) {
-        for b in &mut self.bristles {
-            b.load = self.capacity;
+        for (k, b) in self.bristles.iter_mut().enumerate() {
+            b.load = self.capacity * (DIP_MIN + (1.0 - DIP_MIN) * hash01(k / DIP_CLUMP, 37));
             b.comp = *frac;
         }
     }
@@ -435,6 +447,7 @@ impl Brush {
             touching += 1;
             let rc = (radius * 2.0 * b.thick).max(self.tuft * b.thick).max(0.6 * dx) as f32;
             let nseg = segs_touching.len() as f64;
+            let fill = (b.load / self.capacity.max(1e-30)).min(1.0) as f32;
             let over = (b.load - self.capacity).max(0.0) * (OVERFLOW * dt).min(1.0) / nseg;
             let film = FILM * (b.load / self.capacity).min(1.0) * (self.release / RELEASE_REF) * b.thick / overlap;
             let laid: Vec<(usize, usize, f64)> = segs_touching
@@ -471,10 +484,10 @@ impl Brush {
                         let q0 = [from.x as f32, from.y as f32];
                         let q1 = [b.pts[tip].x as f32, b.pts[tip].y as f32];
                         let mid = (b.pts[tip] + from) * 0.5;
-                        releases.push(Release { p0: q0, p1: q1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32 });
+                        releases.push(Release { p0: q0, p1: q1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32, fill });
                     } else {
                         let mid = (b.pts[i] + b.pts[i - 1]) * 0.5;
-                        releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32 });
+                        releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32, fill });
                     }
                 }
             }

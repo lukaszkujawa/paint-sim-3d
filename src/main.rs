@@ -553,7 +553,7 @@ impl App {
                 self.prev_kind = c.kind;
                 if c.kind == ToolKind::Brush && c.brush_width > 0.0 {
                     let b = &self.brush;
-                    if b.shape != brush::BrushShape::Flat || (b.width - c.brush_width).abs() > 1e-4 || b.bristles.len() != c.brush_count {
+                    if b.shape != brush::BrushShape::Flat || (b.width - c.brush_width).abs() > 1e-4 || b.requested != c.brush_count {
                         self.rebuild_brush(brush::BrushShape::Flat, c.brush_count, 0.05, c.brush_width);
                     }
                     self.brush.capacity = c.brush_capacity;
@@ -655,7 +655,7 @@ impl App {
                     if mm > 0.0 && self.evo.run.as_ref().map(|ev| ev.painted >= n).unwrap_or(false) {
                         THEN_STEP.store(step + 1, std::sync::atomic::Ordering::Relaxed);
                         if let Some(sh) = shape.filter(|sh| *sh != self.brush.shape) {
-                            let (nb, len) = (self.brush.bristles.len(), self.brush.len);
+                            let (nb, len) = (self.brush.requested, self.brush.len);
                             self.rebuild_brush(sh, nb, len, mm * 1e-3);
                         }
                         let kind = self.tool.kind;
@@ -695,7 +695,7 @@ impl App {
                 self.prev_kind = ToolKind::Brush;
             }
             if args.iter().any(|a| a == "--flat") {
-                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                let (n, len) = (self.brush.requested, self.brush.len);
                 self.rebuild_brush(brush::BrushShape::Flat, n, len, 0.03);
             }
             if let Some(mm) = arg("--size").and_then(|v| v.parse::<f64>().ok()) {
@@ -897,7 +897,7 @@ impl App {
                 return true;
             }
             if f == 1 {
-                let n = self.brush.bristles.len();
+                let n = self.brush.requested;
                 let len = self.brush.len;
                 self.rebuild_brush(brush::BrushShape::Round, n, len, arg("--size").unwrap_or(16.0) * 1e-3);
                 self.tool.kind = ToolKind::Brush;
@@ -905,7 +905,7 @@ impl App {
             }
             if t == 0 && k > 0 && args.iter().any(|a| a == "--resize") {
                 let size = if (k / 3) % 2 == 0 { arg("--size").unwrap_or(16.0) } else { 6.0 } * 1e-3;
-                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                let (n, len) = (self.brush.requested, self.brush.len);
                 self.rebuild_brush(brush::BrushShape::Round, n, len, size);
             }
             let reload = arg("--reload").unwrap_or(5.0) as u64;
@@ -963,7 +963,7 @@ impl App {
             let size = sizes[si] * 1e-3;
             if t == 0 {
                 let len = arg("--len").map(|v| v * 1e-3).unwrap_or(self.brush.len);
-                let n = self.brush.bristles.len();
+                let n = self.brush.requested;
                 if (self.brush.size() - size).abs() > 1e-6 || (self.brush.len - len).abs() > 1e-6 {
                     self.rebuild_brush(brush::BrushShape::Round, n, len, size);
                 }
@@ -1004,12 +1004,18 @@ impl App {
             }
             self.tool.kind = ToolKind::Brush;
             self.prev_kind = ToolKind::Brush;
-            let (shape, mm) = SPECS[row];
+            let (shape, mut mm) = SPECS[row];
+            if row == SPECS.len() - 1 {
+                mm = std::env::args().collect::<Vec<_>>().windows(2).find(|p| p[0] == "--widest").and_then(|p| p[1].parse().ok()).unwrap_or(mm);
+            }
             if t == 0 {
-                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                let (n, len) = (self.brush.requested, self.brush.len);
                 self.rebuild_brush(shape, n, len, mm * 1e-3);
                 let mut p = color::PaintMix::pure(3);
                 p.frac[0] = 0.6;
+                if std::env::args().any(|a| a == "--black") {
+                    p = color::PaintMix::pure(1);
+                }
                 p.frac[13] = 40.0;
                 p.frac[14] = (20f32).ln() + 10.0;
                 if std::env::args().any(|a| a == "--thinpaint") {
@@ -1017,7 +1023,8 @@ impl App {
                     p.frac[13] = 0.0;
                     p.frac[14] = (self.tool.mu as f32).ln() + 10.0;
                 }
-                self.brush.capacity = self.brush.base_capacity * (mm * 1e-3 / 0.016).clamp(1.0, 10.0);
+                let dry = std::env::args().collect::<Vec<_>>().windows(2).find(|p| p[0] == "--dry").and_then(|p| p[1].parse::<f64>().ok()).unwrap_or(1.0);
+                self.brush.capacity = self.brush.base_capacity * (mm * 1e-3 / 0.016).clamp(1.0, 10.0) * dry;
                 self.brush.clean();
                 self.brush.dip(&p.frac);
                 self.paint.frac = p.frac;
@@ -1045,7 +1052,7 @@ impl App {
             let args: Vec<String> = std::env::args().collect();
             let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
             if f == 1 {
-                let (n, len) = (self.brush.bristles.len(), arg("--len").map(|v| v * 1e-3).unwrap_or(self.brush.len));
+                let (n, len) = (self.brush.requested, arg("--len").map(|v| v * 1e-3).unwrap_or(self.brush.len));
                 self.rebuild_brush(brush::BrushShape::Round, n, len, arg("--size").unwrap_or(16.0) * 1e-3);
                 self.tool.kind = ToolKind::Brush;
                 self.prev_kind = ToolKind::Brush;
@@ -1080,7 +1087,7 @@ impl App {
             let arg = |k: &str| args.windows(2).find(|p| p[0] == k).and_then(|p| p[1].parse::<f64>().ok());
             if f == 1 {
                 let shape = if args.iter().any(|a| a == "--flat") { brush::BrushShape::Flat } else { brush::BrushShape::Round };
-                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                let (n, len) = (self.brush.requested, self.brush.len);
                 self.rebuild_brush(shape, n, len, arg("--size").unwrap_or(30.0) * 1e-3);
                 self.tool.kind = ToolKind::Brush;
                 self.prev_kind = ToolKind::Brush;
@@ -2632,7 +2639,7 @@ impl App {
                     .par_iter()
                     .map(|r| {
                         let pig = color::PaintMix { frac: r.comp }.normalized().packed();
-                        let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, dx).laid_by(Method::Brush).recycled().strands(r.seed, r.offset, dx);
+                        let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, dx).laid_by(Method::Brush).recycled().strands(r.seed, r.offset, r.fill, dx);
                         let inside = r.vol * d.inside_fraction(w, hgt) as f64;
                         (d, inside)
                     })

@@ -18,6 +18,7 @@ const CONTACT_ROLLER: u32 = 1u;
 const CONTACT_SPONGE: u32 = 2u;
 const CONTACT_BODY: u32 = 3u;
 const BRISTLE_SCRAPE: f32 = 0.25;
+const SCRAPE_STRANDS: f32 = 0.5;
 const SPONGE_FILM: f32 = 1e-5;
 
 fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -55,7 +56,7 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
                 let ab = k.p1 - k.p0;
                 let q = p - k.p0;
                 let across = (q.x * ab.y - q.y * ab.x) / max(length(ab), 1e-9);
-                if strand_mask(across, k.bristle + 1u, P.dx) < 0.5 { continue; }
+                if strand_mask(across, k.bristle + 1u, SCRAPE_STRANDS, P.dx) < 0.5 { continue; }
             }
             if k.pad == 0u {
                 swept = true;

@@ -43,10 +43,13 @@ pub const DEPOSIT_CAP_START: u32 = 2;
 pub const DEPOSIT_CAP_END: u32 = 4;
 pub const DEPOSIT_STRANDS: u32 = 8;
 const STRAND_MIN_W: f32 = 0.18e-3;
-const STRAND_CELLS: f32 = 1.2;
-const STRAND_LO: f32 = 0.35;
-const STRAND_HI: f32 = 0.6;
-const STRAND_FLOOR: f32 = 0.08;
+const STRAND_CELLS: f32 = 1.0;
+const STRAND_SOFT: f32 = 0.12;
+const STRAND_FLOOR: f32 = 0.0;
+const CLUMP_W: f32 = 3.0e-3;
+const CLUMP_AMP: f32 = 0.5;
+const STRAND_WET: f32 = 0.12;
+const STRAND_DRY: f32 = 0.85;
 const DEPOSIT_METHOD_SHIFT: u32 = 8;
 
 #[derive(Clone, Copy)]
@@ -67,15 +70,36 @@ fn strand_hash(i: i32, seed: u32) -> f32 {
     (h & 0xffff) as f32 / 65535.0
 }
 
-fn strand_mask(s: f32, seed: u32, width: f32) -> f32 {
-    let x = s / width;
+fn strand_noise(x: f32, seed: u32) -> f32 {
     let i = x.floor();
     let f = x - i;
     let t = f * f * (3.0 - 2.0 * f);
     let a = strand_hash(i as i32, seed);
     let b = strand_hash(i as i32 + 1, seed);
-    let v = ((a + (b - a) * t - STRAND_LO) / (STRAND_HI - STRAND_LO)).clamp(0.0, 1.0);
+    a + (b - a) * t
+}
+
+fn strand_mask(s: f32, seed: u32, thr: f32, width: f32) -> f32 {
+    let fine = strand_noise(s / width, seed);
+    let clump = strand_noise(s / CLUMP_W, seed ^ 40503);
+    let t = thr + CLUMP_AMP * (clump - 0.5) * thr;
+    let v = ((fine - t + STRAND_SOFT) / (2.0 * STRAND_SOFT)).clamp(0.0, 1.0);
     STRAND_FLOOR + (1.0 - STRAND_FLOOR) * v
+}
+
+fn strand_duty(thr: f32) -> f32 {
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..256)
+            .map(|k| {
+                let t = k as f32 / 255.0;
+                let n = 40000;
+                let sum: f32 = (0..n).map(|i| strand_mask(i as f32 * 0.37e-3 + 1.0e-5, 7 + (i / 2000) as u32, t, 0.39e-3)).sum();
+                sum / n as f32
+            })
+            .collect()
+    });
+    table[((thr * 255.0) as usize).min(255)]
 }
 
 fn segment_dir(p0: [f32; 2], p1: [f32; 2]) -> ([f32; 2], f32) {
@@ -122,15 +146,13 @@ impl Deposit {
         self
     }
 
-    pub fn strands(mut self, seed: u32, offset: f32, dx: f32) -> Self {
+    pub fn strands(mut self, seed: u32, offset: f32, fill: f32, dx: f32) -> Self {
         self.kind |= DEPOSIT_STRANDS;
-        self.pad[0] = seed;
+        let thr = (1.0 - fill).clamp(STRAND_WET, STRAND_DRY);
+        self.pad[0] = (seed << 8) | (thr * 255.0) as u32;
         self.pad[1] = offset.to_bits();
         self.pad[2] = STRAND_MIN_W.max(STRAND_CELLS * dx).to_bits();
-        let sampled = self.sampled_volume(0.25 * dx);
-        if sampled > 0.0 {
-            self.h0 *= self.vol / sampled;
-        }
+        self.h0 /= strand_duty((self.pad[0] & 255) as f32 / 255.0);
         self
     }
 
@@ -192,8 +214,8 @@ impl Deposit {
         let cap_end = self.kind & DEPOSIT_CAP_END != 0;
         let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
         let strands = self.kind & DEPOSIT_STRANDS != 0;
-        let (seed, offset, width) = (self.pad[0], f32::from_bits(self.pad[1]), f32::from_bits(self.pad[2]));
-        let mask = move |q: [f32; 2], d: [f32; 2]| if strands { strand_mask(offset - (q[0] * d[1] - q[1] * d[0]), seed, width) } else { 1.0 };
+        let (seed, thr, offset, width) = (self.pad[0] >> 8, (self.pad[0] & 255) as f32 / 255.0, f32::from_bits(self.pad[1]), f32::from_bits(self.pad[2]));
+        let mask = move |q: [f32; 2], d: [f32; 2]| if strands { strand_mask(offset - (q[0] * d[1] - q[1] * d[0]), seed, thr, width) } else { 1.0 };
         move |p: [f32; 2]| {
             let q0 = [p[0] - self.p0[0], p[1] - self.p0[1]];
             let q1 = [p[0] - self.p1[0], p[1] - self.p1[1]];
@@ -278,9 +300,9 @@ pub fn weave(w: usize, h: usize, dx: f32, amp: f32) -> Vec<f32> {
     v
 }
 
-pub const MAX_CONTACTS: usize = 65536;
+pub const MAX_CONTACTS: usize = 1 << 18;
 pub const MAX_SCRAPS: usize = 1 << 18;
-pub const MAX_BRISTLES: usize = 512;
+pub const MAX_BRISTLES: usize = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
@@ -645,7 +667,7 @@ impl Film {
         let dx = settings.width_m / w as f32;
         let tiles = [(w + 63) / 64, (h + 63) / 64];
         let ntiles = (tiles[0] * tiles[1]) as u64;
-        let max_deposits = 1 << 16;
+        let max_deposits = 1 << 17;
         let params_buf = gpu.uniform("params", std::mem::size_of::<Params>() as u64);
         let h_buf = gpu.storage("h", n * 4);
         let m_buf = gpu.storage("m", n * 4);
@@ -1550,6 +1572,28 @@ impl Film {
         self.prof = prof;
         self.substeps_last = substeps;
         self.frame += 1;
+    }
+}
+
+#[cfg(test)]
+mod strand_tests {
+    use super::*;
+
+    #[test]
+    fn strands_conserve_paint_on_average() {
+        let dx = 0.39e-3f32;
+        for fill in [1.0f32, 0.6, 0.3, 0.1] {
+            let (mut laid, mut asked) = (0.0f64, 0.0f64);
+            for k in 0..600 {
+                let vol = 2.0e-9f32;
+                let plain = Deposit::stroke([0.1, 0.1], [0.11, 0.1], 0.0004, vol, [0; 8], dx);
+                let d = plain.strands(3 + (k / 40) as u32, k as f32 * 0.37e-3, fill, dx);
+                laid += d.sampled_volume(0.25 * dx) as f64;
+                asked += vol as f64;
+            }
+            let ratio = laid / asked;
+            assert!((ratio - 1.0).abs() < 0.12, "fill {} laid/asked {}", fill, ratio);
+        }
     }
 }
 

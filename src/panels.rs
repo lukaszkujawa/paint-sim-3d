@@ -530,7 +530,7 @@ impl App {
         });
         let mut size = self.brush.size() * 1e3;
         let mut len = self.brush.len * 1e3;
-        let mut n = self.brush.bristles.len();
+        let mut n = self.brush.requested;
         num_hint(ui, "Pressure", "How hard the brush presses. The mouse wheel changes it; a pen sets it directly.", &mut self.brush_pressure, 0.0, 1.0, 100.0, " %", false);
         let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 0.1, 150.0, 1.0, " mm", true);
         let c2 = num(ui, "Bristle length", &mut len, 10.0, 60.0, 1.0, " mm", false);
@@ -1006,7 +1006,7 @@ impl App {
 
     fn canvas_window(&mut self, ctx: &egui::Context) {
         let Some(mut c) = self.canvas_dialog.take() else { return };
-        const SIZES: [(u32, &str); 5] = [(1536, "Draft"), (2048, "Quick"), (3072, "Standard"), (4096, "Fine"), (6144, "Ultra")];
+        const SIZES: [(u32, &str); 5] = [(1536, "Draft"), (2048, "Quick"), (3072, "Standard"), (4096, "Fine"), (4992, "Ultra")];
         const COLOURS: [(&str, Option<[f32; 3]>); 8] = [
             ("Raw cotton", None),
             ("Primed white", Some([0.94, 0.93, 0.90])),
@@ -1024,7 +1024,9 @@ impl App {
         if let Some(r) = egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.set_width(380.0);
             ui.label(RichText::new("Resolution").strong());
-            for (res, name) in SIZES {
+            let aspect = self.film.settings.height_m / self.film.settings.width_m;
+            let room = self.gpu.device.limits().max_storage_buffer_binding_size as f64;
+            for (res, name) in SIZES.into_iter().filter(|(r, _)| *r as f64 * (*r as f32 * aspect) as f64 * 128.0 <= room) {
                 let cell = width_mm / res as f32;
                 let note = match res {
                     r if r <= 2048 => "fast, loose work",

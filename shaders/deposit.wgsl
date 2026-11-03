@@ -5,7 +5,7 @@
 
 fn strands_at(q: vec2<f32>, dir: vec2<f32>, d: Deposit) -> f32 {
     if (d.kind & DEPOSIT_STRANDS) == 0u { return 1.0; }
-    return strand_mask(bitcast<f32>(d.pad1) - (q.x * dir.y - q.y * dir.x), d.pad0, P.dx);
+    return strand_mask(bitcast<f32>(d.pad1) - (q.x * dir.y - q.y * dir.x), d.pad0 >> 8u, f32(d.pad0 & 255u) / 255.0, P.dx);
 }
 
 fn ribbon_height(p: vec2<f32>, d: Deposit) -> f32 {

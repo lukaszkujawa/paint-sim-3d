@@ -37,10 +37,11 @@ const DEPOSIT_CAP_START: u32 = 2u;
 const DEPOSIT_CAP_END: u32 = 4u;
 const DEPOSIT_STRANDS: u32 = 8u;
 const STRAND_MIN_W: f32 = 0.18e-3;
-const STRAND_CELLS: f32 = 1.2;
-const STRAND_LO: f32 = 0.35;
-const STRAND_HI: f32 = 0.6;
-const STRAND_FLOOR: f32 = 0.08;
+const STRAND_CELLS: f32 = 1.0;
+const STRAND_SOFT: f32 = 0.12;
+const STRAND_FLOOR: f32 = 0.0;
+const CLUMP_W: f32 = 3.0e-3;
+const CLUMP_AMP: f32 = 0.5;
 
 fn strand_hash(i: i32, seed: u32) -> f32 {
     var h = (u32(i) * 73856093u) ^ (seed * 19349663u);
@@ -50,14 +51,20 @@ fn strand_hash(i: i32, seed: u32) -> f32 {
     return f32(h & 0xffffu) / 65535.0;
 }
 
-fn strand_mask(s: f32, seed: u32, dx: f32) -> f32 {
-    let x = s / max(STRAND_MIN_W, STRAND_CELLS * dx);
+fn strand_noise(x: f32, seed: u32) -> f32 {
     let i = floor(x);
     let f = x - i;
     let t = f * f * (3.0 - 2.0 * f);
     let a = strand_hash(i32(i), seed);
     let b = strand_hash(i32(i) + 1, seed);
-    let v = clamp((a + (b - a) * t - STRAND_LO) / (STRAND_HI - STRAND_LO), 0.0, 1.0);
+    return a + (b - a) * t;
+}
+
+fn strand_mask(s: f32, seed: u32, thr: f32, dx: f32) -> f32 {
+    let fine = strand_noise(s / max(STRAND_MIN_W, STRAND_CELLS * dx), seed);
+    let clump = strand_noise(s / CLUMP_W, seed ^ 40503u);
+    let t = thr + CLUMP_AMP * (clump - 0.5) * thr;
+    let v = clamp((fine - t + STRAND_SOFT) / (2.0 * STRAND_SOFT), 0.0, 1.0);
     return STRAND_FLOOR + (1.0 - STRAND_FLOOR) * v;
 }
 const DEPOSIT_METHOD_SHIFT: u32 = 8u;

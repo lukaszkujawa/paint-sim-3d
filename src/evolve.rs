@@ -2389,7 +2389,7 @@ impl App {
             ToolKind::Pour => self.pour_radius = size as f32,
             ToolKind::Brush => {
                 if (self.brush.size() - size).abs() > 0.02 * size {
-                    let (shape, n, len) = (self.brush.shape, self.brush.bristles.len(), self.brush.len);
+                    let (shape, n, len) = (self.brush.shape, self.brush.requested, self.brush.len);
                     self.rebuild_brush(shape, n, len, size);
                 }
             }
@@ -2467,7 +2467,7 @@ impl App {
         }
         if let Some(len) = self.evo.saved_len.take() {
             if (self.brush.len - len).abs() > 1e-6 {
-                let (shape, n, size) = (self.brush.shape, self.brush.bristles.len(), self.brush.size());
+                let (shape, n, size) = (self.brush.shape, self.brush.requested, self.brush.size());
                 self.rebuild_brush(shape, n, len, size);
             }
         }
@@ -2685,7 +2685,7 @@ impl App {
                 let user_len = self.evo.saved_len.unwrap_or(self.brush.len);
                 let len = (BRISTLE_PER_SIZE * plan.size).clamp(BRISTLE_MIN.min(user_len), user_len);
                 if (self.brush.size() - plan.size).abs() > 0.02 * plan.size || (self.brush.len - len).abs() > 0.02 * len {
-                    let (shape, n) = (self.brush.shape, self.brush.bristles.len());
+                    let (shape, n) = (self.brush.shape, self.brush.requested);
                     self.rebuild_brush(shape, n, len, plan.size);
                 }
                 let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, self.brush_press(self.brush_pressure).max(PRESS_MIN));

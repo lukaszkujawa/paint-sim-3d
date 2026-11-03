@@ -120,6 +120,10 @@ const TONE_LOW: f32 = 0.01;
 const TONE_HIGH: f32 = 0.995;
 const TONE_MIN_SPAN: f32 = 20.0;
 const TONE_GAMMA: f32 = 1.3;
+const FIT_MARGIN_L: f32 = 8.0;
+const FIT_MIN_EV: f32 = -3.0;
+const FIT_FULL_EV: f32 = 1.0;
+const ROUND_LEAD: f64 = 0.06;
 const LOAD_SIZE: f64 = 0.016;
 const STRIDE_HW: f32 = 6.0;
 const LOAD_MAX: f64 = 10.0;
@@ -333,6 +337,7 @@ pub struct EvolveState {
     pub photo: Option<Photo>,
     pub focus: Focus,
     pub run: Option<Evolver>,
+    fitted: Option<(f32, f32)>,
     pub candidates: usize,
     pub follow: f64,
     pub intent: f64,
@@ -352,7 +357,7 @@ pub struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, candidates: 32, follow: 0.7, intent: 0.7, prep: Prep::none(), prep_touched: None, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new(), stroke_press: 0.0 }
+        Self { photo: None, focus: Focus { shape: FocusShape::Off, a: [0.5, 0.5], b: [0.75, 0.5], soft: 0.5, outside: 0.0 }, run: None, fitted: None, candidates: 32, follow: 0.7, intent: 0.7, prep: Prep::none(), prep_touched: None, dry_passes: true, longest: 0.25, active: false, photo_gen: 0, saved_paint: None, saved_height: None, saved_load: None, saved_len: None, user_sizes: Vec::new(), stroke_press: 0.0 }
     }
 }
 
@@ -422,7 +427,7 @@ fn tonemap(x: f32) -> f32 {
     ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
 }
 
-fn encode(c: f32) -> f32 {
+pub(crate) fn encode(c: f32) -> f32 {
     if c <= 0.0031308 {
         12.92 * c
     } else {
@@ -1765,6 +1770,7 @@ pub struct Evolver {
     gain: Option<[f32; 3]>,
     offset: [f32; 3],
     base_gain: [f32; 3],
+    fit_ev: f32,
     pub w: usize,
     pub h: usize,
     pub factor: u32,
@@ -1842,6 +1848,7 @@ impl Evolver {
             gain: None,
             offset: [0.0; 3],
             base_gain: [1.0; 3],
+            fit_ev: 0.0,
             w,
             h,
             factor,
@@ -1910,6 +1917,22 @@ impl Evolver {
         self.start_err = 0.0;
     }
 
+    fn range_fit(&self, gain: [f32; 3]) -> f32 {
+        let mut sample: Vec<f32> = self.photo.iter().step_by(QUANTILE_STRIDE).map(|p| lab(*p)[0]).collect();
+        sample.sort_by(|a, b| a.total_cmp(b));
+        let want = sample[((sample.len() - 1) as f32 * TONE_HIGH) as usize] + FIT_MARGIN_L;
+        let white_at = |ev: f32| view_lab(self.white, gain.map(|g| g * ev.exp2()))[0];
+        if white_at(0.0) <= want {
+            return 0.0;
+        }
+        let (mut lo, mut hi) = (FIT_MIN_EV, 0.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if white_at(mid) < want { lo = mid } else { hi = mid }
+        }
+        hi
+    }
+
     pub fn calibrate(&mut self, gain: [f32; 3], offset: [f32; 3]) {
         self.gain = Some(gain);
         self.offset = offset;
@@ -1924,10 +1947,11 @@ impl Evolver {
         let at = |q: f32| sample[((sample.len() - 1) as f32 * q) as usize];
         let l0 = at(TONE_LOW);
         let lh = at(TONE_HIGH).max(lb + TONE_MIN_SPAN).min(lw);
+        let gamma = TONE_GAMMA + (1.0 - TONE_GAMMA) * (-self.fit_ev / FIT_FULL_EV).clamp(0.0, 1.0);
         let mapped: Vec<[f32; 3]> = lifted
             .into_par_iter()
             .map(|v| {
-                let l = if v[0] >= lh || lh <= l0 { v[0].max(lb) } else { lb + (lh - lb) * ((v[0] - l0) / (lh - l0)).clamp(0.0, 1.0).powf(TONE_GAMMA) };
+                let l = if v[0] >= lh || lh <= l0 { v[0].max(lb) } else { lb + (lh - lb) * ((v[0] - l0) / (lh - l0)).clamp(0.0, 1.0).powf(gamma) };
                 [l.min(lw), v[1], v[2]]
             })
             .collect();
@@ -2481,6 +2505,7 @@ impl App {
 
     pub(crate) fn restore_exposure(&mut self) {
         self.renderer.exposure = crate::render::DEFAULT_EXPOSURE;
+        self.evo.fitted = None;
         self.stop_evolve();
         self.evo.run = None;
     }
@@ -2513,7 +2538,21 @@ impl App {
                 self.tool.flowing = false;
                 let rgb = self.read_linear(ev, [0, 0, ev.w, ev.h]);
                 if !ev.calibrated {
-                    let base = self.display_gain(ev, &rgb).map(|g| g * (-crate::render::DEFAULT_EXPOSURE).exp2());
+                    if let Some((user, fitted)) = self.evo.fitted.take() {
+                        if (self.renderer.exposure - fitted).abs() < 1e-4 {
+                            self.renderer.exposure = user;
+                        }
+                    }
+                    let user = self.renderer.exposure;
+                    let unit = self.display_gain(ev, &rgb).map(|g| g * (-user).exp2());
+                    let fit = ev.range_fit(unit);
+                    ev.fit_ev = fit;
+                    if fit < 0.0 && fit < user {
+                        self.renderer.exposure = fit;
+                        self.evo.fitted = Some((user, fit));
+                        self.notice(&format!("Exposure set to {:.1} EV so paint covers this photo's tones; change it under Render", fit));
+                    }
+                    let base = unit.map(|g| g * fit.exp2());
                     ev.base_gain = base;
                     let gain = base.map(|g| g * (-ev.prep.lift_ev).exp2());
                     log::info!("display gain {:.2} {:.2} {:.2}", gain[0], gain[1], gain[2]);
@@ -2549,7 +2588,7 @@ impl App {
                         }
                         Phase::Plan
                     }
-                    Some(plan) => {
+                    Some(mut plan) => {
                         if plan.dry && self.evo.dry_passes {
                             self.begin_full();
                             self.film.dry_now(&self.gpu);
@@ -2557,6 +2596,16 @@ impl App {
                         self.prepare_tool(&plan);
                         ev.applied(self.tool_size(plan.kind));
                         self.begin_stroke();
+                        let (_, dir) = plan.entry();
+                        if plan.kind == ToolKind::Brush {
+                            self.brush.lean = DVec3::new(dir.x, dir.y, 0.0);
+                            if self.brush.shape == BrushShape::Round {
+                                let shift = dir * (ROUND_LEAD * self.brush.len);
+                                for q in plan.path.iter_mut() {
+                                    *q -= shift;
+                                }
+                            }
+                        }
                         let (from, _) = plan.entry();
                         self.tool.pos = DVec3::new(from.x, from.y, z);
                         Phase::Lower(plan, 0)
@@ -2689,7 +2738,7 @@ impl App {
                     self.rebuild_brush(shape, n, len, plan.size);
                 }
                 let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, self.brush_press(self.brush_pressure).max(PRESS_MIN));
-                let press = press * (1.0 + PRESS_JITTER * (2.0 * rand::random::<f64>() - 1.0));
+                let press = press * (1.0 + PRESS_JITTER * (2.0 * rand::random::<f64>() - 1.0)) + self.brush.touch_depth();
                 self.evo.stroke_press = press;
                 self.tool.height = self.brush.len - press * PRESS_START;
                 self.brush.capacity = self.brush.base_capacity * (plan.size / LOAD_SIZE).clamp(1.0, LOAD_MAX);

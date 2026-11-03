@@ -1387,6 +1387,36 @@ impl Film {
         [&self.h_buf, &self.m_buf, &self.rheo, &self.strata_h, &self.strata_pig, &self.strata_cure, &self.sub_refl, &self.lay]
     }
 
+    pub fn read_mean_colour(&self, gpu: &Gpu, region: [u32; 4]) -> [f32; 3] {
+        let (cw, ch) = (region[2] - region[0], region[3] - region[1]);
+        let bpr = ((cw * 8 + 255) / 256) * 256;
+        let buf = gpu.readback("colour_pick", (bpr * ch) as u64);
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("colour_pick") });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self.color_tex, mip_level: 0, origin: wgpu::Origin3d { x: region[0], y: region[1], z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: None } },
+            wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit(std::iter::once(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = slice.get_mapped_range().expect("map");
+        let halves: &[u16] = bytemuck::cast_slice(&data);
+        let row = (bpr / 2) as usize;
+        let mut sum = [0.0f32; 3];
+        for y in 0..ch as usize {
+            for x in 0..cw as usize {
+                for c in 0..3 {
+                    sum[c] += half::f16::from_bits(halves[y * row + x * 4 + c]).to_f32();
+                }
+            }
+        }
+        drop(data);
+        buf.unmap();
+        sum.map(|v| v / (cw * ch) as f32)
+    }
+
     pub fn read_state(&self, gpu: &Gpu) -> Vec<Vec<u8>> {
         let bufs = self.state_buffers();
         let reads: Vec<wgpu::Buffer> = bufs.iter().map(|b| gpu.readback("state_r", b.size())).collect();

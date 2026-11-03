@@ -44,6 +44,7 @@ const KNIFE_PENDING_DECAY: f64 = 0.5;
 const KNIFE_SMEAR: f64 = 0.35;
 const KNIFE_BAND_MIX_PER_M: f64 = 1.2;
 const PEN_STALE_S: f32 = 0.3;
+const PICK_RADIUS: i64 = 1;
 const MAX_STEP_SPEED: f32 = 2.0;
 const PEN_FLOW_MIN: f64 = 0.1;
 const PEN_FLOW_MAX: f64 = 1.5;
@@ -124,6 +125,11 @@ struct App {
     pen_curve: f32,
     pal_picks: [[f32; 3]; 6],
     paint_pick: [f32; 3],
+    paint_pick_mix: [f32; 12],
+    paint_pick_ev: f32,
+    paint_hex: String,
+    eyedropper: bool,
+    pick_hover: Option<[f32; 3]>,
     custom_mixes: Vec<[f32; 16]>,
     prof: String,
     auto_quality: bool,
@@ -208,6 +214,7 @@ struct AutoScript {
     spp: u32,
     light: Vec<f32>,
     aces: bool,
+    agx: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -332,6 +339,11 @@ impl App {
             pen_curve: 1.0,
             pal_picks: [[0.5; 3]; 6],
             paint_pick: [0.5; 3],
+            paint_pick_mix: [0.0; 12],
+            paint_pick_ev: 0.0,
+            paint_hex: String::new(),
+            eyedropper: false,
+            pick_hover: None,
             custom_mixes: Vec::new(),
             prof: String::new(),
             auto_quality: std::env::var("PAINT_NO_AUTOQ").is_err(),
@@ -382,6 +394,9 @@ impl App {
         }
         if app.auto.as_ref().map(|a| a.aces).unwrap_or(false) {
             app.renderer.agx = false;
+        }
+        if app.auto.as_ref().map(|a| a.agx).unwrap_or(false) {
+            app.renderer.agx = true;
         }
         if app.auto.is_none() {
             app.canvas_dialog = Some(CanvasChoice { res: app.film.w, colour: app.film.settings.canvas_rgb, weave: app.film.settings.raw_canvas, custom: [0.90, 0.85, 0.76], first: true });
@@ -1661,7 +1676,7 @@ impl App {
         drop(data);
         buf.unmap();
         let [vx, vy, vw, vh] = self.view_rect.map(|v| v.max(0.0) as u32);
-        let img = if vw > 0 && vh > 0 && (vw < w || vh < h) { image::imageops::crop_imm(&img, vx, vy, vw.min(w - vx.min(w)), vh.min(h - vy.min(h))).to_image() } else { img };
+        let img = if vw > 0 && vh > 0 && (vw < w || vh < h) && !std::env::args().any(|a| a == "--showui") { image::imageops::crop_imm(&img, vx, vy, vw.min(w - vx.min(w)), vh.min(h - vy.min(h))).to_image() } else { img };
         let _ = img.save(path);
         log::warn!("saved {}", path);
     }
@@ -2006,6 +2021,29 @@ impl App {
         log::warn!("{}", self.stats);
     }
 
+    pub(crate) fn canvas_colour_at_cursor(&self) -> Option<[f32; 3]> {
+        if self.cursor_over_panel() {
+            return None;
+        }
+        let p = self.cam.plane_hit(self.ndc(), 0.0)?;
+        let dx = self.film.dx as f64;
+        let (w, h) = (self.film.w as i64, self.film.h as i64);
+        let (i, j) = ((p.x as f64 / dx).floor() as i64, (p.y as f64 / dx).floor() as i64);
+        if i < 0 || j < 0 || i >= w || j >= h {
+            return None;
+        }
+        let (x0, y0) = ((i - PICK_RADIUS).max(0) as u32, (j - PICK_RADIUS).max(0) as u32);
+        let (x1, y1) = ((i + PICK_RADIUS + 1).min(w) as u32, (j + PICK_RADIUS + 1).min(h) as u32);
+        Some(self.film.read_mean_colour(&self.gpu, [x0, y0, x1, y1]).map(evolve::encode))
+    }
+
+    fn eyedrop_click(&mut self) {
+        if let Some(rgb) = self.canvas_colour_at_cursor() {
+            self.use_colour(self.shown(rgb));
+            self.eyedropper = false;
+        }
+    }
+
     fn cursor_over_panel(&self) -> bool {
         let [x, y, w, h] = self.view_rect;
         let (cx, cy) = (self.cursor[0], self.cursor[1]);
@@ -2203,6 +2241,57 @@ impl App {
             }
         } else {
             self.last_pour = None;
+        }
+        if self.auto.as_ref().map(|a| a.script == "eyedrop").unwrap_or(false) {
+            const WANTED: [[f32; 3]; 5] = [[0.5, 0.5, 0.5], [0.6, 0.3, 0.2], [0.2, 0.35, 0.6], [0.85, 0.8, 0.7], [0.25, 0.25, 0.25]];
+            let size = self.window.inner_size();
+            let f = self.frame_index;
+            let y_of = |k: usize| 0.2 + 0.13 * k as f32;
+            let span = 230u64;
+            self.tool.kind = ToolKind::Brush;
+            let at = |y: f32, s: f32| [size.width as f32 * (0.3 + 0.35 * s), size.height as f32 * y];
+            let mut down = false;
+            if f == 5 {
+                let n = self.brush.requested;
+                let len = self.brush.len;
+                self.rebuild_brush(brush::BrushShape::Round, n, len, 0.03);
+            }
+            if f >= 10 && f < 10 + span * 5 {
+                let k = ((f - 10) / span) as usize;
+                let t = (f - 10) % span;
+                if t == 0 {
+                    self.use_colour(WANTED[k]);
+                    log::warn!("eyedrop row {} wanted {:?} paint {:?} shown {:?} at {:?}", k, WANTED[k], color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac), self.shown(color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac)), at(y_of(k), 0.5));
+                }
+                if t < 210 {
+                    if t % 70 == 0 {
+                        self.reload_tool();
+                    }
+                    self.cursor = at(y_of(k), (t % 70) as f32 / 70.0);
+                    down = t % 70 < 62;
+                }
+            }
+            let done = 10 + span * 5;
+            if f == done + 10 {
+                self.paint.frac = color::PaintMix::pure(0).frac;
+                self.reload_tool();
+                self.eyedropper = true;
+                self.cursor = at(y_of(1), 0.5);
+            }
+            if f == done + 40 {
+                let seen = self.canvas_colour_at_cursor();
+                self.eyedrop_click();
+                log::warn!("eyedrop sampled {:?} mixed {:?} still picking {} view {:?}", seen, color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac), self.eyedropper, self.view_rect);
+            }
+            if f > done + 50 && f <= done + 120 {
+                self.cursor = at(0.87, (f - done - 50) as f32 / 70.0);
+                down = true;
+            }
+            if f == done + 130 {
+                self.cursor = at(y_of(2), 0.5);
+                self.eyedropper = true;
+            }
+            self.mouse_down[0] = down;
         }
         if let Some(script) = self.auto.as_ref().map(|a| a.script.clone()).filter(|s| s.starts_with("undo")) {
             let size = self.window.inner_size();
@@ -2755,7 +2844,7 @@ impl App {
         let t_ui = Instant::now();
         let raw = self.ui.state.take_egui_input(&self.window);
         self.ui.ctx.begin_pass(raw);
-        if self.auto.is_none() {
+        if self.auto.is_none() || std::env::args().any(|a| a == "--showui") {
             self.ui_panel();
             if !self.view_fitted && self.view_rect[2] > 1.0 {
                 self.view_fitted = true;
@@ -3006,7 +3095,9 @@ impl ApplicationHandler for Pending {
                         if t.force.is_none() {
                             app.pen_raw = 1.0;
                         }
-                        if !app.cursor_over_panel() {
+                        if app.eyedropper {
+                            app.eyedrop_click();
+                        } else if !app.cursor_over_panel() {
                             app.pen_down = true;
                             app.mouse_down[0] = true;
                         }
@@ -3037,6 +3128,10 @@ impl ApplicationHandler for Pending {
                 };
                 if state == ElementState::Pressed {
                     if app.cursor_over_panel() {
+                        return;
+                    }
+                    if app.eyedropper && i == 0 {
+                        app.eyedrop_click();
                         return;
                     }
                     app.mouse_down[i] = true;
@@ -3073,7 +3168,9 @@ impl ApplicationHandler for Pending {
                 if event.state == ElementState::Pressed && !app.ui.ctx.egui_wants_keyboard_input() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Space) => app.paused = !app.paused,
+                        PhysicalKey::Code(KeyCode::Escape) if app.eyedropper => app.eyedropper = false,
                         PhysicalKey::Code(KeyCode::Escape) => app.stop_evolve(),
+                        PhysicalKey::Code(KeyCode::KeyI) => app.eyedropper = !app.eyedropper,
                         PhysicalKey::Code(KeyCode::Tab) => app.show_inspector = !app.show_inspector,
                         PhysicalKey::Code(KeyCode::KeyT) => app.set_top_view(),
                         PhysicalKey::Code(KeyCode::KeyB) => app.beauty_render(true),
@@ -3149,6 +3246,7 @@ fn parse_auto() -> Option<AutoScript> {
     let mut spp = 64u32;
     let mut light = Vec::new();
     let mut aces = false;
+    let mut agx = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -3173,6 +3271,7 @@ fn parse_auto() -> Option<AutoScript> {
             "--cure" => { cure = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0); i += 1; }
             "--stop" => { stop = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
             "--aces" => { aces = true; }
+            "--agx" => { agx = true; }
             "--light" => { light = args.get(i + 1).map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect()).unwrap_or_default(); i += 1; }
             "--rounds" => { rounds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 1; }
             "--snap-save" => { snap_save = args.get(i + 1).cloned().unwrap_or_default(); i += 1; }
@@ -3188,7 +3287,7 @@ fn parse_auto() -> Option<AutoScript> {
         }
         i += 1;
     }
-    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, rounds, snap_save, snap_load, camat, vres, spp, light, aces })
+    frames.map(|frames| AutoScript { frames, shot, beauty, view, tilt, cam, script, debug, cure, pace, sigma, angle, yield_pa, mu, pig, layer, seed, dry, export, stop, rounds, snap_save, snap_load, camat, vres, spp, light, aces, agx })
 }
 
 fn app_icon() -> Option<winit::window::Icon> {

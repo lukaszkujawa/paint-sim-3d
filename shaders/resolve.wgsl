@@ -7,6 +7,8 @@ struct Res {
     c: vec4<f32>,
 }
 
+const AGX_BALANCE_EV: f32 = 1.15;
+
 struct VOut {
     @builtin(position) pos: vec4<f32>,
 }
@@ -106,7 +108,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let uv = in.pos.xy / vec2<f32>(R.b.y, R.b.z) - vec2<f32>(0.5);
     let vig = 1.0 - R.b.x * smoothstep(0.15, 0.75, dot(uv, uv) * 2.0);
     c *= vig;
-    var mapped = agx(c);
+    var mapped = agx(c * exp2(AGX_BALANCE_EV));
     if R.b.w < 0.5 { mapped = aces(c); }
     let grain = R.a.w;
     if grain > 0.0 {

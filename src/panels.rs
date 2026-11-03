@@ -130,6 +130,15 @@ fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egu
     });
 }
 
+fn parse_hex(text: &str) -> Option<[f32; 3]> {
+    let h = text.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let part = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
+    Some([part(0)?, part(2)?, part(4)?])
+}
+
 fn swatch_color(rgb: [f32; 3]) -> Color32 {
     Color32::from_rgb((rgb[0] * 255.0) as u8, (rgb[1] * 255.0) as u8, (rgb[2] * 255.0) as u8)
 }
@@ -165,7 +174,7 @@ impl App {
         self.sim_time = 0.0;
     }
 
-    fn reload_tool(&mut self) {
+    pub(crate) fn reload_tool(&mut self) {
         match self.tool.kind {
             ToolKind::Brush => self.brush.dip(&self.paint.frac),
             ToolKind::Roller => self.roller.dip(&self.paint.frac),
@@ -176,6 +185,9 @@ impl App {
     }
 
     pub(crate) fn ui_panel(&mut self) {
+        if self.eyedropper {
+            self.eyedropper_overlay();
+        }
         let ctx = self.ui.ctx.clone();
         self.menu_open = false;
         self.block_rects.clear();
@@ -308,7 +320,7 @@ impl App {
             ui.add_space(10.0);
             let rgb = color::mix_rgb(&self.film.pigments, &self.film.cmf_table, &self.paint.frac);
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(TOOLBAR_W - 12.0, 30.0), egui::Sense::click());
-            ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
+            ui.painter().rect_filled(rect, 4.0, swatch_color(self.shown(rgb)));
             ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
             if resp.on_hover_text("Current paint. Click to reload the tool (R)").clicked() {
                 self.reload_tool();
@@ -567,24 +579,23 @@ impl App {
         parts.sort_by(|a, b| b.0.total_cmp(&a.0));
         let desc = parts.iter().take(3).map(|(f, n)| format!("{:.0}% {}", f * 100.0, n)).collect::<Vec<_>>().join(", ");
         ui.horizontal(|ui| {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), egui::Sense::click());
-            ui.painter().rect_filled(rect, 4.0, swatch_color(rgb));
-            let stroke = if resp.hovered() { Stroke::new(1.5, Color32::from_gray(220)) } else { Stroke::new(1.0, Color32::from_gray(90)) };
-            ui.painter().rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
-            let resp = resp.on_hover_text("Click to pick any colour");
-            if resp.clicked() {
-                self.paint_pick = rgb;
-            }
-            self.paint_picker(ui, &resp, rgb);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, swatch_color(self.shown(rgb)));
+            ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
             ui.add(egui::Label::new(RichText::new(if desc.is_empty() { "No pigment".to_string() } else { desc }).small()).wrap());
         });
+        ui.add_space(4.0);
+        let dropper = egui::Button::selectable(self.eyedropper, "Pick colour from canvas").min_size(Vec2::new(ui.available_width(), 24.0));
+        if ui.add(dropper).on_hover_text("Click a spot on the canvas to mix its colour and load the tool (I). Esc cancels.").clicked() {
+            self.eyedropper = !self.eyedropper;
+        }
         ui.add_space(4.0);
         let cols = 6;
         let gap = 4.0;
         let cell = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32).floor();
         egui::Grid::new("swatches").spacing([gap, gap]).show(ui, |ui| {
             for i in 0..color::NPIG.min(names.len()) {
-                let c = swatch_color(color::masstone_rgb(&self.film.pigments, &self.film.cmf_table, i));
+                let c = swatch_color(self.shown(color::masstone_rgb(&self.film.pigments, &self.film.cmf_table, i)));
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(cell, 22.0), egui::Sense::click());
                 ui.painter().rect_filled(rect, 3.0, c);
                 let used = self.paint.frac[i] > 0.0;
@@ -613,7 +624,7 @@ impl App {
                 ui.label(RichText::new("Custom").small().weak());
                 let mut pick = None;
                 for (k, m) in self.custom_mixes.iter().enumerate() {
-                    let c = swatch_color(color::mix_rgb(&self.film.pigments, &self.film.cmf_table, m));
+                    let c = swatch_color(self.shown(color::mix_rgb(&self.film.pigments, &self.film.cmf_table, m)));
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), egui::Sense::click());
                     ui.painter().rect_filled(rect, 3.0, c);
                     let same = (0..color::NPIG).all(|i| (m[i] - self.paint.frac[i] / total).abs() < 1e-4);
@@ -631,6 +642,13 @@ impl App {
                 }
             });
         }
+        ui.add_space(4.0);
+        if self.paint.frac[..color::NPIG] != self.paint_pick_mix || self.renderer.exposure != self.paint_pick_ev {
+            self.paint_pick = self.shown(rgb);
+            self.paint_pick_ev = self.renderer.exposure;
+            self.paint_pick_mix.copy_from_slice(&self.paint.frac[..color::NPIG]);
+        }
+        egui::CollapsingHeader::new(RichText::new("Custom colour").small()).id_salt("custom_colour").default_open(true).show(ui, |ui| self.custom_colour(ui, rgb));
         ui.add_space(4.0);
         prop(ui, "Preset", |ui| {
             if ui.button("Enamel").on_hover_text("Fluid house paint, Pollock's choice").clicked() {
@@ -874,44 +892,79 @@ impl App {
         }
     }
 
-    fn paint_picker(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rgb: [f32; 3]) {
-        let popup = egui::Popup::from_toggle_button_response(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.set_width(240.0);
-            ui.label(RichText::new("Pick a colour").strong());
-            ui.spacing_mut().slider_width = 210.0;
-            let mut c = swatch_color(self.paint_pick);
-            if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
-                self.paint_pick = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
-                let mix = pollock::match_rgb(self.paint_pick);
-                for i in 0..color::NPIG {
-                    self.paint.frac[i] = mix[i];
-                }
-            }
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
-                ui.painter().rect_filled(r, 3.0, swatch_color(self.paint_pick));
-                ui.label(RichText::new("picked").small().weak());
-                let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
-                ui.painter().rect_filled(r, 3.0, swatch_color(rgb));
-                ui.label(RichText::new("paint").small().weak());
-            });
-            ui.label(RichText::new("The colour is mixed from the twelve pigments, so very saturated colours come out as the closest real paint. Thinner and yield stress are kept.").small().weak());
-            ui.separator();
-            if ui.button("Save to custom colours").clicked() {
-                let total: f32 = self.paint.frac[..color::NPIG].iter().sum::<f32>().max(1e-6);
-                let mut m = [0.0f32; 16];
-                for i in 0..color::NPIG {
-                    m[i] = self.paint.frac[i] / total;
-                }
-                self.custom_mixes.retain(|o| (0..color::NPIG).any(|i| (o[i] - m[i]).abs() > 1e-4));
-                self.custom_mixes.insert(0, m);
-                self.custom_mixes.truncate(12);
-            }
-        });
-        if let Some(p) = popup {
-            self.block_rects.push(p.response.rect);
-            self.menu_open = true;
+    pub(crate) fn shown(&self, paint: [f32; 3]) -> [f32; 3] {
+        color::paint_shown(paint, self.renderer.exposure)
+    }
+
+    pub(crate) fn use_colour(&mut self, rgb: [f32; 3]) {
+        let mix = pollock::match_rgb(color::paint_for_shown(rgb, self.renderer.exposure));
+        for i in 0..color::NPIG {
+            self.paint.frac[i] = mix[i];
         }
+        self.paint_pick = rgb;
+        self.paint_pick_ev = self.renderer.exposure;
+        self.paint_pick_mix.copy_from_slice(&self.paint.frac[..color::NPIG]);
+        self.reload_tool();
+    }
+
+    fn custom_colour(&mut self, ui: &mut egui::Ui, rgb: [f32; 3]) {
+        ui.spacing_mut().slider_width = (ui.available_width() - 24.0).clamp(120.0, 240.0);
+        let mut c = swatch_color(self.paint_pick);
+        if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+            self.use_colour([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]);
+        }
+        ui.add_space(4.0);
+        let mut submitted = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Hex").small());
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.paint_hex).desired_width(72.0).char_limit(7));
+            if edit.changed() {
+                submitted = parse_hex(&self.paint_hex);
+            }
+            if !edit.has_focus() {
+                let c = swatch_color(self.paint_pick);
+                self.paint_hex = format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b());
+            }
+            let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 3.0, swatch_color(self.paint_pick));
+            ui.label(RichText::new("wanted").small().weak());
+            let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 3.0, swatch_color(self.shown(rgb)));
+            ui.label(RichText::new("paint").small().weak());
+        });
+        if let Some(rgb) = submitted {
+            self.use_colour(rgb);
+        }
+        ui.add(egui::Label::new(RichText::new("Mixed from the twelve pigments, so very saturated colours come out as the closest real paint. Thinner and yield stress are kept.").small().weak()).wrap());
+        if ui.button("Save to custom colours").clicked() {
+            let total: f32 = self.paint.frac[..color::NPIG].iter().sum::<f32>().max(1e-6);
+            let mut m = [0.0f32; 16];
+            for i in 0..color::NPIG {
+                m[i] = self.paint.frac[i] / total;
+            }
+            self.custom_mixes.retain(|o| (0..color::NPIG).any(|i| (o[i] - m[i]).abs() > 1e-4));
+            self.custom_mixes.insert(0, m);
+            self.custom_mixes.truncate(12);
+        }
+    }
+
+    fn eyedropper_overlay(&mut self) {
+        let ctx = self.ui.ctx.clone();
+        let ppp = ctx.pixels_per_point().max(0.01);
+        self.pick_hover = self.canvas_colour_at_cursor();
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        let Some(rgb) = self.pick_hover.map(|c| self.shown(c)) else { return };
+        let at = egui::pos2(self.cursor[0] / ppp + 18.0, self.cursor[1] / ppp + 18.0);
+        egui::Area::new(egui::Id::new("eyedropper")).order(egui::Order::Tooltip).fixed_pos(at).interactable(false).show(&ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, swatch_color(rgb));
+                    let c = swatch_color(rgb);
+                    ui.label(RichText::new(format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())).small());
+                });
+            });
+        });
     }
 
     fn palette_swatch(&mut self, ui: &mut egui::Ui, s: usize) {

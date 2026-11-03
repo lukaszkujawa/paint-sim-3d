@@ -31,7 +31,6 @@ const FLOOR_COLOR: vec3<f32> = vec3<f32>(0.052, 0.055, 0.061);
 const ROLLER_STIPPLE_DEPTH: f32 = 14e-6;
 const ROLLER_STIPPLE_SCALE: f32 = 0.7e-3;
 const ROLLER_STIPPLE_STRETCH: f32 = 1.6;
-const F0_PAINT: f32 = 0.04;
 const BRISTLE_SPACING: f32 = 0.35e-3;
 const BRISTLE_DEPTH: f32 = 25e-6;
 const KNIFE_SPACING: f32 = 0.09e-3;
@@ -39,7 +38,6 @@ const KNIFE_DEPTH: f32 = 6e-6;
 const GROOVE_FULL_DEPTH_AT: f32 = 0.3e-3;
 const WRINKLE_WAVELENGTH: f32 = 0.8e-3;
 const WRINKLE_HEIGHT: f32 = 8e-6;
-const THIN_FILM_MATTE: f32 = 0.12e-3;
 const SIGMA_PAINT: f32 = 0.035;
 const KEY_HALF_ANGLE: f32 = 0.12;
 const SOFTBOX_HALF_W: f32 = 0.45;
@@ -51,14 +49,11 @@ const HAIR_RING: f32 = 1.5;
 const HAIR_DEPTH: f32 = 60e-6;
 const WEAVE_RELIEF: f32 = 50e-6;
 const PAINT_WEAVE: f32 = 0.05;
-const LIVE_SHEEN_FLAT: f32 = 0.04;
-const LIVE_SHEEN_RIDGE: f32 = 0.25;
 const HORIZON_GLOW: vec3<f32> = vec3<f32>(0.62, 0.6, 0.56);
 const AO_DIRS: i32 = 6;
 const AO_STEPS: i32 = 4;
 const FILL_RADIANCE: f32 = 0.35;
 const FILL_TINT: vec3<f32> = vec3<f32>(0.86, 0.92, 1.0);
-const COAT_ROUGH: f32 = 0.07;
 const GRAIN_SCALE: f32 = 0.6e-3;
 const WEAVE_PERIOD: f32 = 1.4e-3;
 const LAMP_DIST: f32 = 1.3;
@@ -78,15 +73,12 @@ const BEAUTY_SOFTBOX_SCALE: f32 = 1.5;
 const BEAUTY_SOFTBOX_RADIANCE: f32 = 1.6;
 const PAINT_HUE_DRIFT: f32 = 0.035;
 const PAINT_TONE_DRIFT: f32 = 0.06;
-const BEAUTY_MIN_ALPHA: f32 = 0.035;
 const FIREFLY_CLAMP: f32 = 40.0;
 const BEAUTY_PENUMBRA: f32 = 0.03;
 const SHADOW_BIAS: f32 = 2e-6;
 const CLUMP_WIDTH: f32 = 1.1e-3;
 const CLUMP_ELONGATION: f32 = 14.0;
 const CLUMP_DEPTH: f32 = 14e-6;
-const DRY_GLOSS_FLOOR: f32 = 0.06;
-const DRY_GLOSS_SCALE: f32 = 0.5;
 const COLOR_CRISP: f32 = 2.2;
 const MARBLE_R1: f32 = 1.2e-3;
 const MARBLE_R2: f32 = 2.6e-3;
@@ -397,20 +389,6 @@ fn surf_wide(p: vec2<f32>) -> f32 {
         s += wy[b] * row;
     }
     return s / (nx * ny);
-}
-
-fn wet_bilinear(p: vec2<f32>) -> f32 {
-    if p.x < 0.0 || p.y < 0.0 || p.x > cam.canvas.x || p.y > cam.canvas.y { return 0.0; }
-    let g = p / cam.canvas.z - vec2<f32>(0.5);
-    let f = floor(g);
-    let t = g - f;
-    let i = i32(f.x);
-    let j = i32(f.y);
-    let a = wet_at(i, j);
-    let b = wet_at(i + 1, j);
-    let c = wet_at(i, j + 1);
-    let d = wet_at(i + 1, j + 1);
-    return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
 }
 
 struct Detail {
@@ -946,64 +924,6 @@ fn softbox(dir: vec3<f32>, l: vec3<f32>, rough: f32, hw: f32, hh: f32) -> f32 {
     return inside * fill;
 }
 
-fn d_ggx_aniso(n: vec3<f32>, t: vec3<f32>, b: vec3<f32>, hvec: vec3<f32>, at: f32, ab: f32) -> f32 {
-    let th = dot(t, hvec) / at;
-    let bh = dot(b, hvec) / ab;
-    let nh = dot(n, hvec);
-    let d = th * th + bh * bh + nh * nh;
-    return 1.0 / (PI * at * ab * d * d);
-}
-
-fn spec_lobe_aniso(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32, aniso: f32, tdir: vec2<f32>) -> f32 {
-    if aniso <= 0.01 { return spec_lobe(n, v, l, rough, f0); }
-    let hvec = normalize(v + l);
-    let a = max(rough * rough, 0.002);
-    let a_wide = select(min(a + sin(KEY_HALF_ANGLE), 1.0), max(a, BEAUTY_MIN_ALPHA), beauty_mode());
-    var t = vec3<f32>(tdir, 0.0);
-    t = normalize(t - n * dot(t, n));
-    let b = cross(n, t);
-    let at = max(a_wide * (1.0 - 0.6 * aniso), 0.002);
-    let ab = min(a_wide * (1.0 + 1.2 * aniso), 1.0);
-    let ndv = max(dot(n, v), 1e-3);
-    let ndl = max(dot(n, l), 0.0);
-    let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, hvec), 0.0), 5.0);
-    let a2 = at * ab;
-    return d_ggx_aniso(n, t, b, hvec, at, ab) * v_smith(ndv, ndl, a2) * f;
-}
-
-fn d_ggx(ndh: f32, a2: f32) -> f32 {
-    let d = ndh * ndh * (a2 - 1.0) + 1.0;
-    return a2 / (PI * d * d);
-}
-
-fn v_smith(ndv: f32, ndl: f32, a2: f32) -> f32 {
-    let gv = ndl * sqrt(ndv * ndv * (1.0 - a2) + a2);
-    let gl = ndv * sqrt(ndl * ndl * (1.0 - a2) + a2);
-    return 0.5 / max(gv + gl, 1e-5);
-}
-
-fn spec_lobe(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32) -> f32 {
-    let hvec = normalize(v + l);
-    let a = max(rough * rough, 0.002);
-    let a_wide = select(min(a + sin(KEY_HALF_ANGLE), 1.0), max(a, BEAUTY_MIN_ALPHA), beauty_mode());
-    let a2 = a_wide * a_wide;
-    let ndh = max(dot(n, hvec), 0.0);
-    let ndv = max(dot(n, v), 1e-3);
-    let ndl = max(dot(n, l), 0.0);
-    let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, hvec), 0.0), 5.0);
-    return d_ggx(ndh, a2) * v_smith(ndv, ndl, a_wide * a_wide) * f;
-}
-
-fn env_dfg(f0: f32, rough: f32, ndv: f32) -> f32 {
-    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
-    let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
-    let r = rough * c0 + c1;
-    let a004 = min(r.x * r.x, exp2(-9.28 * ndv)) * r.x + r.y;
-    let scale = a004 * -1.04 + r.z;
-    let bias = a004 * 1.04 + r.w;
-    return f0 * scale + bias;
-}
-
 fn tonemap(c: vec3<f32>) -> vec3<f32> {
     let a = 2.51; let b = 0.03; let cc = 2.43; let d = 0.59; let e = 0.14;
     return clamp((c * (a * c + b)) / (c * (cc * c + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -1079,7 +999,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let l = normalize(cam.light.xyz);
     if !near_paint(p) && cam.jitter.z <= 0.5 {
         let cs = color_sharp(p);
-        return vec4<f32>(to_srgb(tonemap(cam.ortho.w * lit(normal_bilinear(p), v, l, 1.0, 1.0, cs.rgb, cs.a, 0.0, 0.0, 0.0, vec2<f32>(1.0, 0.0), 1.0))), 1.0);
+        return vec4<f32>(to_srgb(tonemap(cam.ortho.w * lit(normal_bilinear(p), l, 1.0, 1.0, cs.rgb, 1.0))), 1.0);
     }
     let ms = micro_slope(p, detail);
     let bs = base_slope(p);
@@ -1098,14 +1018,6 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     var col = color_sharp(pcw);
     if beauty_mode() && detail.thickness > 0.02e-3 {
         col = vec4<f32>(marble(pcw, col.rgb, detail), col.a);
-    }
-    let thin = 0.3 * (1.0 - smoothstep(0.0, THIN_FILM_MATTE, detail.thickness)) * smoothstep(0.0, 1e-5, detail.thickness);
-    var rough = clamp(col.a + 0.3 * length(ms) + thin, 0.03, 0.95);
-    if beauty_mode() {
-        let paint_cover = smoothstep(0.0, 0.08e-3, detail.thickness);
-        let gloss = DRY_GLOSS_FLOOR + (col.a - DRY_GLOSS_FLOOR) * DRY_GLOSS_SCALE;
-        let patchy = 0.75 + 0.5 * (0.5 + 0.5 * fbm(p / 2.5e-3 + vec2<f32>(6.1, 2.4), 3));
-        rough = clamp(mix(col.a, gloss * patchy, paint_cover) + thin, 0.03, 0.95);
     }
     let z0 = surf_hit(p, detail);
     let sh = shadow_at(p, z0, l);
@@ -1142,41 +1054,13 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let sp = specks(p);
     albedo = mix(albedo, vec3<f32>(0.85, 0.83, 0.8), 0.7 * sp.x * (0.4 + 0.6 * bare));
     albedo *= 1.0 - 0.6 * sp.y;
-    let rough_var = 1.0 + 0.18 * vnoise(p / 0.45e-3 + vec2<f32>(3.0, 8.0)) * painted;
-    let rough_s = clamp(rough * rough_var, 0.03, 0.95);
-    let wetness = wet_bilinear(p);
-    let coat = smoothstep(0.02e-3, 0.25e-3, wetness) * (1.0 - 0.7 * detail.cure) * (1.0 - thin / 0.3);
-    let aniso = clamp(0.7 * detail.brush + 0.5 * detail.knife, 0.0, 0.8) * smoothstep(0.0, 0.15e-3, detail.thickness);
     let falloff = select(1.0, lamp_falloff(p), cam.jitter.z > 0.5);
-    let c = lit(n, v, l, sh, ao, albedo, rough_s, detail.cure, coat, aniso, detail.dir, falloff);
+    let c = lit(n, l, sh, ao, albedo, falloff);
     if cam.jitter.z > 0.5 { return vec4<f32>(select(min(c, vec3<f32>(FIREFLY_CLAMP)), vec3<f32>(0.0), c != c), 1.0); }
     return vec4<f32>(to_srgb(tonemap(c * cam.ortho.w)), 1.0);
 }
 
-fn lit(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, sh: f32, ao: f32, albedo: vec3<f32>, rough: f32, cure: f32, coat: f32, aniso: f32, tdir: vec2<f32>, falloff: f32) -> vec3<f32> {
-    let ndl = max(dot(n, l), 0.0);
-    let ndv = max(dot(n, v), 1e-3);
-    let sun = cam.light.w * falloff;
-    let f_env = env_dfg(F0_PAINT, rough, ndv);
-    let kd = 1.0 - f_env;
-    let ambient = env_radiance(n, 1.0) * ao;
+fn lit(n: vec3<f32>, l: vec3<f32>, sh: f32, ao: f32, albedo: vec3<f32>, falloff: f32) -> vec3<f32> {
     let lambert = select(1.0, 1.0 / PI, beauty_mode());
-    let diffuse = albedo * kd * (sun * ndl * sh * lambert + ambient);
-    var spec = spec_lobe_aniso(n, v, l, rough, F0_PAINT, aniso, tdir);
-    spec += 0.35 * cure * spec_lobe(n, v, l, max(rough, 0.55), F0_PAINT);
-    let direct = spec * sun * ndl * sh;
-    let rv = reflect(-v, n);
-    let occlusion = clamp(pow(ndv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    let env = env_radiance(rv, rough) * f_env * occlusion;
-    let sheen = select(mix(LIVE_SHEEN_FLAT, LIVE_SHEEN_RIDGE, smoothstep(0.04, 0.4, length(n.xy))), 1.0, beauty_mode());
-    let base_spec = select(1.0, 1.0 - coat, beauty_mode()) * sheen;
-    var c = diffuse + (vec3<f32>(direct) + env) * base_spec;
-    if coat > 0.0 {
-        let fc = env_dfg(F0_PAINT, COAT_ROUGH, ndv);
-        let coat_direct = spec_lobe(n, v, l, COAT_ROUGH, F0_PAINT) * sun * ndl * sh;
-        let occ_c = clamp(pow(ndv + ao, exp2(-16.0 * COAT_ROUGH - 1.0)) - 1.0 + ao, 0.0, 1.0);
-        let coat_env = env_radiance(rv, COAT_ROUGH) * fc * occ_c;
-        c = c * (1.0 - coat * fc) + coat * sheen * (vec3<f32>(coat_direct) + coat_env);
-    }
-    return c;
+    return albedo * (cam.light.w * falloff * max(dot(n, l), 0.0) * sh * lambert + env_radiance(n, 1.0) * ao);
 }

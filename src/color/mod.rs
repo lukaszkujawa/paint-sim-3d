@@ -26,6 +26,46 @@ fn unit_tint() -> f32 {
 
 const VIEW_GAIN: [f32; 3] = [1.6, 1.6, 1.78];
 
+const PAINT_VIEW_GAIN: [f32; 3] = [2.63, 2.71, 2.85];
+
+fn tone(x: f32) -> f32 {
+    ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+}
+
+fn untone(y: f32) -> f32 {
+    let (a, b, c, d, e) = (2.51f32, 0.03f32, 2.43f32, 0.59f32, 0.14f32);
+    let y = y.clamp(0.0, 0.995);
+    let qa = a - y * c;
+    let qb = b - y * d;
+    (-qb + (qb * qb + 4.0 * qa * y * e).sqrt()) / (2.0 * qa)
+}
+
+fn srgb_decode(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn srgb_encode(c: f32) -> f32 {
+    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+pub fn paint_shown(paint: [f32; 3], exposure: f32) -> [f32; 3] {
+    let k = exposure.exp2();
+    let mut out = [0.0f32; 3];
+    for i in 0..3 {
+        out[i] = srgb_encode(tone(srgb_decode(paint[i]) * PAINT_VIEW_GAIN[i] * k));
+    }
+    out
+}
+
+pub fn paint_for_shown(shown: [f32; 3], exposure: f32) -> [f32; 3] {
+    let k = exposure.exp2();
+    let mut out = [0.0f32; 3];
+    for i in 0..3 {
+        out[i] = srgb_encode((untone(srgb_decode(shown[i])) / (PAINT_VIEW_GAIN[i] * k)).clamp(0.0, 1.0));
+    }
+    out
+}
+
 pub fn canvas_albedo(shown: [f32; 3]) -> [f32; 3] {
     let dec = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
     let enc = |c: f32| if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };

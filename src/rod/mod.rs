@@ -586,6 +586,7 @@ impl Rod {
         s
     }
 
+    #[cfg(test)]
     fn coarsen_factor(&self, i: usize) -> f64 {
         let s: f64 = (0..i.min(self.x.len().saturating_sub(1))).map(|k| (self.x[k + 1] - self.x[k]).length()).sum();
         coarsen_from_arc(s)

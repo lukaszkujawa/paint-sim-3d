@@ -5,6 +5,7 @@ pub struct Banded {
 }
 
 impl Banded {
+    #[cfg(test)]
     pub fn new(n: usize, b: usize) -> Self {
         Self { n, b, a: vec![0.0; n * (b + 1)] }
     }

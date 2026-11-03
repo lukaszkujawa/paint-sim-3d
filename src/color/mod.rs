@@ -432,3 +432,43 @@ mod canvas_colour_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn shown_colour_round_trips_through_paint() {
+        for ev in [-2.5f32, -1.0, 0.0, 0.5] {
+            for v in [0.1f32, 0.25, 0.5, 0.75, 0.9] {
+                let paint = paint_for_shown([v, v * 0.8, v * 0.6], ev);
+                let back = paint_shown(paint, ev);
+                for ((a, b), p) in back.iter().zip([v, v * 0.8, v * 0.6]).zip(paint) {
+                    if p >= 0.999 {
+                        continue;
+                    }
+                    assert!((a - b).abs() < 2e-3, "ev {ev} v {v}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_exposure_darkens_what_paint_shows() {
+        let paint = [0.4, 0.4, 0.4];
+        assert!(paint_shown(paint, -2.0)[0] < paint_shown(paint, 0.0)[0]);
+    }
+
+    #[test]
+    fn lower_exposure_asks_for_lighter_paint() {
+        let shown = [0.5, 0.5, 0.5];
+        assert!(paint_for_shown(shown, -2.0)[0] > paint_for_shown(shown, 0.0)[0]);
+    }
+
+    #[test]
+    fn extreme_requests_stay_in_range() {
+        for c in paint_for_shown([1.0, 0.0, 1.0], -4.0) {
+            assert!((0.0..=1.0).contains(&c));
+        }
+    }
+}

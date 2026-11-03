@@ -519,3 +519,41 @@ impl Brush {
         }
     }
 }
+
+#[cfg(test)]
+mod pose_tests {
+    use super::*;
+
+    #[test]
+    fn hair_count_follows_area_but_stays_capped() {
+        let small = Brush::build(BrushShape::Round, 40, 0.03, 0.004, 3e-4);
+        let big = Brush::build(BrushShape::Round, 40, 0.03, 0.03, 3e-4);
+        assert!(big.bristles.len() > small.bristles.len());
+        assert!(Brush::build(BrushShape::Flat, 40, 0.03, 0.2, 3e-4).bristles.len() <= MAX_HAIRS);
+    }
+
+    #[test]
+    fn requested_count_is_remembered() {
+        assert_eq!(Brush::build(BrushShape::Round, 77, 0.03, 0.03, 3e-4).requested, 77);
+    }
+
+    #[test]
+    fn flat_brush_needs_more_depth_to_touch_than_a_round_one() {
+        let round = Brush::build(BrushShape::Round, 40, 0.03, 0.03, 3e-4);
+        let flat = Brush::build(BrushShape::Flat, 40, 0.03, 0.03, 3e-4);
+        assert!(round.touch_depth() > 0.0);
+        assert!(flat.touch_depth() > round.touch_depth());
+    }
+
+    #[test]
+    fn dipping_loads_every_hair_within_capacity() {
+        let mut b = Brush::build(BrushShape::Round, 40, 0.03, 0.01, 3e-4);
+        let mut mix = [0.0f32; 16];
+        mix[3] = 1.0;
+        b.dip(&mix);
+        for h in &b.bristles {
+            assert!(h.load > 0.0 && h.load <= b.capacity);
+            assert_eq!(h.comp[3], 1.0);
+        }
+    }
+}

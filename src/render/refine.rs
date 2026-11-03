@@ -17,8 +17,6 @@ pub struct Refine {
     pub fw: u32,
     pub fh: u32,
     pub dx: f32,
-    pub h_fine: wgpu::Buffer,
-    pub m_fine: wgpu::Buffer,
     scratch: wgpu::Buffer,
     weight: wgpu::Buffer,
     params: wgpu::Buffer,
@@ -85,7 +83,7 @@ impl Refine {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&film.detail_view) },
             ],
         });
-        Self { fw, fh, dx: film.dx * 0.5, h_fine, m_fine, scratch, weight, params, bg_h, bg_m, p_up, p_weight, p_ab, p_ba, bg_render, iterations: 24 }
+        Self { fw, fh, dx: film.dx * 0.5, scratch, weight, params, bg_h, bg_m, p_up, p_weight, p_ab, p_ba, bg_render, iterations: 24 }
     }
 
     pub fn run(&self, gpu: &Gpu, film: &Film) {

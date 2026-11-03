@@ -209,6 +209,12 @@ pub fn substrate_refl(n: usize, raw: bool, colour: Option<[f32; 16]>) -> Vec<u32
     v
 }
 
+fn first_refl(v: &[u32]) -> [u32; 8] {
+    let mut out = [0u32; 8];
+    out.copy_from_slice(&v[..8]);
+    out
+}
+
 pub fn weave(w: usize, h: usize, dx: f32, amp: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; w * h];
     if amp <= 0.0 {
@@ -245,6 +251,18 @@ pub struct Contact {
     pub zb: f32,
     pub bristle: u32,
     pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+pub struct RubberParams {
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub radius: f32,
+    pub weave: f32,
+    pub active: u32,
+    pub pad: u32,
+    pub refl: [u32; 8],
 }
 
 #[repr(C)]
@@ -487,6 +505,12 @@ pub struct Film {
     frame: u32,
     pub white_refl: Vec<u32>,
     pub knife_buf: wgpu::Buffer,
+    rubber_buf: wgpu::Buffer,
+    bg_rubber: wgpu::BindGroup,
+    p_rubber: wgpu::ComputePipeline,
+    rubber_active: bool,
+    pub canvas_refl: [u32; 8],
+    pub erased: bool,
     pub scraps: wgpu::Buffer,
     pub scrap_count: wgpu::Buffer,
     pub scrap_read: [wgpu::Buffer; 2],
@@ -639,6 +663,7 @@ impl Film {
         let tile_moved = gpu.storage("tile_moved", nt16 * 4);
         let max_scraps = MAX_SCRAPS as u64;
         let knife_buf = gpu.uniform("knife", std::mem::size_of::<KnifeParams>() as u64);
+        let rubber_buf = gpu.uniform("rubber", std::mem::size_of::<RubberParams>() as u64);
         let scraps = gpu.storage("scraps", max_scraps * 48);
         let scrap_count = gpu.storage("scrap_count", 16);
         let scrap_read = [gpu.readback("scrap_r0", max_scraps * 48 + 16), gpu.readback("scrap_r1", max_scraps * 48 + 16)];
@@ -752,6 +777,7 @@ impl Film {
             .storage(&tile_moved, false)
             .storage(&lay, false)
             .build(&gpu.device, "tiles");
+        let (l_rubber, bg_rubber) = BindBuilder::new(stages).uniform(&rubber_buf).build(&gpu.device, "rubber");
         let (l_knife, bg_knife) = BindBuilder::new(stages)
             .uniform(&knife_buf)
             .storage(&scraps, false)
@@ -772,6 +798,8 @@ impl Film {
         let shade_src = format!("{}\n{}\n{}", common, include_str!("../../shaders/km.wgsl"), include_str!("../../shaders/shade.wgsl"));
         let knife_src = format!("{}\n{}\n{}", common, include_str!("../../shaders/strata.wgsl"), include_str!("../../shaders/knife.wgsl"));
         let sm_knife = gpu.shader("knife", &knife_src);
+        let rubber_src = format!("{}\n{}", common, include_str!("../../shaders/rubber.wgsl"));
+        let sm_rubber = gpu.shader("rubber", &rubber_src);
         let brush_src = format!("{}\n{}\n{}", common, include_str!("../../shaders/strata.wgsl"), include_str!("../../shaders/brush.wgsl"));
         let sm_brush = gpu.shader("brush", &brush_src);
         let sm_film = gpu.shader("film", &film_src);
@@ -821,6 +849,7 @@ impl Film {
         let p_shade = compute_pipeline(d, "shade", &sm_shade, "shade", &[&l0, &l1, &l_shade, &l_tiles]);
         let p_shade_full = compute_pipeline(d, "shade_full", &sm_shade, "shade_full", &[&l0, &l1, &l_shade, &l_tiles]);
         let p_knife = compute_pipeline(d, "knife", &sm_knife, "knife", &[&l0, &l1, &l_knife, &l_tiles]);
+        let p_rubber = compute_pipeline(d, "rubber", &sm_rubber, "rubber", &[&l0, &l1, &l_rubber, &l_tiles]);
         let p_brush = compute_pipeline(d, "brush_scrape", &sm_brush, "brush_scrape", &[&l0, &l1, &l_brush, &l_tiles]);
 
         let params = Params {
@@ -847,7 +876,7 @@ impl Film {
             clock,
             w, h, dx, tiles, settings, params, params_buf,
             h_buf, m_buf, rheo, lap, flux, flux_s, alpha, delta, tmp, acc_s, strata_h, strata_pig, strata_cure,
-            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, white_refl, knife_buf, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, res_tool: [0; 2], contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
+            sub_refl, pigtab, cmf, strata_h2, strata_pig2, alpha_s, stats_buf, tile_flags, tile_list, tile_indirect, active_count, tiles16, bg_tiles, p_mark, p_compact, p_copy_back, p_shade_full, needs_full_shade: true, journal, tile_moved, active_tiles: 0, frame: 0, canvas_refl: first_refl(&white_refl), white_refl, knife_buf, rubber_buf, bg_rubber, p_rubber, rubber_active: false, erased: false, scraps, scrap_count, scrap_read, scrap_pending, knife_active: false, contacts, ctile_range, ctile_items, reservoir, res_read, res_pending, res_tool: [0; 2], contact_count: 0, pool_buf, pool_read, pool_dims, stats_read, stats_pending, stats_frame: 0,
             deposits, tile_start, tile_count, tile_items,
             color_tex, color_view, detail_tex, detail_view, lay, bg0, bg1, bg_fac, bg_dep, bg_shade, bg_knife, p_knife, bg_brush, p_brush,
             p_lap, p_plug, p_flux, p_limit, p_nose, p_shed, p_slump, p_apply, p_split, p_clear_acc, p_commit_tmp, p_reduce, p_pool,
@@ -1016,6 +1045,7 @@ impl Film {
         let ones: Vec<[f32; 2]> = vec![[1.0, 0.0]; n];
         gpu.queue.write_buffer(&self.rheo, 0, bytemuck::cast_slice(&ones));
         self.white_refl = substrate_refl(n, self.settings.raw_canvas, self.settings.canvas_rgb.map(|c| color::reflectance_of(color::canvas_albedo(c), &self.cmf_table)));
+        self.canvas_refl = first_refl(&self.white_refl);
         gpu.queue.write_buffer(&self.sub_refl, 0, bytemuck::cast_slice(&self.white_refl));
         let wv = weave(self.w as usize, self.h as usize, self.dx, self.settings.weave_um * 1e-6);
         self.weave_volume = wv.iter().map(|v| *v as f64).sum::<f64>() * (self.dx as f64) * (self.dx as f64);
@@ -1039,6 +1069,23 @@ impl Film {
             self.touch_rect(minx, miny, maxx, maxy);
         }
         gpu.queue.write_buffer(&self.knife_buf, 0, bytemuck::bytes_of(&p));
+    }
+
+    pub fn set_rubber(&mut self, gpu: &Gpu, seg: Option<([f32; 2], [f32; 2], f32)>) {
+        let Some((a, b, radius)) = seg else {
+            if self.rubber_active {
+                self.rubber_active = false;
+                self.needs_full_shade = true;
+                gpu.queue.write_buffer(&self.rubber_buf, 0, bytemuck::bytes_of(&RubberParams::default()));
+            }
+            return;
+        };
+        self.rubber_active = true;
+        self.erased = true;
+        let reach = radius + self.dx;
+        self.touch_rect(a[0].min(b[0]) - reach, a[1].min(b[1]) - reach, a[0].max(b[0]) + reach, a[1].max(b[1]) + reach);
+        let p = RubberParams { a, b, radius, weave: self.settings.weave_um * 1e-6, active: 1, pad: 0, refl: self.canvas_refl };
+        gpu.queue.write_buffer(&self.rubber_buf, 0, bytemuck::bytes_of(&p));
     }
 
     pub fn upload_contacts(&mut self, gpu: &Gpu, cs: &[Contact]) {
@@ -1347,6 +1394,10 @@ impl Film {
             if self.knife_active {
                 mk(&mut pass, "knife");
                 dispatch(&mut pass, &self.p_knife, &[&self.bg0, &self.bg1, &self.bg_knife, g], gx, gy, 1);
+            }
+            if self.rubber_active {
+                mk(&mut pass, "rubber");
+                dispatch(&mut pass, &self.p_rubber, &[&self.bg0, &self.bg1, &self.bg_rubber, g], gx, gy, 1);
             }
             mk(&mut pass, "mark");
             dispatch(&mut pass, &self.p_mark, &[&self.bg0, &self.bg1, &self.bg_fac, g], self.tiles16[0], self.tiles16[1], 1);

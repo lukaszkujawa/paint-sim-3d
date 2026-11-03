@@ -21,7 +21,6 @@ const HOVER: f64 = 0.004;
 const PRESS_PER_SIZE: f64 = 1.0;
 const PRESS_MIN: f64 = 0.0005;
 const APPROACH_STEPS: f64 = 4.0;
-const BRUSH_REST: f64 = 0.75;
 const TRAVEL_PER_SIZE: f64 = 1.0;
 const REFINEMENTS: usize = 16;
 const TILE: usize = 8;
@@ -121,7 +120,6 @@ const TONE_LOW: f32 = 0.01;
 const TONE_HIGH: f32 = 0.995;
 const TONE_MIN_SPAN: f32 = 20.0;
 const TONE_GAMMA: f32 = 1.3;
-const BRISTLE_TRAIL: f64 = 0.17;
 const LOAD_SIZE: f64 = 0.016;
 const STRIDE_HW: f32 = 6.0;
 const LOAD_MAX: f64 = 10.0;
@@ -382,6 +380,7 @@ fn tool_range(kind: ToolKind, shape: BrushShape) -> Option<ToolRange> {
         ToolKind::Bottle => r(0.0005, 0.006, 1.5, (6.0, 30.0), 0.2),
         ToolKind::Bucket => r(0.003, 0.03, 1.0, (6.0, 30.0), 0.4),
         ToolKind::Knife => r(0.005, 0.15, 0.5, (1.5, 7.0), 0.15),
+        ToolKind::Rubber => None,
     }
 }
 
@@ -2381,6 +2380,7 @@ impl App {
             ToolKind::Bottle => self.tool.bottle_radius,
             ToolKind::Bucket => self.tool.bucket_radius,
             ToolKind::Knife => self.tool.knife_width,
+            ToolKind::Rubber => self.rubber_size,
         }
     }
 
@@ -2399,6 +2399,7 @@ impl App {
             ToolKind::Bottle => self.tool.bottle_radius = size,
             ToolKind::Bucket => self.tool.bucket_radius = size,
             ToolKind::Knife => self.tool.knife_width = size,
+            ToolKind::Rubber => self.rubber_size = size,
         }
     }
 
@@ -2556,17 +2557,15 @@ impl App {
                         self.prepare_tool(&plan);
                         ev.applied(self.tool_size(plan.kind));
                         self.begin_stroke();
-                        let (from, dir) = plan.entry();
-                        let p = from + dir * self.trail(&plan);
-                        self.tool.pos = DVec3::new(p.x, p.y, z);
+                        let (from, _) = plan.entry();
+                        self.tool.pos = DVec3::new(from.x, from.y, z);
                         Phase::Lower(plan, 0)
                     }
                 }
             }
             Phase::Lower(plan, n) => {
-                let (from, dir) = plan.entry();
-                let p = from + dir * self.trail(&plan);
-                self.tool.pos = DVec3::new(p.x, p.y, z);
+                let (from, _) = plan.entry();
+                self.tool.pos = DVec3::new(from.x, from.y, z);
                 let thread = is_thread(plan.kind);
                 self.tool.flowing = thread;
                 let fall = if thread { ((2.0 * z / 9.81).sqrt() / self.sim_dt.max(1e-6)).ceil() as u32 } else { 0 };
@@ -2581,7 +2580,7 @@ impl App {
             Phase::Approach(plan, s) => {
                 let s1 = (s + (plan.lead / APPROACH_STEPS).min(plan.speed * self.sim_dt)).min(plan.lead);
                 let (from, dir) = plan.entry();
-                let p = from + dir * (s1 + self.trail(&plan));
+                let p = from + dir * s1;
                 self.tool.pos = DVec3::new(p.x, p.y, z);
                 self.tool.vel = DVec3::new(dir.x, dir.y, 0.0) * plan.speed;
                 self.tool.flowing = true;
@@ -2596,7 +2595,7 @@ impl App {
             Phase::Exit(plan, s) => {
                 let s1 = (s + (plan.lead / APPROACH_STEPS).min(plan.speed * self.sim_dt)).min(plan.lead);
                 let dir = plan.exit_dir();
-                let p = *plan.path.last().unwrap() + dir * (s1 + self.trail(&plan));
+                let p = *plan.path.last().unwrap() + dir * s1;
                 self.tool.pos = DVec3::new(p.x, p.y, z);
                 self.tool.vel = DVec3::new(dir.x, dir.y, 0.0) * plan.speed;
                 self.tool.flowing = true;
@@ -2611,8 +2610,7 @@ impl App {
                 let total = plan.length();
                 let travel = if plan.kind == ToolKind::Brush { (plan.speed * self.sim_dt).min(TRAVEL_PER_SIZE * plan.size) } else { plan.speed * self.sim_dt };
                 let s1 = (s + travel).min(total);
-                let lag = self.trail(&plan);
-                let (p0, p1) = (plan.ahead(s + lag), plan.ahead(s1 + lag));
+                let (p0, p1) = (plan.ahead(s), plan.ahead(s1));
                 let z = if plan.kind == ToolKind::Brush {
                     self.tool.height = self.brush.len - self.evo.stroke_press * press_profile(s1, total, plan.size);
                     self.tool.height
@@ -2671,10 +2669,6 @@ impl App {
         }
     }
 
-    fn trail(&self, plan: &Plan) -> f64 {
-        if plan.kind == ToolKind::Brush { BRISTLE_TRAIL * self.brush.len } else { 0.0 }
-    }
-
     fn brush_hover(&self) -> f64 {
         (self.brush.len - self.tool.height).max(0.0) + HOVER
     }
@@ -2694,9 +2688,7 @@ impl App {
                     let (shape, n) = (self.brush.shape, self.brush.bristles.len());
                     self.rebuild_brush(shape, n, len, plan.size);
                 }
-                let len = self.brush.len;
-                let user = self.evo.saved_height.filter(|h| *h < len - PRESS_MIN).unwrap_or(BRUSH_REST * len);
-                let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, (self.brush.len - user).max(PRESS_MIN));
+                let press = (PRESS_PER_SIZE * plan.size).clamp(PRESS_MIN, self.brush_press(self.brush_pressure).max(PRESS_MIN));
                 let press = press * (1.0 + PRESS_JITTER * (2.0 * rand::random::<f64>() - 1.0));
                 self.evo.stroke_press = press;
                 self.tool.height = self.brush.len - press * PRESS_START;
@@ -2718,6 +2710,7 @@ impl App {
                 self.tool.stick_diameter = plan.size;
                 self.tool.reload();
             }
+            ToolKind::Rubber => {}
             ToolKind::Bottle => self.tool.bottle_radius = plan.size,
             ToolKind::Bucket => self.tool.bucket_radius = plan.size,
             ToolKind::Knife => {

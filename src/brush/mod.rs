@@ -1,4 +1,5 @@
 use crate::film::Contact;
+use crate::gizmo::push_box;
 use crate::tools::{push_tube, TubeVertex};
 use glam::DVec3;
 use rayon::prelude::*;
@@ -17,8 +18,17 @@ const PACK: f64 = 0.9;
 const FILL: f64 = 0.6;
 const HAIR_MIN: f64 = 2.0e-5;
 const COHESION: f64 = 0.5;
+const FERRULE_COL: [f32; 3] = [0.62, 0.62, 0.6];
+const HANDLE_COL: [f32; 3] = [0.36, 0.2, 0.1];
 const SPREAD: f64 = 2.5;
-const SPLAY: f64 = 4.0;
+const CONTACT_LOAD: f64 = 0.2;
+const TILT: f64 = 0.6;
+const TOUCH_PER_LEN: f64 = 0.05;
+const TILT_STEER: f64 = 0.5;
+const TIP_ANCHOR: f64 = 1.0;
+const FLAT_FAN: f64 = 0.12;
+const FERRULE_LEN: f64 = 0.018;
+const HANDLE_LEN: f64 = 0.09;
 const FILM: f64 = 1.2e-4;
 const RELEASE_REF: f64 = 1.5;
 const SWEEP_MIN: f64 = 0.25;
@@ -88,6 +98,9 @@ pub struct Brush {
     pub placed: bool,
     pub handle: DVec3,
     pub touching: usize,
+    pub lean: DVec3,
+    pub ferrule: DVec3,
+    pub up: DVec3,
 }
 
 impl Brush {
@@ -101,14 +114,15 @@ impl Brush {
         let mut bristles = Vec::with_capacity(n);
         let blank = |k: usize, root: DVec3, rest: DVec3| {
             let thick = 0.65 + 0.7 * hash01(k, 11);
-            let clump = (hash01(k / 3, 23) - 0.5) * 0.22;
+            let clump = (hash01(k / 3, 23) - 0.5) * 0.22 * (size / len).min(1.0);
             let lean = DVec3::new(rest.x + clump * (hash01(k / 3, 29) - 0.5), rest.y + clump * (hash01(k / 3, 31) - 0.5), rest.z).normalize();
             Bristle { pts: vec![DVec3::ZERO; segs + 1], prev: vec![DVec3::ZERO; segs + 1], root, rest: lean, dirs: vec![lean; segs], seg: len / segs as f64, rho: Vec::new(), rr: Vec::new(), rn: 0.0, out: DVec3::ZERO, load: 0.0, comp: [0.0; 16], touch: vec![false; segs + 1], last: vec![DVec3::ZERO; segs + 1], was: vec![false; segs + 1], thick }
         };
         let lemon = |k: usize, rj: f64, a: f64, ferrule_r: f64| {
             let rn = (rj / ferrule_r).min(1.0);
             let reach = (1.0 - TAPER * rn * rn) * (1.0 + 0.01 * (hash01(k, 17) - 0.5));
-            let (cx, cy) = (CLUMP * (hash01(k / 3, 29) - 0.5), CLUMP * (hash01(k / 3, 31) - 0.5));
+            let spread = CLUMP * (size / len).min(1.0);
+            let (cx, cy) = (spread * (hash01(k / 3, 29) - 0.5), spread * (hash01(k / 3, 31) - 0.5));
             let node = |i: usize| {
                 let u = reach * i as f64 / segs as f64;
                 let rho = rj * (1.0 + BELLY * u) * (1.0 - u).max(0.0).powf(POINT);
@@ -151,7 +165,7 @@ impl Brush {
                     let x = (-0.5 + (c + 0.5 + 0.9 * jx) / cols as f64) * width;
                     let y = (-0.5 + (r + 0.5 + 0.9 * jy) / rows as f64) * thick;
                     let root = DVec3::new(x, y, 0.0);
-                    let rest = DVec3::new(0.3 * x / (0.5 * width), 0.15 * y / (0.5 * thick), -1.0).normalize();
+                    let rest = DVec3::new(FLAT_FAN * x / len, FLAT_FAN * y / len, -1.0).normalize();
                     bristles.push(blank(k, root, rest));
                 }
                 (0.5 * width, width, width * (0.18 * width).max(thick))
@@ -161,11 +175,16 @@ impl Brush {
         let hair = radius;
         let radius = hair.min(ferrule_r * (FILL / n.max(1) as f64).sqrt()).max(HAIR_MIN);
         let capacity = BASE_CAPACITY * (area / BASE_AREA).sqrt() * (len / BASE_LEN);
-        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0 }
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0, lean: DVec3::X, ferrule: DVec3::ZERO, up: DVec3::Z }
     }
 
     pub fn size(&self) -> f64 {
         self.width
+    }
+
+    pub fn touch_depth(&self) -> f64 {
+        let thick = if self.shape == BrushShape::Flat { (0.18 * self.width).clamp(1.5e-3, 6.0e-3).min(self.width) } else { 0.0 };
+        TOUCH_PER_LEN * self.len + 0.5 * thick * TILT.sin()
     }
 
     fn rooted(&self, root: DVec3) -> DVec3 {
@@ -265,7 +284,7 @@ impl Brush {
         let stiffness = self.stiffness;
         let friction = self.friction;
         let capacity = self.capacity;
-        let ferrule = self.ferrule_r;
+        let ferrule_r = self.ferrule_r;
         let vel = if self.placed { (handle - self.handle) / dt.max(1e-6) } else { DVec3::ZERO };
         let speed = vel.truncate().length();
         if self.shape == BrushShape::Flat && speed > STEER_MIN_SPEED {
@@ -279,15 +298,38 @@ impl Brush {
             }
             self.angle += d * (speed * dt / (STEER_DIST * self.width)).min(1.0);
         }
-        let roots: Vec<DVec3> = self.bristles.iter().map(|b| self.rooted(b.root)).collect();
+        if speed > STEER_MIN_SPEED {
+            let k = (speed * dt / (TILT_STEER * self.len)).min(1.0);
+            self.lean += (DVec3::new(vel.x, vel.y, 0.0) / speed - self.lean) * k;
+        }
+        let mut amount = self.lean.length().min(1.0);
+        let mut along = if amount > 1e-6 { self.lean / self.lean.length() } else { DVec3::X };
+        if self.shape == BrushShape::Flat {
+            let (sb, cb) = self.angle.sin_cos();
+            let normal = DVec3::new(-sb, cb, 0.0);
+            let face = along.dot(normal);
+            amount *= face.abs();
+            along = if face < 0.0 { -normal } else { normal };
+        }
+        let side = DVec3::new(-along.y, along.x, 0.0);
+        let (st, ct) = (TILT * amount).sin_cos();
+        let tilted = move |v: DVec3| {
+            let (a, s, z) = (v.dot(along), v.dot(side), v.z);
+            along * (a * ct + z * st) + side * s + DVec3::Z * (z * ct - a * st)
+        };
+        let ferrule = DVec3::new(handle.x, handle.y, handle.z - self.len * (1.0 - ct)) + along * (self.len * st * TIP_ANCHOR);
+        self.ferrule = ferrule;
+        self.up = tilted(DVec3::Z);
+        let roots: Vec<DVec3> = self.bristles.iter().map(|b| tilted(self.rooted(b.root))).collect();
         let (sa, ca) = self.angle.sin_cos();
         let turn = move |v: DVec3| DVec3::new(ca * v.x - sa * v.y, sa * v.x + ca * v.y, v.z);
+        let frame = move |v: DVec3| tilted(turn(v));
         if !self.placed || (handle - self.handle).length() > 0.1 {
             for (b, root) in self.bristles.iter_mut().zip(&roots) {
-                b.pts[0] = handle + *root;
+                b.pts[0] = ferrule + *root;
                 b.prev[0] = b.pts[0];
                 for i in 1..=segs {
-                    b.pts[i] = b.pts[i - 1] + turn(b.dirs[i - 1]) * b.seg;
+                    b.pts[i] = b.pts[i - 1] + frame(b.dirs[i - 1]) * b.seg;
                     b.prev[i] = b.pts[i];
                 }
             }
@@ -298,7 +340,7 @@ impl Brush {
         let press = ((self.len + floor(handle.x, handle.y) - handle.z) / self.len).clamp(0.0, 1.0);
         let inv = 1.0 / self.bristles.len().max(1) as f64;
         for b in self.bristles.iter_mut().zip(roots.iter()) {
-            b.0.pts[0] = handle + *b.1;
+            b.0.pts[0] = ferrule + *b.1;
         }
         for _ in 0..8 {
             let axis: Vec<DVec3> = if packed { (0..=segs).map(|i| self.bristles.iter().map(|b| b.pts[i]).sum::<DVec3>() * inv).collect() } else { Vec::new() };
@@ -309,27 +351,28 @@ impl Brush {
                 let friction = friction * (1.0 - LUBE * wet);
                 let hold = COHESION * (0.3 + 0.7 * wet);
                 for i in 1..=segs {
-                    let dir_prev = if i == 1 { turn(b.dirs[0]) } else { ((b.pts[i - 1] - b.pts[i - 2]).normalize_or_zero() + turn(b.dirs[i - 1] - b.dirs[i - 2])).normalize_or_zero() };
+                    let dir_prev = if i == 1 { frame(b.dirs[0]) } else { ((b.pts[i - 1] - b.pts[i - 2]).normalize_or_zero() + frame(b.dirs[i - 1] - b.dirs[i - 2])).normalize_or_zero() };
                     let target = b.pts[i - 1] + dir_prev * l;
                     let cur = b.pts[i];
                     b.pts[i] = cur + (target - cur) * stiffness;
                     let zs = floor(b.pts[i].x, b.pts[i].y) + radius;
                     if b.pts[i].z < zs {
+                        let load = ((zs - b.pts[i].z) / (CONTACT_LOAD * l)).min(1.0);
                         b.pts[i].z = zs;
                         let d = b.prev[i] - b.pts[i];
                         let cur = b.pts[i];
-                        b.pts[i] = DVec3::new(cur.x + d.x * friction, cur.y + d.y * friction, cur.z);
+                        b.pts[i] = DVec3::new(cur.x + d.x * friction * load, cur.y + d.y * friction * load, cur.z);
                     }
                     if packed {
                         let off = DVec3::new(b.pts[i].x - axis[i].x, b.pts[i].y - axis[i].y, 0.0);
                         let radial = off.dot(out);
-                        let floor_r = b.rho[i] + SPLAY * press * ferrule * b.rn * (i as f64 / segs as f64);
+                        let floor_r = b.rho[i];
                         if radial < floor_r {
                             b.pts[i] += out * (floor_r - radial);
                         }
                         let off = DVec3::new(b.pts[i].x - axis[i].x, b.pts[i].y - axis[i].y, 0.0);
                         let r = off.length();
-                        let rmax = b.rr[i] + SPREAD * press * ferrule + 2.0 * radius;
+                        let rmax = b.rr[i] + SPREAD * press * ferrule_r + 2.0 * radius;
                         if r > rmax {
                             b.pts[i] -= off * ((r - rmax) / r * hold);
                         }
@@ -432,6 +475,18 @@ impl Brush {
     }
 
     pub fn mesh(&self, verts: &mut Vec<TubeVertex>, idx: &mut Vec<u32>, paint_col: &dyn Fn(&[f32; 16]) -> [f32; 3], rmin: f64) {
+        let top = self.ferrule + self.up * FERRULE_LEN;
+        let grip = (0.5 * self.width).clamp(0.003, 0.009);
+        if self.shape == BrushShape::Flat {
+            let (s, c) = self.angle.sin_cos();
+            let wide = DVec3::new(c, s, 0.0);
+            let across = self.up.cross(wide).normalize_or_zero();
+            let thick = (0.09 * self.width).clamp(0.00075, 0.003) + 0.0005;
+            push_box(verts, idx, self.ferrule + self.up * (0.5 * FERRULE_LEN), wide * (0.5 * self.width), across * thick, self.up * (0.5 * FERRULE_LEN), FERRULE_COL);
+        } else {
+            push_tube(verts, idx, &[self.ferrule, top], self.ferrule_r.max(rmin), FERRULE_COL);
+        }
+        push_tube(verts, idx, &[top, top + self.up * HANDLE_LEN], grip, HANDLE_COL);
         for b in &self.bristles {
             let f = (b.load / self.capacity).clamp(0.0, 1.0) as f32;
             let pc = if f > 0.0 { paint_col(&b.comp) } else { [0.0; 3] };

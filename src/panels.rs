@@ -21,15 +21,16 @@ const OK: Color32 = Color32::from_rgb(104, 178, 128);
 const WARN: Color32 = Color32::from_rgb(214, 172, 92);
 const INFO: Color32 = Color32::from_rgb(150, 178, 214);
 
-const TOOLS: [(ToolKind, &str, &str, &str); 8] = [
-    (ToolKind::Stick, "Stick", "1", "Drip paint from a loaded stick"),
-    (ToolKind::Bottle, "Bottle", "2", "Squeeze a thin steady thread"),
-    (ToolKind::Bucket, "Bucket", "3", "Pour a heavy stream"),
-    (ToolKind::Pour, "Pour", "4", "Lay paint straight onto the canvas"),
-    (ToolKind::Knife, "Knife", "5", "Drag a palette knife through the paint"),
-    (ToolKind::Brush, "Brush", "6", "Press a bristle brush onto the canvas"),
-    (ToolKind::Roller, "Roller", "7", "Roll an even coat; picks up wet paint as it goes"),
+const TOOLS: [(ToolKind, &str, &str, &str); 9] = [
+    (ToolKind::Brush, "Brush", "1", "Press a bristle brush onto the canvas"),
+    (ToolKind::Roller, "Roller", "2", "Roll an even coat; picks up wet paint as it goes"),
+    (ToolKind::Knife, "Knife", "3", "Drag a palette knife through the paint"),
+    (ToolKind::Stick, "Stick", "4", "Drip paint from a loaded stick"),
+    (ToolKind::Bottle, "Bottle", "5", "Squeeze a thin steady thread"),
+    (ToolKind::Bucket, "Bucket", "6", "Pour a heavy stream"),
+    (ToolKind::Pour, "Pour", "7", "Lay paint straight onto the canvas"),
     (ToolKind::Sponge, "Sponge", "8", "Dab or drag porous texture; a clean sponge lifts wet paint"),
+    (ToolKind::Rubber, "Rubber", "9", "Scrape away paint and texture, wet or dry, down to bare canvas"),
 ];
 
 pub fn apply_style(ctx: &egui::Context) {
@@ -417,6 +418,15 @@ impl App {
             self.sponge_settings(ui);
             return;
         }
+        if self.tool.kind == ToolKind::Rubber {
+            num(ui, "Size", &mut self.rubber_size, crate::RUBBER_MIN, crate::RUBBER_MAX, 1e3, " mm", true);
+            ui.add(egui::Label::new(RichText::new("Drag to remove everything under the rubber, wet or dry, right down to the bare canvas and its weave. The wheel sets the size, and a pen clears a wider path the harder you press. Wet paint beside the cleared area can still flow back in.").small().weak()).wrap());
+            return;
+        }
+        if self.tool.kind == ToolKind::Brush {
+            self.brush_settings(ui);
+            return;
+        }
         num(ui, "Height", &mut self.tool.height, 0.002, 1.0, 100.0, " cm", true);
         match self.tool.kind {
             ToolKind::Stick => {
@@ -463,8 +473,7 @@ impl App {
                 });
                 ui.add(egui::Label::new(RichText::new("Drag to level the paint under the blade to the gap. Excess is carried on the blade and spread into thin or bare spots further on; surplus squeezes out as ridges along both ends, and lifting the knife leaves an end ridge.").small().weak()).wrap());
             }
-            ToolKind::Brush => self.brush_settings(ui),
-            ToolKind::Roller | ToolKind::Sponge => {}
+            ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge | ToolKind::Rubber => {}
         }
     }
 
@@ -522,6 +531,7 @@ impl App {
         let mut size = self.brush.size() * 1e3;
         let mut len = self.brush.len * 1e3;
         let mut n = self.brush.bristles.len();
+        num_hint(ui, "Pressure", "How hard the brush presses. The mouse wheel changes it; a pen sets it directly.", &mut self.brush_pressure, 0.0, 1.0, 100.0, " %", false);
         let c1 = num(ui, if shape == brush::BrushShape::Flat { "Width" } else { "Diameter" }, &mut size, 0.1, 150.0, 1.0, " mm", true);
         let c2 = num(ui, "Bristle length", &mut len, 10.0, 60.0, 1.0, " mm", false);
         let c3 = num(ui, "Bristles", &mut n, 16.0, 400.0, 1.0, "", false);

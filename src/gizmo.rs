@@ -31,6 +31,7 @@ pub struct GizmoCtx {
     pub px: f64,
     pub knife_gap: f64,
     pub sponge_radius: f64,
+    pub rubber_radius: f64,
     pub knife_fill: f32,
     pub knife_paint: [f32; 3],
     pub pour_radius: f64,
@@ -227,6 +228,11 @@ pub fn tool_gizmo(verts: &mut Vec<TubeVertex>, idx: &mut Vec<u32>, tool: &Tool, 
         ToolKind::Sponge => {
             if let (Some(g), false) = (cx.ground, tool.flowing) {
                 push_ring(verts, idx, DVec3::new(g.x, g.y, SURFACE_LIFT), cx.sponge_radius, line * 0.7, ACCENT);
+            }
+        }
+        ToolKind::Rubber => {
+            if let Some(g) = cx.ground {
+                push_ring(verts, idx, DVec3::new(g.x, g.y, SURFACE_LIFT), cx.rubber_radius, line * 0.7, ACCENT);
             }
         }
         ToolKind::Brush | ToolKind::Roller => {}

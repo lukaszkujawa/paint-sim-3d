@@ -6,6 +6,7 @@ use std::time::Instant;
 const MAGIC: &[u8; 4] = b"PSIM";
 const VERSION: u32 = 1;
 const EXPOSURE_TAG: &[u8; 4] = b"EXPO";
+const CANVAS_TAG: &[u8; 4] = b"CANV";
 const CHUNK: usize = 32 << 20;
 const MAX_LEVELS: usize = 64;
 const MAX_FULL: usize = 3;
@@ -264,6 +265,8 @@ impl App {
         out.extend_from_slice(&blob);
         out.extend_from_slice(EXPOSURE_TAG);
         out.extend_from_slice(&self.renderer.exposure.to_le_bytes());
+        out.extend_from_slice(CANVAS_TAG);
+        out.extend_from_slice(bytemuck::cast_slice(&self.film.canvas_refl));
         let ok = std::fs::write(&path, &out).is_ok();
         if ok {
             self.thumbnail(&path);
@@ -306,6 +309,11 @@ impl App {
             return;
         }
         self.restore_exposure();
+        if let Some(tail) = data.len().checked_sub(36).map(|o| &data[o..]).filter(|t| &t[..4] == CANVAS_TAG) {
+            for (k, word) in tail[4..].chunks_exact(4).enumerate() {
+                self.film.canvas_refl[k] = u32::from_le_bytes(word.try_into().unwrap());
+            }
+        }
         let s = &mut self.film.settings;
         s.tilt_deg = f(16);
         s.tilt_dir_deg = f(20);

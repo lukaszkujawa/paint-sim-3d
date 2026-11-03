@@ -27,6 +27,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+pub(crate) const RUBBER_MIN: f64 = 0.002;
+pub(crate) const RUBBER_MAX: f64 = 0.3;
+const RUBBER_PEN_LIGHT: f64 = 0.35;
 const KNIFE_TURN_MIN: f64 = 2.0e-4;
 const KNIFE_TURN_DIST: f64 = 0.04;
 const KNIFE_CAPACITY_PER_WIDTH: f64 = 5.0e-5;
@@ -46,7 +49,7 @@ const PEN_FLOW_MIN: f64 = 0.1;
 const PEN_FLOW_MAX: f64 = 1.5;
 const PEN_WIDTH_MIN: f32 = 0.35;
 const PEN_KNIFE_CLOSE: f64 = 0.9;
-const PEN_BRUSH_PRESS: f64 = 0.4;
+const PEN_BRUSH_PRESS: f64 = 0.25;
 const PEN_PRESS_DIAMETERS: f64 = 3.0;
 const HOLD_MIN: f64 = 0.02;
 const HOLD_SPAN: f64 = 0.6;
@@ -126,6 +129,7 @@ struct App {
     auto_quality: bool,
     frame_budget_ms: f32,
     brush_sink: f64,
+    pub(crate) brush_pressure: f64,
     brush_raise: f64,
     brush_z: Option<f64>,
     brush_hold: f64,
@@ -144,6 +148,9 @@ struct App {
     paint: color::PaintMix,
     pour_rate: f32,
     pour_radius: f32,
+    rubber_size: f64,
+    rubber_prev: Option<DVec3>,
+    rubber_seg: Option<([f32; 2], [f32; 2], f32)>,
     fps: f32,
     sim_time: f32,
     paused: bool,
@@ -330,6 +337,7 @@ impl App {
             auto_quality: std::env::var("PAINT_NO_AUTOQ").is_err(),
             frame_budget_ms: 14.0,
             brush_sink: 0.88,
+            brush_pressure: 0.5,
             brush_raise: 0.0,
             brush_z: None,
             brush_hold: 0.0,
@@ -348,6 +356,9 @@ impl App {
             paint,
             pour_rate: 2.0e-6,
             pour_radius: 0.004,
+            rubber_size: 0.03,
+            rubber_prev: None,
+            rubber_seg: None,
             fps: 0.0,
             sim_time: 0.0,
             paused: false,
@@ -357,6 +368,11 @@ impl App {
             stats: String::new(),
         };
         app.sync_pal_picks();
+        if app.auto.is_none() {
+            app.tool.kind = ToolKind::Brush;
+            app.prev_kind = ToolKind::Brush;
+            app.height_kind = ToolKind::Brush;
+        }
         if let Some(path) = std::env::args().skip(1).filter(|_| app.auto.is_none()).find(|a| !a.starts_with("--") && std::path::Path::new(a).is_file() && ["jpg", "jpeg", "png", "webp", "bmp"].iter().any(|e| a.to_lowercase().ends_with(e))) {
             app.load_photo(std::path::Path::new(&path));
         }
@@ -485,8 +501,8 @@ impl App {
         self.history.name.clear();
     }
 
-    fn brush_press(&self, pressure: f64) -> f64 {
-        pressure * (PEN_BRUSH_PRESS * self.brush.len).min(PEN_PRESS_DIAMETERS * self.brush.size())
+    pub(crate) fn brush_press(&self, pressure: f64) -> f64 {
+        self.brush.touch_depth() + pressure * (PEN_BRUSH_PRESS * self.brush.len).min(PEN_PRESS_DIAMETERS * self.brush.size())
     }
 
     fn rebuild_brush(&mut self, shape: brush::BrushShape, n: usize, len: f64, size: f64) {
@@ -506,6 +522,7 @@ impl App {
         let mut b = brush::Brush::build(shape, n, len, size, radius);
         b.stiffness = st;
         b.angle = old.angle;
+        b.lean = old.lean;
         b.friction = fr;
         b.release = rl;
         if load > 0.0 && cap > 0.0 {
@@ -970,6 +987,50 @@ impl App {
             let x = w * 0.5 - 0.035 + 0.07 * s;
             let wave = if pi == 3 { (s * std::f64::consts::TAU).sin() * (size * 1.5).max(0.003) } else { 0.0 };
             self.tool.pos = DVec3::new(x, y + wave, self.tool.height);
+            return true;
+        }
+        if a.script == "brushlab" {
+            const SPECS: [(brush::BrushShape, f64); 6] = [(brush::BrushShape::Round, 3.0), (brush::BrushShape::Round, 8.0), (brush::BrushShape::Round, 20.0), (brush::BrushShape::Flat, 5.0), (brush::BrushShape::Flat, 20.0), (brush::BrushShape::Flat, 70.0)];
+            const PRESSURES: [f64; 3] = [0.15, 0.5, 1.0];
+            let f = self.frame_index;
+            let period = 200u64;
+            let k = (f.saturating_sub(1) / period) as usize;
+            let t = f.saturating_sub(1) % period;
+            let (row, col) = (k / PRESSURES.len(), k % PRESSURES.len());
+            if row >= SPECS.len() {
+                self.tool.flowing = false;
+                self.tool.pos = DVec3::new(0.02, 0.02, 0.2);
+                return true;
+            }
+            self.tool.kind = ToolKind::Brush;
+            self.prev_kind = ToolKind::Brush;
+            let (shape, mm) = SPECS[row];
+            if t == 0 {
+                let (n, len) = (self.brush.bristles.len(), self.brush.len);
+                self.rebuild_brush(shape, n, len, mm * 1e-3);
+                let mut p = color::PaintMix::pure(1);
+                p.frac[13] = 40.0;
+                p.frac[14] = (20f32).ln() + 10.0;
+                self.brush.capacity = self.brush.base_capacity * (mm * 1e-3 / 0.016).clamp(1.0, 10.0);
+                self.brush.clean();
+                self.brush.dip(&p.frac);
+                self.paint.frac = p.frac;
+            }
+            self.tool.height = self.brush.len - self.brush_press(PRESSURES[col]);
+            let (x0, y0) = (0.07 + col as f64 * 0.38, 0.07 + row as f64 * 0.125);
+            let (x, y, down) = match t {
+                0..=9 => (x0 - 0.03 + 0.003 * t as f64, y0, false),
+                10..=59 => (x0, y0, true),
+                60..=79 => (x0 + 0.06 * (t - 60) as f64 / 20.0, y0, false),
+                80..=179 => {
+                    let s = (t - 80) as f64 / 100.0;
+                    let bend = if s > 0.6 { 0.03 * ((s - 0.6) / 0.4) * ((s - 0.6) / 0.4) } else { 0.0 };
+                    (x0 + 0.06 + 0.22 * s, y0 + bend, true)
+                }
+                _ => (x0 + 0.28, y0 + 0.03, false),
+            };
+            self.tool.flowing = down;
+            self.tool.pos = DVec3::new(x, y, self.tool.height);
             return true;
         }
         if a.script == "brushpress" {
@@ -1834,6 +1895,10 @@ impl App {
         self.film.s_max = smax;
         let vol = sum * dx * dx;
         let volm = summ * dx * dx - self.film.weave_volume;
+        if self.film.erased {
+            self.film.total_deposited = vol + volm + self.tool_scraped - self.tool_released;
+            self.film.erased = false;
+        }
         {
             let (imax, _) = hv.iter().enumerate().fold((0usize, 0.0f32), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
             let w = self.film.w as usize;
@@ -1999,6 +2064,8 @@ impl App {
             self.held_deposits.extend_from_slice(&all[sent..]);
         }
         self.film.set_knife(&self.gpu, knife);
+        let seg = self.rubber_seg.take();
+        self.film.set_rubber(&self.gpu, seg);
         let substeps = self.film.choose_substeps(frame_dt);
         self.film.update_params(&self.gpu, frame_dt, substeps);
         self.film.flush_journal(&self.gpu);
@@ -2159,6 +2226,27 @@ impl App {
                     self.save_painting("roundtrip2");
                 }
             }
+            if script.starts_with("undorubber") {
+                if f == 5 {
+                    let args: Vec<String> = std::env::args().collect();
+                    if let Some(v) = args.windows(2).find(|p| p[0] == "--canvas").map(|p| p[1].clone()) {
+                        let c: Vec<f32> = v.split(',').filter_map(|t| t.parse().ok()).collect();
+                        self.start_canvas(CanvasChoice { res: self.film.w, colour: (c.len() >= 3).then(|| [c[0], c[1], c[2]]), weave: true, custom: [0.9; 3], first: false });
+                    }
+                }
+                if f == 160 && script == "undorubber" {
+                    self.film.dry_now(&self.gpu);
+                }
+                if f >= 175 {
+                    self.tool.kind = ToolKind::Rubber;
+                    self.rubber_size = 0.06;
+                }
+                if (180..240).contains(&f) {
+                    let s = (f - 180) as f32 / 60.0;
+                    self.cursor = [size.width as f32 * (0.25 + 0.5 * s), size.height as f32 * 0.45];
+                    self.mouse_down[0] = true;
+                }
+            }
             if script == "undoclear" && f == 200 {
                 self.begin_full();
                 self.clear_canvas();
@@ -2268,7 +2356,7 @@ impl App {
         }
         deposits.append(&mut self.pending_deposits);
         if !scripted {
-            let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge) { 0.0 } else { self.tool.height as f32 };
+            let pick_z = if matches!(self.tool.kind, ToolKind::Brush | ToolKind::Roller | ToolKind::Sponge | ToolKind::Rubber) { 0.0 } else { self.tool.height as f32 };
             let general = if self.tool.kind == ToolKind::Knife { None } else { self.cam.plane_hit(self.ndc(), pick_z).or_else(|| self.cam.plane_hit(self.ndc(), 0.0)) };
             if let Some(p) = general {
                 let p = DVec3::new(p.x as f64, p.y as f64, self.tool.height);
@@ -2296,6 +2384,17 @@ impl App {
         self.paint.frac[14] = (self.tool.mu as f32).ln() + 10.0;
         self.film.settings.sigma = self.tool.sigma as f32;
         self.tool.paint = self.paint;
+        if self.tool.kind == ToolKind::Rubber && self.tool.flowing {
+            if !self.paused {
+                let here = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
+                let from = self.rubber_prev.unwrap_or(here);
+                let width = pen.map(|p| RUBBER_PEN_LIGHT + (1.0 - RUBBER_PEN_LIGHT) * p).unwrap_or(1.0);
+                self.rubber_seg = Some(([from.x as f32, from.y as f32], [here.x as f32, here.y as f32], (0.5 * self.rubber_size * width) as f32));
+                self.rubber_prev = Some(here);
+            }
+        } else {
+            self.rubber_prev = None;
+        }
         let mut knife = None;
         if self.tool.kind == ToolKind::Knife {
             let here = DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0);
@@ -2483,6 +2582,9 @@ impl App {
             if self.prev_kind != ToolKind::Brush {
                 self.tool.height = self.brush.len * 0.75;
             }
+            if self.auto.is_none() && !self.evolving() {
+                self.tool.height = self.brush.len - self.brush_press(self.brush_pressure);
+            }
             self.tool.height = self.tool.height.clamp(0.002, self.brush.len - 0.0002);
             if self.tool.infinite && !self.evolving() {
                 self.brush.top_up(&self.paint.frac);
@@ -2500,7 +2602,7 @@ impl App {
                     let p = (geo / reach.max(1e-6)).clamp(0.0, 1.0);
                     let target = HOLD_MIN + HOLD_SPAN * p.powf(HOLD_EXP);
                     let have = self.brush.touching as f64 / self.brush.bristles.len().max(1) as f64;
-                    self.brush_hold = (self.brush_hold + HOLD_GAIN * (target - have) * reach * frame_dt as f64).clamp(0.0, (reach - geo).max(0.0));
+                    self.brush_hold = (self.brush_hold + HOLD_GAIN * (target - have).max(0.0) * reach * frame_dt as f64).clamp(0.0, (reach - geo).max(0.0));
                 } else if !self.tool.flowing {
                     self.brush_hold = 0.0;
                 }
@@ -2592,14 +2694,6 @@ impl App {
         };
         let (mut tv, mut ti) = tools::tube_mesh(&self.air.rods, &self.air.drops, &color_of);
         let solid = ti.len();
-        if self.tool.kind == ToolKind::Brush {
-            let r = self.brush.ferrule_r;
-            let ferrule = [rod::Drop { x: self.brush.handle, v: DVec3::ZERO, vol: 4.0 / 3.0 * std::f64::consts::PI * r * r * r, pig: [0; 8], fluid: self.tool.fluid() }];
-            let (fv, fi) = tools::tube_mesh(&[], &ferrule, &color_of);
-            let base = tv.len() as u32;
-            tv.extend(fv);
-            ti.extend(fi.iter().map(|i| i + base));
-        }
         if self.auto.is_none() && (self.painter_active || self.evolving() || !self.cursor_over_panel()) {
             let ground = if self.painter_active || self.evolving() { Some(DVec3::new(self.tool.pos.x, self.tool.pos.y, 0.0)) } else { self.cam.plane_hit(self.ndc(), 0.0).map(|g| DVec3::new(g.x as f64, g.y as f64, 0.0)) };
             let gx = gizmo::GizmoCtx {
@@ -2610,6 +2704,7 @@ impl App {
                 knife_fill: (self.knife_load() / self.knife_capacity().max(1e-12)).clamp(0.0, 1.0) as f32,
                 knife_paint: color_of(&color::PaintMix { frac: self.knife_mix() }.normalized().packed()),
                 sponge_radius: 0.5 * self.sponge.size,
+                rubber_radius: 0.5 * self.rubber_size,
                 knife_gap: self.tool.knife_height * self.pen().map(|p| 1.0 - PEN_KNIFE_CLOSE * p).unwrap_or(1.0),
                 pour_radius: self.pour_radius as f64 * self.pen().map(|p| PEN_WIDTH_MIN as f64 + (1.0 - PEN_WIDTH_MIN as f64) * p).unwrap_or(1.0),
             };
@@ -2948,6 +3043,10 @@ impl ApplicationHandler for Pending {
                     app.cam.dist = (app.cam.dist * (1.0 - d * 0.1)).clamp(0.05, 6.0);
                 } else if app.tool.kind == ToolKind::Roller {
                     app.roller.pressure = (app.roller.pressure + d as f64 * 0.05).clamp(0.0, 1.0);
+                } else if app.tool.kind == ToolKind::Brush {
+                    app.brush_pressure = (app.brush_pressure + d as f64 * 0.05).clamp(0.0, 1.0);
+                } else if app.tool.kind == ToolKind::Rubber {
+                    app.rubber_size = (app.rubber_size * (1.0 + d as f64 * 0.1)).clamp(RUBBER_MIN, RUBBER_MAX);
                 } else if app.tool.kind == ToolKind::Sponge {
                     app.sponge.pressure = (app.sponge.pressure + d as f64 * 0.05).clamp(0.0, 1.0);
                 } else {
@@ -2965,14 +3064,15 @@ impl ApplicationHandler for Pending {
                         PhysicalKey::Code(KeyCode::Tab) => app.show_inspector = !app.show_inspector,
                         PhysicalKey::Code(KeyCode::KeyT) => app.set_top_view(),
                         PhysicalKey::Code(KeyCode::KeyB) => app.beauty_render(true),
-                        PhysicalKey::Code(KeyCode::Digit1) => app.tool.kind = ToolKind::Stick,
-                        PhysicalKey::Code(KeyCode::Digit2) => app.tool.kind = ToolKind::Bottle,
-                        PhysicalKey::Code(KeyCode::Digit3) => app.tool.kind = ToolKind::Bucket,
-                        PhysicalKey::Code(KeyCode::Digit4) => app.tool.kind = ToolKind::Pour,
-                        PhysicalKey::Code(KeyCode::Digit5) => app.tool.kind = ToolKind::Knife,
-                        PhysicalKey::Code(KeyCode::Digit6) => app.tool.kind = ToolKind::Brush,
-                        PhysicalKey::Code(KeyCode::Digit7) => app.tool.kind = ToolKind::Roller,
+                        PhysicalKey::Code(KeyCode::Digit1) => app.tool.kind = ToolKind::Brush,
+                        PhysicalKey::Code(KeyCode::Digit2) => app.tool.kind = ToolKind::Roller,
+                        PhysicalKey::Code(KeyCode::Digit3) => app.tool.kind = ToolKind::Knife,
+                        PhysicalKey::Code(KeyCode::Digit4) => app.tool.kind = ToolKind::Stick,
+                        PhysicalKey::Code(KeyCode::Digit5) => app.tool.kind = ToolKind::Bottle,
+                        PhysicalKey::Code(KeyCode::Digit6) => app.tool.kind = ToolKind::Bucket,
+                        PhysicalKey::Code(KeyCode::Digit7) => app.tool.kind = ToolKind::Pour,
                         PhysicalKey::Code(KeyCode::Digit8) => app.tool.kind = ToolKind::Sponge,
+                        PhysicalKey::Code(KeyCode::Digit9) => app.tool.kind = ToolKind::Rubber,
                         PhysicalKey::Code(KeyCode::KeyR) => {
                             match app.tool.kind {
                                 ToolKind::Brush => app.brush.dip(&app.paint.frac),

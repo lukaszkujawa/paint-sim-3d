@@ -41,6 +41,12 @@ pub struct Deposit {
 pub const DEPOSIT_RECYCLED: u32 = 1;
 pub const DEPOSIT_CAP_START: u32 = 2;
 pub const DEPOSIT_CAP_END: u32 = 4;
+pub const DEPOSIT_STRANDS: u32 = 8;
+const STRAND_MIN_W: f32 = 0.18e-3;
+const STRAND_CELLS: f32 = 1.2;
+const STRAND_LO: f32 = 0.35;
+const STRAND_HI: f32 = 0.6;
+const STRAND_FLOOR: f32 = 0.08;
 const DEPOSIT_METHOD_SHIFT: u32 = 8;
 
 #[derive(Clone, Copy)]
@@ -51,6 +57,25 @@ pub enum Method {
     Brush = 4,
     Knife = 5,
     Roller = 6,
+}
+
+fn strand_hash(i: i32, seed: u32) -> f32 {
+    let mut h = (i as u32).wrapping_mul(73856093) ^ seed.wrapping_mul(19349663);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1e995);
+    h ^= h >> 15;
+    (h & 0xffff) as f32 / 65535.0
+}
+
+fn strand_mask(s: f32, seed: u32, width: f32) -> f32 {
+    let x = s / width;
+    let i = x.floor();
+    let f = x - i;
+    let t = f * f * (3.0 - 2.0 * f);
+    let a = strand_hash(i as i32, seed);
+    let b = strand_hash(i as i32 + 1, seed);
+    let v = ((a + (b - a) * t - STRAND_LO) / (STRAND_HI - STRAND_LO)).clamp(0.0, 1.0);
+    STRAND_FLOOR + (1.0 - STRAND_FLOOR) * v
 }
 
 fn segment_dir(p0: [f32; 2], p1: [f32; 2]) -> ([f32; 2], f32) {
@@ -94,6 +119,18 @@ impl Deposit {
 
     pub fn laid_by(mut self, method: Method) -> Self {
         self.kind |= (method as u32) << DEPOSIT_METHOD_SHIFT;
+        self
+    }
+
+    pub fn strands(mut self, seed: u32, offset: f32, dx: f32) -> Self {
+        self.kind |= DEPOSIT_STRANDS;
+        self.pad[0] = seed;
+        self.pad[1] = offset.to_bits();
+        self.pad[2] = STRAND_MIN_W.max(STRAND_CELLS * dx).to_bits();
+        let sampled = self.sampled_volume(0.25 * dx);
+        if sampled > 0.0 {
+            self.h0 *= self.vol / sampled;
+        }
         self
     }
 
@@ -154,12 +191,15 @@ impl Deposit {
         let cap_start = self.kind & DEPOSIT_CAP_START != 0;
         let cap_end = self.kind & DEPOSIT_CAP_END != 0;
         let len = |q: [f32; 2]| (q[0] * q[0] + q[1] * q[1]).sqrt();
+        let strands = self.kind & DEPOSIT_STRANDS != 0;
+        let (seed, offset, width) = (self.pad[0], f32::from_bits(self.pad[1]), f32::from_bits(self.pad[2]));
+        let mask = move |q: [f32; 2], d: [f32; 2]| if strands { strand_mask(offset - (q[0] * d[1] - q[1] * d[0]), seed, width) } else { 1.0 };
         move |p: [f32; 2]| {
             let q0 = [p[0] - self.p0[0], p[1] - self.p0[1]];
             let q1 = [p[0] - self.p1[0], p[1] - self.p1[1]];
             if l <= 0.0 {
                 let x = len(q0) / self.r0;
-                return if x < 1.0 { self.h0 * (1.0 - x * x) } else { 0.0 };
+                return if x < 1.0 { self.h0 * (1.0 - x * x) * mask(q0, self.n0) } else { 0.0 };
             }
             if !cap_start && q0[0] * self.n0[0] + q0[1] * self.n0[1] < 0.0 {
                 return 0.0;
@@ -180,7 +220,7 @@ impl Deposit {
             }
             let rt = self.r0 + (self.r1 - self.r0) * (u / l).clamp(0.0, 1.0);
             let x = dist / rt;
-            if x < 1.0 { self.h0 * (rt / self.r0) * (1.0 - x * x) } else { 0.0 }
+            if x < 1.0 { self.h0 * (rt / self.r0) * (1.0 - x * x) * mask(q0, dir) } else { 0.0 }
         }
     }
 }

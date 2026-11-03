@@ -3,12 +3,17 @@
 @group(2) @binding(2) var<storage, read> tile_count: array<u32>;
 @group(2) @binding(3) var<storage, read> tile_items: array<u32>;
 
+fn strands_at(q: vec2<f32>, dir: vec2<f32>, d: Deposit) -> f32 {
+    if (d.kind & DEPOSIT_STRANDS) == 0u { return 1.0; }
+    return strand_mask(bitcast<f32>(d.pad1) - (q.x * dir.y - q.y * dir.x), d.pad0, P.dx);
+}
+
 fn ribbon_height(p: vec2<f32>, d: Deposit) -> f32 {
     let ab = d.p1 - d.p0;
     let l2 = dot(ab, ab);
     if l2 <= 0.0 {
         let x = length(p - d.p0) / d.r0;
-        return select(0.0, d.h0 * (1.0 - x * x), x < 1.0);
+        return select(0.0, d.h0 * (1.0 - x * x) * strands_at(p - d.p0, d.n0, d), x < 1.0);
     }
     let l = sqrt(l2);
     let dir = ab / l;
@@ -20,12 +25,13 @@ fn ribbon_height(p: vec2<f32>, d: Deposit) -> f32 {
     if !cap_end && dot(q1, d.n1) >= 0.0 { return 0.0; }
     let u = dot(q0, dir);
     if u < -d.r0 || u > l + d.r1 { return 0.0; }
+    let mask = strands_at(q0, dir, d);
     var dist = abs(q0.x * dir.y - q0.y * dir.x);
     if cap_start && u < 0.0 { dist = length(q0); }
     if cap_end && u > l { dist = length(q1); }
     let rt = mix(d.r0, d.r1, clamp(u / l, 0.0, 1.0));
     let x = dist / rt;
-    return select(0.0, d.h0 * (rt / d.r0) * (1.0 - x * x), x < 1.0);
+    return select(0.0, d.h0 * (rt / d.r0) * (1.0 - x * x) * mask, x < 1.0);
 }
 
 @compute @workgroup_size(16, 16)

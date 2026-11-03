@@ -1008,9 +1008,15 @@ impl App {
             if t == 0 {
                 let (n, len) = (self.brush.bristles.len(), self.brush.len);
                 self.rebuild_brush(shape, n, len, mm * 1e-3);
-                let mut p = color::PaintMix::pure(1);
+                let mut p = color::PaintMix::pure(3);
+                p.frac[0] = 0.6;
                 p.frac[13] = 40.0;
                 p.frac[14] = (20f32).ln() + 10.0;
+                if std::env::args().any(|a| a == "--thinpaint") {
+                    p.frac[12] = 0.3;
+                    p.frac[13] = 0.0;
+                    p.frac[14] = (self.tool.mu as f32).ln() + 10.0;
+                }
                 self.brush.capacity = self.brush.base_capacity * (mm * 1e-3 / 0.016).clamp(1.0, 10.0);
                 self.brush.clean();
                 self.brush.dip(&p.frac);
@@ -2626,7 +2632,7 @@ impl App {
                     .par_iter()
                     .map(|r| {
                         let pig = color::PaintMix { frac: r.comp }.normalized().packed();
-                        let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, dx).laid_by(Method::Brush).recycled();
+                        let d = Deposit::stroke(r.p0, r.p1, r.r, r.vol as f32, pig, dx).laid_by(Method::Brush).recycled().strands(r.seed, r.offset, dx);
                         let inside = r.vol * d.inside_fraction(w, hgt) as f64;
                         (d, inside)
                     })

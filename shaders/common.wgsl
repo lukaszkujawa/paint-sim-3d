@@ -35,6 +35,31 @@ struct Deposit {
 
 const DEPOSIT_CAP_START: u32 = 2u;
 const DEPOSIT_CAP_END: u32 = 4u;
+const DEPOSIT_STRANDS: u32 = 8u;
+const STRAND_MIN_W: f32 = 0.18e-3;
+const STRAND_CELLS: f32 = 1.2;
+const STRAND_LO: f32 = 0.35;
+const STRAND_HI: f32 = 0.6;
+const STRAND_FLOOR: f32 = 0.08;
+
+fn strand_hash(i: i32, seed: u32) -> f32 {
+    var h = (u32(i) * 73856093u) ^ (seed * 19349663u);
+    h ^= h >> 13u;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15u;
+    return f32(h & 0xffffu) / 65535.0;
+}
+
+fn strand_mask(s: f32, seed: u32, dx: f32) -> f32 {
+    let x = s / max(STRAND_MIN_W, STRAND_CELLS * dx);
+    let i = floor(x);
+    let f = x - i;
+    let t = f * f * (3.0 - 2.0 * f);
+    let a = strand_hash(i32(i), seed);
+    let b = strand_hash(i32(i) + 1, seed);
+    let v = clamp((a + (b - a) * t - STRAND_LO) / (STRAND_HI - STRAND_LO), 0.0, 1.0);
+    return STRAND_FLOOR + (1.0 - STRAND_FLOOR) * v;
+}
 const DEPOSIT_METHOD_SHIFT: u32 = 8u;
 const METHOD_THREAD: u32 = 1u;
 const METHOD_DROP: u32 = 2u;

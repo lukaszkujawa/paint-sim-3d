@@ -45,6 +45,12 @@ const KEY_HALF_ANGLE: f32 = 0.12;
 const SOFTBOX_HALF_W: f32 = 0.45;
 const SOFTBOX_HALF_H: f32 = 0.3;
 const SOFTBOX_RADIANCE: f32 = 5.0;
+const HAIR_SLOPE_GAIN: f32 = 0.9;
+const HAIR_CAVITY: f32 = 0.3;
+const HAIR_RING: f32 = 1.5;
+const HAIR_DEPTH: f32 = 60e-6;
+const WEAVE_RELIEF: f32 = 50e-6;
+const PAINT_WEAVE: f32 = 0.05;
 const LIVE_SHEEN_FLAT: f32 = 0.04;
 const LIVE_SHEEN_RIDGE: f32 = 0.25;
 const HORIZON_GLOW: vec3<f32> = vec3<f32>(0.62, 0.6, 0.56);
@@ -639,6 +645,31 @@ fn base_slope(p: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(sx, sy) / (2.0 * e);
 }
 
+fn paint_at(p: vec2<f32>) -> f32 {
+    let g = p / cam.canvas.z - vec2<f32>(0.5);
+    let f = floor(g);
+    let t = g - f;
+    let i = i32(f.x);
+    let j = i32(f.y);
+    let top = vec4<f32>(surf_at(i, j), surf_at(i + 1, j), surf_at(i, j + 1), surf_at(i + 1, j + 1));
+    let wet = vec4<f32>(wet_at(i, j), wet_at(i + 1, j), wet_at(i, j + 1), wet_at(i + 1, j + 1));
+    let film = wet + max(top - wet - vec4<f32>(WEAVE_RELIEF), vec4<f32>(0.0));
+    return mix(mix(film.x, film.y, t.x), mix(film.z, film.w, t.x), t.y);
+}
+
+fn hair_slope(p: vec2<f32>) -> vec2<f32> {
+    let e = 0.5 * cam.canvas.z;
+    let sx = paint_at(p + vec2<f32>(e, 0.0)) - paint_at(p - vec2<f32>(e, 0.0));
+    let sy = paint_at(p + vec2<f32>(0.0, e)) - paint_at(p - vec2<f32>(0.0, e));
+    return vec2<f32>(sx, sy) / (2.0 * e);
+}
+
+fn hair_cavity(p: vec2<f32>) -> f32 {
+    let e = HAIR_RING * cam.canvas.z;
+    let ring = paint_at(p + vec2<f32>(e, 0.0)) + paint_at(p - vec2<f32>(e, 0.0)) + paint_at(p + vec2<f32>(0.0, e)) + paint_at(p - vec2<f32>(0.0, e));
+    return clamp((paint_at(p) - 0.25 * ring) / HAIR_DEPTH, -1.0, 1.0);
+}
+
 fn normal_from_slope(s: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(-s, 1.0));
 }
@@ -1051,7 +1082,11 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         return vec4<f32>(to_srgb(tonemap(cam.ortho.w * lit(normal_bilinear(p), v, l, 1.0, 1.0, cs.rgb, cs.a, 0.0, 0.0, 0.0, vec2<f32>(1.0, 0.0), 1.0))), 1.0);
     }
     let ms = micro_slope(p, detail);
-    let n = normal_from_slope(base_slope(p) + ms);
+    let bs = base_slope(p);
+    let film_cover = smoothstep(0.0, 0.08e-3, detail.thickness);
+    var fine_slope = vec2<f32>(0.0);
+    if film_cover > 0.0 { fine_slope = HAIR_SLOPE_GAIN * film_cover * hair_slope(p); }
+    let n = normal_from_slope(bs + ms + fine_slope);
     let slope = length(n.xy) / max(n.z, 1e-3);
     var pc = p;
     if slope > 0.4 {
@@ -1076,6 +1111,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let sh = shadow_at(p, z0, l);
     let ao = ambient_occlusion(p, z0, detail);
     var albedo = col.rgb;
+    if film_cover > 0.0 { albedo *= 1.0 + HAIR_CAVITY * film_cover * hair_cavity(p); }
     let painted = smoothstep(0.0, 0.08e-3, detail.thickness);
     if painted > 0.0 {
         let g = granulation(p);
@@ -1092,7 +1128,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
         albedo *= 1.0 + 0.10 * cl * tool * painted;
         let thin_paint = 1.0 - smoothstep(0.03e-3, 0.25e-3, detail.thickness);
         let wv = weave(p);
-        albedo *= 1.0 + 0.22 * thin_paint * (wv.x - 0.55) * painted;
+        albedo *= 1.0 + PAINT_WEAVE * thin_paint * (wv.x - 0.55) * painted;
     }
     let bare = 1.0 - smoothstep(0.0, 0.15e-3, detail.thickness);
     if bare > 0.0 {

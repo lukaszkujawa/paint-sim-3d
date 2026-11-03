@@ -71,6 +71,8 @@ pub struct Release {
     pub r: f32,
     pub vol: f64,
     pub comp: [f32; 16],
+    pub seed: u32,
+    pub offset: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -99,6 +101,7 @@ pub struct Brush {
     pub handle: DVec3,
     pub touching: usize,
     pub lean: DVec3,
+    pub stroke_seed: u32,
     pub ferrule: DVec3,
     pub up: DVec3,
 }
@@ -175,7 +178,7 @@ impl Brush {
         let hair = radius;
         let radius = hair.min(ferrule_r * (FILL / n.max(1) as f64).sqrt()).max(HAIR_MIN);
         let capacity = BASE_CAPACITY * (area / BASE_AREA).sqrt() * (len / BASE_LEN);
-        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0, lean: DVec3::X, ferrule: DVec3::ZERO, up: DVec3::Z }
+        Self { bristles, shape, width, angle: 0.0, len, segs, ferrule_r, radius, hair, tuft, stiffness: 0.35, friction: 0.7, capacity, base_capacity: capacity, release: 1.5, placed: false, handle: DVec3::ZERO, touching: 0, lean: DVec3::X, stroke_seed: 1, ferrule: DVec3::ZERO, up: DVec3::Z }
     }
 
     pub fn size(&self) -> f64 {
@@ -399,6 +402,11 @@ impl Brush {
         let sp = vxy.length();
         let dir = if sp > 1e-6 { vxy / sp } else { DVec3::ZERO };
         let mut touching = 0;
+        if self.touching == 0 {
+            self.stroke_seed = self.stroke_seed.wrapping_add(1);
+        }
+        let seed = self.stroke_seed;
+        let centre = DVec3::new(handle.x, handle.y, 0.0);
         let across = if sp > 1e-6 { DVec3::new(-dir.y, dir.x, 0.0) } else { DVec3::X };
         let (mut lo, mut hi, mut lanes, mut count) = (f64::MAX, f64::MIN, 0.0f64, 0usize);
         for b in &self.bristles {
@@ -462,9 +470,11 @@ impl Brush {
                     if b.was[i] && swept > SWEEP_MIN * rc as f64 {
                         let q0 = [from.x as f32, from.y as f32];
                         let q1 = [b.pts[tip].x as f32, b.pts[tip].y as f32];
-                        releases.push(Release { p0: q0, p1: q1, r: rc, vol: rel, comp: b.comp });
+                        let mid = (b.pts[tip] + from) * 0.5;
+                        releases.push(Release { p0: q0, p1: q1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32 });
                     } else {
-                        releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp });
+                        let mid = (b.pts[i] + b.pts[i - 1]) * 0.5;
+                        releases.push(Release { p0, p1, r: rc, vol: rel, comp: b.comp, seed, offset: (mid - centre).dot(side) as f32 });
                     }
                 }
             }

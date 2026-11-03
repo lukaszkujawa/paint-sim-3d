@@ -51,6 +51,12 @@ fn brush_scrape(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var q = 0u; q < n; q++) {
         let k = contacts[ctile_items[start + q]];
         if seg_dist(p, k.p0, k.p1) < k.r {
+            if k.pad == 0u || k.pad == CONTACT_BODY {
+                let ab = k.p1 - k.p0;
+                let q = p - k.p0;
+                let across = (q.x * ab.y - q.y * ab.x) / max(length(ab), 1e-9);
+                if strand_mask(across, k.bristle + 1u, P.dx) < 0.5 { continue; }
+            }
             if k.pad == 0u {
                 swept = true;
                 travel += k.p1 - k.p0;
